@@ -288,4 +288,6 @@ with st.sidebar:
             st.error(f"ফাইল পড়তে সমস্যা হয়েছে: {e}")
 
     st.divider()
-    if st.button("🗑️ নতুন চ্যাট শুরু করুন"):
+        if st.button("🗑️ নতুন চ্যাট শুরু করুন"):
+        st.session_state.messages = []
+        st.rerun()
