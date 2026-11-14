@@ -256,7 +256,7 @@ with st.sidebar:
         st.caption("Tool calling-এর জন্য gpt-oss-120b বা qwen3.8-27b ব্যবহার করো।")
 
     st.divider()
-    st.subheader("📎 স্থায়ী ফাইল আপলোড")
+    st.subheader("📎 স্থায়ী ফাইল আপলোড")
     uploaded_file = st.file_uploader(
         "PDF, TXT, PY বা কোড ফাইল দিন:",
         type=["pdf", "txt", "py", "html", "css", "js", "json", "md"],
@@ -299,3 +299,98 @@ else:
 if file_context:
     system_instruction = (
         f"{base_instruction}\n\n"
+        f"The user uploaded a file named '{uploaded_file.name}'. "
+        f"Use the following file content to answer their questions accurately:\n"
+        f"--- FILE CONTENT START ---\n{file_context[:MAX_FILE_CHARS]}\n--- FILE CONTENT END ---"
+    )
+else:
+    system_instruction = base_instruction
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+
+def extract_json(text):
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    candidate = m.group(1) if m else text.strip()
+    try:
+        parsed = json.loads(candidate)
+    except Exception:
+        return None
+    if not isinstance(parsed, (dict, list)):
+        return None
+    return json.dumps(parsed, indent=2, ensure_ascii=False)
+
+
+def show_download(content, idx):
+    json_data = extract_json(content)
+    if json_data:
+        st.download_button(
+            label="📥 WordPress JSON ফাইল ডাউনলোড করুন",
+            data=json_data,
+            file_name=f"wordpress-template-{idx}.json",
+            mime="application/json",
+            key=f"dl_{idx}",
+        )
+
+
+def stream_reply(model, messages, temp):
+    stream = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temp,
+        max_tokens=8000,
+        stream=True,
+    )
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+
+
+def get_history():
+    history = st.session_state.messages[-MAX_HISTORY:]
+    while history and history[0]["role"] != "user":
+        history = history[1:]
+    return history
+
+
+for idx, message in enumerate(st.session_state.messages):
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        if message["role"] == "assistant":
+            show_download(message["content"], idx)
+
+if is_agent_mode:
+    placeholder = "যেমন: একটি dark theme architecture Home page বানাও..."
+elif is_json_mode:
+    placeholder = "যেমন: একটি মডার্ন Hero Section এর Elementor JSON তৈরি করো..."
+else:
+    placeholder = "এখানে আপনার প্রশ্ন লিখুন..."
+
+if prompt := st.chat_input(placeholder):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    success = False
+    with st.chat_message("assistant"):
+        try:
+            history = get_history()
+            if is_agent_mode:
+                if not (WP_URL and WP_AUTH[0] and WP_AUTH[1]):
+                    raise ValueError("WP_URL, WP_USER, WP_APP_PASSWORD সেট করা নেই।")
+                with st.spinner("ভাবছি..."):
+                    reply = run_agent(selected_model, system_instruction, history, temperature)
+                st.markdown(reply)
+            else:
+                api_messages = [{"role": "system", "content": system_instruction}] + history
+                reply = st.write_stream(stream_reply(selected_model, api_messages, temperature))
+
+            st.session_state.messages.append({"role": "assistant", "content": reply})
+            success = True
+        except Exception as e:
+            st.session_state.messages.pop()
+            st.error(f"একটি সমস্যা হয়েছে: {e}")
+
+    if success:
+        st.rerun()
