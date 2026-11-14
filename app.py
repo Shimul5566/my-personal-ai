@@ -367,30 +367,59 @@ elif is_json_mode:
 else:
     placeholder = "এখানে আপনার প্রশ্ন লিখুন..."
 
-if prompt := st.chat_input(placeholder):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+user_submission = st.chat_input(
+    placeholder,
+    accept_file=True,
+    file_type=["pdf", "txt", "py", "html", "css", "js", "json", "md"],
+)
 
-    success = False
-    with st.chat_message("assistant"):
+if user_submission:
+    prompt_text = user_submission.text or ""
+    attached_files = user_submission.files
+
+    attached_context = ""
+    attached_names = []
+    for f in attached_files:
         try:
-            history = get_history()
-            if is_agent_mode:
-                if not (WP_URL and WP_AUTH[0] and WP_AUTH[1]):
-                    raise ValueError("WP_URL, WP_USER, WP_APP_PASSWORD সেট করা নেই।")
-                with st.spinner("ভাবছি..."):
-                    reply = run_agent(selected_model, system_instruction, history, temperature)
-                st.markdown(reply)
-            else:
-                api_messages = [{"role": "system", "content": system_instruction}] + history
-                reply = st.write_stream(stream_reply(selected_model, api_messages, temperature))
-
-            st.session_state.messages.append({"role": "assistant", "content": reply})
-            success = True
+            text_data = read_file(f.name, f.getvalue())
+            if text_data.strip():
+                attached_context += f"\n--- FILE: {f.name} ---\n{text_data[:MAX_FILE_CHARS]}\n"
+                attached_names.append(f.name)
         except Exception as e:
-            st.session_state.messages.pop()
-            st.error(f"একটি সমস্যা হয়েছে: {e}")
+            st.error(f"ফাইল পড়তে সমস্যা হয়েছে: {e}")
 
-    if success:
-        st.rerun()
+    display_msg = prompt_text
+    if attached_names:
+        display_msg = f"📎 **সংযুক্ত ফাইল:** {', '.join(attached_names)}\n\n{prompt_text}"
+
+    if display_msg.strip():
+        st.session_state.messages.append({"role": "user", "content": display_msg})
+        with st.chat_message("user"):
+            st.markdown(display_msg)
+
+        final_system = system_instruction
+        if attached_context:
+            final_system += f"\n\nUse the attached file content to answer accurately:\n{attached_context}"
+
+        success = False
+        with st.chat_message("assistant"):
+            try:
+                history = get_history()
+                if is_agent_mode:
+                    if not (WP_URL and WP_AUTH[0] and WP_AUTH[1]):
+                        raise ValueError("WP_URL, WP_USER, WP_APP_PASSWORD সেট করা নেই।")
+                    with st.spinner("ভাবছি..."):
+                        reply = run_agent(selected_model, final_system, history, temperature)
+                    st.markdown(reply)
+                else:
+                    api_messages = [{"role": "system", "content": final_system}] + history
+                    reply = st.write_stream(stream_reply(selected_model, api_messages, temperature))
+
+                st.session_state.messages.append({"role": "assistant", "content": reply})
+                success = True
+            except Exception as e:
+                st.session_state.messages.pop()
+                st.error(f"একটি সমস্যা হয়েছে: {e}")
+
+        if success:
+            st.rerun()
