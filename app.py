@@ -95,8 +95,11 @@ WP_TOOLS = [
                 "type": "object",
                 "properties": {
                     "title": {"type": "string"},
-                    "elementor_data": {"type": "array", "items": {"type": "object"},
-                                       "description": "Elementor content array"},
+                    "elementor_data": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "Elementor content array",
+                    },
                     "status": {"type": "string", "enum": ["draft", "publish"]},
                     "post_id": {"type": "integer", "description": "Only to update an existing page"},
                 },
@@ -128,7 +131,7 @@ WP_TOOLS = [
 
 
 def fix_elementor(data):
-    """Duplicate/vul id ঠিক করে, দরকারি key বসায়।"""
+    """Duplicate বা ভুল id ঠিক করে এবং দরকারি key বসায়।"""
     if isinstance(data, str):
         data = json.loads(data)
     if isinstance(data, dict) and "content" in data:
@@ -159,15 +162,24 @@ def run_wp_tool(name, args):
         if name == "create_elementor_page":
             args["elementor_data"] = fix_elementor(args.get("elementor_data", []))
             args.setdefault("status", "draft")
-            r = requests.post(f"{WP_URL}/wp-json/ai-builder/v1/page",
-                              json=args, auth=WP_AUTH, timeout=60)
+            r = requests.post(
+                f"{WP_URL}/wp-json/ai-builder/v1/page",
+                json=args,
+                auth=WP_AUTH,
+                timeout=60,
+            )
         elif name == "list_pages":
             r = requests.get(
                 f"{WP_URL}/wp-json/wp/v2/pages?per_page=50&status=any&_fields=id,title,status,link",
-                auth=WP_AUTH, timeout=30)
+                auth=WP_AUTH,
+                timeout=30,
+            )
         elif name == "trash_page":
-            r = requests.delete(f"{WP_URL}/wp-json/wp/v2/pages/{int(args['post_id'])}",
-                                auth=WP_AUTH, timeout=30)
+            r = requests.delete(
+                f"{WP_URL}/wp-json/wp/v2/pages/{int(args['post_id'])}",
+                auth=WP_AUTH,
+                timeout=30,
+            )
         else:
             return json.dumps({"error": f"unknown tool {name}"})
         return r.text[:4000]
@@ -179,8 +191,12 @@ def run_agent(model, system_text, history, temp, max_steps=5):
     msgs = [{"role": "system", "content": system_text}] + history
     for _ in range(max_steps):
         resp = client.chat.completions.create(
-            model=model, messages=msgs, tools=WP_TOOLS,
-            tool_choice="auto", temperature=temp, max_tokens=8000,
+            model=model,
+            messages=msgs,
+            tools=WP_TOOLS,
+            tool_choice="auto",
+            temperature=temp,
+            max_tokens=8000,
         )
         m = resp.choices[0].message
         if not m.tool_calls:
@@ -189,8 +205,11 @@ def run_agent(model, system_text, history, temp, max_steps=5):
             "role": "assistant",
             "content": m.content or "",
             "tool_calls": [
-                {"id": t.id, "type": "function",
-                 "function": {"name": t.function.name, "arguments": t.function.arguments}}
+                {
+                    "id": t.id,
+                    "type": "function",
+                    "function": {"name": t.function.name, "arguments": t.function.arguments},
+                }
                 for t in m.tool_calls
             ],
         })
@@ -202,7 +221,7 @@ def run_agent(model, system_text, history, temp, max_steps=5):
                     a = {}
                 result = run_wp_tool(t.function.name, a)
             msgs.append({"role": "tool", "tool_call_id": t.id, "content": result})
-    return "⚠️ Maximum step cross hoye gese. Abar try koro."
+    return "⚠️ Maximum step অতিক্রম করেছে। আবার চেষ্টা করো।"
 
 
 # ---------- File reader ----------
@@ -232,8 +251,11 @@ with st.sidebar:
     is_agent_mode = app_mode.startswith("🔌")
 
     temperature = st.slider(
-        "Creativity (temperature)", 0.0, 1.0,
-        0.4 if (is_json_mode or is_agent_mode) else 0.7, 0.05,
+        "Creativity (temperature)",
+        0.0,
+        1.0,
+        0.4 if (is_json_mode or is_agent_mode) else 0.7,
+        0.05,
         key=f"temp_{app_mode}",
     )
 
@@ -241,11 +263,11 @@ with st.sidebar:
         if WP_URL and WP_AUTH[0] and WP_AUTH[1]:
             st.success(f"✅ Connected: {WP_URL}")
         else:
-            st.warning("WP_URL, WP_USER, WP_APP_PASSWORD set koro।")
-        st.caption("Tool calling-er jonno gpt-oss-120b ba qwen3.8-27b use koro।")
+            st.warning("WP_URL, WP_USER, WP_APP_PASSWORD সেট করো।")
+        st.caption("Tool calling-এর জন্য gpt-oss-120b বা qwen3.8-27b ব্যবহার করো।")
 
     st.divider()
-    st.subheader("📎 ফাইল আপলোড করুন")
+    st.subheader("📎 স্থায়ী ফাইল আপলোড")
     uploaded_file = st.file_uploader(
         "PDF, TXT, PY বা কোড ফাইল দিন:",
         type=["pdf", "txt", "py", "html", "css", "js", "json", "md"],
@@ -267,82 +289,3 @@ with st.sidebar:
 
     st.divider()
     if st.button("🗑️ নতুন চ্যাট শুরু করুন"):
-        st.session_state.messages = []
-        st.rerun()
-
-    if st.session_state.get("messages"):
-        st.download_button(
-            "💾 চ্যাট সেভ করুন (.json)",
-            data=json.dumps(st.session_state.messages, indent=2, ensure_ascii=False),
-            file_name="chat-history.json",
-
-
-
-   # ---------- নতুন ইনপুট (চ্যাট বক্সের ভেতরেই ফাইল আপলোড বাটনসহ) ----------
-if is_agent_mode:
-    placeholder = "যেমন: একটি dark theme architecture Home page বানাও..."
-elif is_json_mode:
-    placeholder = "যেমন: একটি মডার্ন Hero Section এর Elementor JSON তৈরি করো..."
-else:
-    placeholder = "এখানে আপনার প্রশ্ন লিখুন বা ফাইল যুক্ত করুন..."
-
-user_submission = st.chat_input(
-    placeholder,
-    accept_file=True,
-    file_type=["pdf", "txt", "py", "html", "css", "js", "json", "md"],
-)
-
-if user_submission:
-    prompt_text = user_submission.text or ""
-    attached_files = user_submission.files
-
-    # যদি চ্যাট বক্স থেকে সরাসরি ফাইল আপলোড করা হয়
-    attached_context = ""
-    attached_names = []
-    for f in attached_files:
-        try:
-            text_data = read_file(f.name, f.getvalue())
-            if text_data.strip():
-                attached_context += f"\n--- FILE: {f.name} ---\n{text_data[:MAX_FILE_CHARS]}\n"
-                attached_names.append(f.name)
-        except Exception as e:
-            st.error(f"ফাইল পড়তে সমস্যা হয়েছে: {e}")
-
-    # ইউজারের মেসেজ স্ক্রিনে দেখানোর জন্য সাজানো
-    display_msg = prompt_text
-    if attached_names:
-        display_msg = f"📎 **সংযুক্ত ফাইল:** {', '.join(attached_names)}\n\n{prompt_text}"
-
-    if display_msg.strip():
-        st.session_state.messages.append({"role": "user", "content": display_msg})
-        with st.chat_message("user"):
-            st.markdown(display_msg)
-
-        # ফাইল থাকলে সিস্টেম প্রম্পটে যুক্ত করা
-        final_system = system_instruction
-        if attached_context:
-            final_system += f"\n\nUse the attached file content to answer accurately:\n{attached_context}"
-
-        success = False
-        with st.chat_message("assistant"):
-            try:
-                history = get_history()
-                if is_agent_mode:
-                    if not (WP_URL and WP_AUTH[0] and WP_AUTH[1]):
-                        raise ValueError("WP_URL, WP_USER, WP_APP_PASSWORD set kora nai।")
-                    with st.spinner("ভাবছি..."):
-                        reply = run_agent(selected_model, final_system, history, temperature)
-                    st.markdown(reply)
-                else:
-                    api_messages = [{"role": "system", "content": final_system}] + history
-                    reply = st.write_stream(stream_reply(selected_model, api_messages, temperature))
-
-                st.session_state.messages.append({"role": "assistant", "content": reply})
-                success = True
-            except Exception as e:
-                st.session_state.messages.pop()
-                st.error(f"একটি সমস্যা হয়েছে: {e}")
-
-        if success:
-            st.rerun()
-         
