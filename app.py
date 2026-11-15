@@ -21,64 +21,98 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# --- ChatGPT স্টাইল কাস্টম CSS ---
+# --- ChatGPT স্টাইল কাস্টম CSS (মোবাইল ও ডেস্কটপ ফিক্সড) ---
 st.markdown(
     """
     <style>
+    /* মূল ব্যাকগ্রাউন্ড ও সব লেখার রঙ স্পষ্ট সাদা করা */
     .stApp {
-        background-color: #212121;
-        color: #ececec;
+        background-color: #212121 !important;
+        color: #ececec !important;
     }
+    .stApp p, .stApp li, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp span, .stApp label, .stMarkdown {
+        color: #ececec !important;
+    }
+    /* সাইডবার ডিজাইন */
     [data-testid="stSidebar"] {
-        background-color: #171717;
+        background-color: #171717 !important;
         border-right: 1px solid #2f2f2f;
     }
+    [data-testid="stSidebar"] * {
+        color: #ececec !important;
+    }
+    /* চ্যাট কন্টেইনার */
     .block-container {
         max-width: 820px;
         padding-top: 2rem;
         padding-bottom: 6rem;
     }
+    /* ইউজার মেসেজ বাবল */
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
-        background-color: #2f2f2f;
+        background-color: #2f2f2f !important;
         border-radius: 18px;
         padding: 12px 18px;
         margin-left: auto;
         width: fit-content;
-        max-width: 80%;
+        max-width: 85%;
         border: 1px solid #3c3c3c;
     }
+    /* অ্যাসিস্ট্যান্ট মেসেজ */
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
-        background-color: transparent;
+        background-color: transparent !important;
         padding: 12px 0px;
+    }
+    /* সব বাটন (আবার তৈরি করো, সাইডবার বাটন) */
+    .stButton > button, .stDownloadButton > button {
+        background-color: #2f2f2f !important;
+        color: #ececec !important;
+        border: 1px solid #444444 !important;
+        border-radius: 10px !important;
+    }
+    .stButton > button:hover, .stDownloadButton > button:hover {
+        background-color: #3d3d3d !important;
+        border-color: #666666 !important;
     }
     [data-testid="stSidebar"] .stButton > button {
         width: 100%;
-        border-radius: 10px;
-        background-color: #212121;
-        color: #ececec;
-        border: 1px solid #383838;
         text-align: left;
         padding: 8px 12px;
-        transition: all 0.2s ease;
     }
-    [data-testid="stSidebar"] .stButton > button:hover {
-        background-color: #2f2f2f;
-        border-color: #555555;
+    /* নিচের বটম কন্টেইনার ও চ্যাট ইনপুট বক্স (মোবাইল সাদা বক্স ফিক্স) */
+    [data-testid="stBottom"], [data-testid="stBottom"] > div {
+        background-color: #212121 !important;
     }
-    [data-testid="stChatInput"] {
+    [data-testid="stChatInput"], [data-testid="stChatInput"] > div {
         background-color: #2f2f2f !important;
         border-radius: 24px !important;
-        border: 1px solid #424242 !important;
+        border: 1px solid #4a4a4a !important;
     }
+    /* টাইপ করার টেক্সট এরিয়া ও প্লেসহোল্ডার */
+    [data-testid="stChatInput"] textarea {
+        background-color: transparent !important;
+        color: #ffffff !important;
+        caret-color: #ffffff !important;
+    }
+    [data-testid="stChatInput"] textarea::placeholder {
+        color: #9e9e9e !important;
+        opacity: 1 !important;
+    }
+    /* ইনপুট বক্সের প্লাস (+) ও সেন্ড আইকন */
+    [data-testid="stChatInput"] button, [data-testid="stChatInput"] svg {
+        color: #ececec !important;
+        fill: #ececec !important;
+    }
+    /* স্ট্যান্ডার্ড ফুটার ও হেডার ব্যাকগ্রাউন্ড */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header[data-testid="stHeader"] {
-        background-color: rgba(33, 33, 33, 0.8);
+        background-color: rgba(33, 33, 33, 0.85) !important;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
 
 
 def get_secret(name, default=""):
