@@ -435,7 +435,12 @@ def gemini_stream(system_text, history, temp, use_image):
     body = {
         "systemInstruction": {"parts": [{"text": system_text}]},
         "contents": gemini_contents(history, use_image),
-        "generationConfig": {"temperature": temp, "maxOutputTokens": 8000},
+        "generationConfig": {
+    "temperature": temp,
+    "maxOutputTokens": 8000,
+    "thinkingConfig": {"thinkingBudget": 1024},
+},
+
     }
     url = f"{GEMINI_BASE}/{GEMINI_MODEL}:streamGenerateContent?alt=sse"
     with requests.post(url, headers=_gemini_headers(), json=body, stream=True, timeout=120) as r:
