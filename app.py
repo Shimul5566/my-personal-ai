@@ -429,7 +429,7 @@ def gemini_contents(history, use_image):
     last = len(history) - 1
     for i, m in enumerate(history):
         parts = [{"text": m["content"] or " "}]
-        if use_image and i == last and m["role"] == "user" and m.get("image"):
+        if use_image and m["role"] == "user" and m.get("image"):
             parts.append({"inlineData": {"mimeType": m.get("mime") or "image/png", "data": m["image"]}})
         contents.append({"role": "user" if m["role"] == "user" else "model", "parts": parts})
     return contents
@@ -1609,7 +1609,7 @@ if st.session_state.pending:
                     reply_msg = {"role": "assistant", "content": reply}
                 else:
                     history = get_history()
-                    use_vision = bool(history and history[-1].get("image"))
+                    use_vision = last_msg_has_image()
                     temp_eff = min(temperature, 0.3) if use_vision else temperature  # পরীক্ষার উত্তরে নির্ভুলতা দরকার
                     search_block = ""
                     sources_md = ""
