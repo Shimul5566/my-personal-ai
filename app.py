@@ -508,28 +508,90 @@ def generate_ai_image(prompt, size_key, quality):
 
 
 def edit_ai_image(image_bytes, instruction, mime, quality):
-    """আপলোড বা আগে তৈরি করা ছবি এডিট: OpenAI → FLUX Kontext (HF)"""
-    if not HAS_EDIT:
-        raise RuntimeError("ছবি এডিট করতে OPENAI_API_KEY অথবা HF_TOKEN সেট করো।")
+    """OpenAI -> FLUX Kontext (HF) -> ফ্রি Groq Vision + Pollinations Flux ফলব্যাক"""
     eng = enhance_edit_prompt(instruction)
     notes = []
+    mime = mime or "image/png"
 
     if OPENAI_API_KEY:
         try:
-            return {"bytes": openai_edit_image(image_bytes, eng, mime, quality), "mime": "image/png",
-                    "prompt": eng, "source": f"OpenAI ({OPENAI_IMAGE_MODEL})", "notes": notes}
+            return {
+                "bytes": openai_edit_image(image_bytes, eng, mime, quality),
+                "mime": "image/png",
+                "prompt": eng,
+                "source": f"OpenAI ({OPENAI_IMAGE_MODEL})",
+                "notes": notes,
+            }
         except Exception as e:
             notes.append(f"OpenAI ব্যর্থ: {_short(e)}")
 
     if HF_TOKEN:
         try:
-            return {"bytes": hf_edit_image(image_bytes, eng), "mime": "image/png",
-                    "prompt": eng, "source": "FLUX Kontext (Hugging Face)", "notes": notes}
+            return {
+                "bytes": hf_edit_image(image_bytes, eng),
+                "mime": "image/png",
+                "prompt": eng,
+                "source": "FLUX Kontext (Hugging Face)",
+                "notes": notes,
+            }
         except Exception as e:
             notes.append(f"HF ব্যর্থ: {_short(e)}")
 
-    raise RuntimeError("ছবি এডিট করা যায়নি। " + " | ".join(notes))
+    # ফ্রি ফলব্যাক: Groq Vision দিয়ে ছবির ডিজাইন বুঝে নতুন ছবি তৈরি (আসল ছবি এডিট হয় না)
+    notes.append("আসল ছবি এডিট হয়নি। ছবির স্টাইল দেখে নতুন ছবি তৈরি হয়েছে (ফ্রি ফলব্যাক)।")
+    combined_prompt = eng
+    try:
+        b64_img = base64.b64encode(image_bytes).decode("utf-8")
+        desc_resp = client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Analyze the visual style, colors, layout, and typography of this image. "
+                                "Write a short English image generation prompt (max 28 words) to recreate this "
+                                f"same design style with this change: '{instruction}'. "
+                                "Keep any requested name inside double quotes. Output ONLY the prompt."
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64_img}"}},
+                    ],
+                }
+            ],
+            temperature=0.5,
+            max_tokens=600,
+        )
+        text = (desc_resp.choices[0].message.content or "").strip()
+        text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()  # কিছু মডেল চিন্তা-অংশ পাঠায়
+        if text:
+            combined_prompt = text
+    except Exception as e:
+        notes.append(f"ছবি বিশ্লেষণ ব্যর্থ: {_short(e)}")
 
+    seed = uuid.uuid4().int % 100000
+    url = (
+        "https://image.pollinations.ai/prompt/"
+        f"{urllib.parse.quote(combined_prompt)}?width=1024&height=1024&model=flux&nologo=true&seed={seed}"
+    )
+    try:
+        r = requests.get(url, timeout=120)
+        r.raise_for_status()
+        ctype = r.headers.get("content-type", "image/jpeg").split(";")[0]
+        if not ctype.startswith("image"):
+            raise RuntimeError("ছবি পাওয়া যায়নি")
+    except Exception as e:
+        notes.append(f"Pollinations ব্যর্থ: {_short(e)}")
+        raise RuntimeError("ছবি এডিট করা যায়নি। " + " | ".join(notes))
+    return {
+        "bytes": r.content,
+        "mime": ctype,
+        "prompt": combined_prompt,
+        "source": "Pollinations Flux (ফ্রি স্টাইল-এডিট)",
+        "notes": notes,
+    }
 
 # ---------- Web search (Tavily) ----------
 def search_query(user_text):
