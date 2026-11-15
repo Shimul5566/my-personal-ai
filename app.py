@@ -25,15 +25,13 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    /* মূল ব্যাকগ্রাউন্ড ও সব লেখার রঙ স্পষ্ট সাদা করা */
     .stApp {
         background-color: #212121 !important;
         color: #ececec !important;
     }
-    .stApp p, .stApp li, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp span, .stApp label, .stMarkdown {
+    .stApp p, .stApp li, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp label, .stMarkdown {
         color: #ececec !important;
     }
-    /* সাইডবার ডিজাইন */
     [data-testid="stSidebar"] {
         background-color: #171717 !important;
         border-right: 1px solid #2f2f2f;
@@ -41,13 +39,11 @@ st.markdown(
     [data-testid="stSidebar"] * {
         color: #ececec !important;
     }
-    /* চ্যাট কন্টেইনার */
     .block-container {
         max-width: 820px;
         padding-top: 2rem;
         padding-bottom: 6rem;
     }
-    /* ইউজার মেসেজ বাবল */
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
         background-color: #2f2f2f !important;
         border-radius: 18px;
@@ -57,12 +53,10 @@ st.markdown(
         max-width: 85%;
         border: 1px solid #3c3c3c;
     }
-    /* অ্যাসিস্ট্যান্ট মেসেজ */
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
         background-color: transparent !important;
         padding: 12px 0px;
     }
-    /* সব বাটন (আবার তৈরি করো, সাইডবার বাটন) */
     .stButton > button, .stDownloadButton > button {
         background-color: #2f2f2f !important;
         color: #ececec !important;
@@ -78,7 +72,6 @@ st.markdown(
         text-align: left;
         padding: 8px 12px;
     }
-    /* নিচের বটম কন্টেইনার ও চ্যাট ইনপুট বক্স (মোবাইল সাদা বক্স ফিক্স) */
     [data-testid="stBottom"], [data-testid="stBottom"] > div {
         background-color: #212121 !important;
     }
@@ -87,7 +80,6 @@ st.markdown(
         border-radius: 24px !important;
         border: 1px solid #4a4a4a !important;
     }
-    /* টাইপ করার টেক্সট এরিয়া ও প্লেসহোল্ডার */
     [data-testid="stChatInput"] textarea {
         background-color: transparent !important;
         color: #ffffff !important;
@@ -97,12 +89,10 @@ st.markdown(
         color: #9e9e9e !important;
         opacity: 1 !important;
     }
-    /* ইনপুট বক্সের প্লাস (+) ও সেন্ড আইকন */
     [data-testid="stChatInput"] button, [data-testid="stChatInput"] svg {
         color: #ececec !important;
         fill: #ececec !important;
     }
-    /* স্ট্যান্ডার্ড ফুটার ও হেডার ব্যাকগ্রাউন্ড */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header[data-testid="stHeader"] {
@@ -112,7 +102,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
 
 
 def get_secret(name, default=""):
@@ -153,7 +142,8 @@ MAX_FILE_CHARS = 20000
 MAX_IMAGE_BYTES = 3_000_000
 MAX_CHATS = 20
 VISION_MODEL = "qwen/qwen3.8-27b"  # Groq-এর ছবি দেখার (Vision) মডেল
-HF_IMAGE_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
+HF_IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
+HF_EDIT_MODEL = "black-forest-labs/FLUX.1-Kontext-dev"
 
 ELEMENTOR_PROMPT = """You are an expert WordPress and Elementor developer.
 When the user asks for a template, page, section, or block, output ONLY one valid JSON object
@@ -223,6 +213,27 @@ WP_TOOLS = [
         },
     },
 ]
+
+
+# ---------- Intent Detection (ছবি তৈরি বা এডিট বোঝার জন্য) ----------
+CREATE_VERBS = r"(\b(create|make|generate|draw|design)\b|বানাও|বানিয়ে|তৈরি|আঁক)"
+CREATE_NOUNS = r"(\b(logo|poster|banner|thumbnail|wallpaper|avatar|illustration|picture|image|photo)\b|লোগো|ছবি|পোস্টার|ব্যানার)"
+EDIT_PATTERN = (
+    r"(\b(remove|replace|change|edit)\b.*\b(background|clothes|shirt|suit|hair|colou?r|object)\b"
+    r"|ব্যাকগ্রাউন্ড|এডিট|বদলে|সরিয়ে)"
+)
+NOT_VISUAL = r"(\b(code|python|html|css|javascript|js|wordpress|elementor|function|script|plugin|api|json)\b|কোড|ওয়ার্ডপ্রেস|এলিমেন্টর)"
+
+
+def detect_visual_intent(text, has_image):
+    t = text.lower()
+    if has_image:
+        return "edit" if re.search(EDIT_PATTERN, t) else "vision"
+    if re.search(NOT_VISUAL, t):
+        return "chat"
+    if re.search(CREATE_VERBS, t) and re.search(CREATE_NOUNS, t):
+        return "create"
+    return "chat"
 
 
 # ---------- Elementor / WordPress ----------
@@ -319,26 +330,72 @@ def run_agent(model, system_text, history, temp, max_steps=5):
     return "⚠️ Maximum step অতিক্রম করেছে। আবার চেষ্টা করো।"
 
 
-# ---------- Image generation ----------
-def enhance_image_prompt(user_prompt):
-    """বাংলা বা সাধারণ প্রম্পটকে ছবির জন্য নিখুঁত ইংরেজি প্রম্পটে রূপান্তর করে"""
+# ---------- Image generation / editing ----------
+def _llm_rewrite(system_text, user_text):
     try:
         res = client.chat.completions.create(
             model="openai/gpt-oss-20b",
             messages=[
-                {
-                    "role": "system",
-                    "content": "Convert the user's image request into a detailed, high-quality English image generation prompt. Output ONLY the English prompt, nothing else.",
-                },
-                {"role": "user", "content": user_prompt},
+                {"role": "system", "content": system_text},
+                {"role": "user", "content": user_text},
             ],
             temperature=0.6,
             max_tokens=800,
         )
         text = (res.choices[0].message.content or "").strip()
-        return text or user_prompt
+        return text or user_text
     except Exception:
-        return user_prompt
+        return user_text
+
+
+def enhance_image_prompt(user_prompt):
+    """বাংলা বা সাধারণ প্রম্পটকে ছবির জন্য নিখুঁত ইংরেজি প্রম্পটে রূপান্তর করে"""
+    return _llm_rewrite(
+        "Convert the user's image request into a detailed, high-quality English image generation prompt. "
+        "Output ONLY the English prompt, nothing else.",
+        user_prompt,
+    )
+
+
+def enhance_edit_prompt(user_prompt):
+    """এডিটের নির্দেশনাকে ছোট, স্পষ্ট ইংরেজি নির্দেশনায় রূপান্তর করে"""
+    return _llm_rewrite(
+        "Convert the user's image editing request into one short, clear English editing instruction "
+        "(for example: 'Replace the background with a beach at sunset, keep the person unchanged'). "
+        "Output ONLY the instruction, nothing else.",
+        user_prompt,
+    )
+
+
+def _hf_call(fn):
+    """HF InferenceClient: আগে provider=auto, না হলে fal-ai দিয়ে চেষ্টা"""
+    from huggingface_hub import InferenceClient
+
+    last_error = None
+    for provider in ("auto", "fal-ai"):
+        try:
+            return fn(InferenceClient(provider=provider, api_key=HF_TOKEN))
+        except Exception as e:
+            last_error = e
+    raise last_error
+
+
+def _pil_to_bytes(img):
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def hf_text_to_image(prompt):
+    img = _hf_call(lambda c: c.text_to_image(prompt, model=HF_IMAGE_MODEL))
+    return _pil_to_bytes(img)
+
+
+def hf_edit_image(image_bytes, prompt):
+    if not HF_TOKEN:
+        raise RuntimeError("ছবি এডিট করতে HF_TOKEN লাগবে। Secrets বা .env-এ HF_TOKEN সেট করো।")
+    img = _hf_call(lambda c: c.image_to_image(image_bytes, prompt=prompt, model=HF_EDIT_MODEL))
+    return _pil_to_bytes(img)
 
 
 def generate_ai_image(prompt):
@@ -347,16 +404,8 @@ def generate_ai_image(prompt):
 
     if HF_TOKEN:
         try:
-            r = requests.post(
-                HF_IMAGE_URL,
-                headers={"Authorization": f"Bearer {HF_TOKEN}"},
-                json={"inputs": eng_prompt},
-                timeout=120,
-            )
-            ctype = r.headers.get("content-type", "")
-            if r.status_code == 200 and ctype.startswith("image"):
-                return {"bytes": r.content, "mime": ctype.split(";")[0],
-                        "prompt": eng_prompt, "source": "FLUX (Hugging Face)"}
+            return {"bytes": hf_text_to_image(eng_prompt), "mime": "image/png",
+                    "prompt": eng_prompt, "source": "FLUX (Hugging Face)"}
         except Exception:
             pass
 
@@ -371,6 +420,13 @@ def generate_ai_image(prompt):
     if not ctype.startswith("image"):
         raise RuntimeError("ছবি তৈরি করা যায়নি, একটু পরে আবার চেষ্টা করো।")
     return {"bytes": r.content, "mime": ctype, "prompt": eng_prompt, "source": "Pollinations"}
+
+
+def edit_ai_image(image_bytes, instruction):
+    """আপলোড করা ছবি এডিট (FLUX Kontext, HF_TOKEN লাগবে)"""
+    eng = enhance_edit_prompt(instruction)
+    out = hf_edit_image(image_bytes, eng)
+    return {"bytes": out, "mime": "image/png", "prompt": eng, "source": "FLUX Kontext (Hugging Face)"}
 
 
 # ---------- File reader ----------
@@ -464,7 +520,9 @@ with st.sidebar:
             st.warning("WP_URL, WP_USER, WP_APP_PASSWORD সেট করো।")
         st.caption("Tool calling-এর জন্য gpt-oss-120b বা qwen3.8-27b ব্যবহার করো।")
     if is_image_mode:
-        st.caption("HF_TOKEN থাকলে FLUX, না থাকলে ফ্রি জেনারেটর ব্যবহার হবে।")
+        st.caption("ছবি না দিলে নতুন ছবি তৈরি হবে (HF_TOKEN না থাকলে ফ্রি জেনারেটর)। ছবি দিলে সেটি এডিট হবে (HF_TOKEN লাগবে)।")
+    if app_mode.startswith("💬"):
+        st.caption("চ্যাটে 'লোগো বানাও' লিখলে ছবি তৈরি, ছবি দিয়ে 'ব্যাকগ্রাউন্ড বদলাও' লিখলে এডিট হবে।")
 
     file_context = ""
     uploaded_file = None
@@ -494,8 +552,8 @@ with st.sidebar:
         )
         if uploaded_image is not None:
             st.image(uploaded_image.getvalue(), width=160)
-            if is_agent_mode or is_image_mode:
-                st.caption("এই মোডে ছবি ব্যবহার হবে না।")
+            if is_agent_mode:
+                st.caption("Agent মোডে ছবি ব্যবহার হবে না।")
 
     if cur().get("file_name"):
         st.caption(f"📎 এই চ্যাটের ফাইল: {cur()['file_name']}")
@@ -627,13 +685,29 @@ def build_api_messages(history, system_text, use_vision):
     return clean
 
 
+def resolve_intent(last_user):
+    has_image = bool(last_user.get("image"))
+    if is_agent_mode:
+        return "agent"
+    if is_image_mode:
+        return "edit" if has_image else "create"
+    if is_json_mode:
+        return "vision" if has_image else "chat"
+    if last_user.get("attachment"):
+        return "vision" if has_image else "chat"
+    intent = detect_visual_intent(last_user["content"], has_image)
+    if intent == "edit" and not HF_TOKEN:
+        intent = "vision"  # এডিটের জন্য HF_TOKEN না থাকলে সাধারণ ছবি-বিশ্লেষণ
+    return intent
+
+
 # ---------- ইনপুট ----------
 if is_agent_mode:
     placeholder = "যেমন: একটি dark theme architecture Home page বানাও..."
 elif is_json_mode:
     placeholder = "যেমন: একটি মডার্ন Hero Section এর Elementor JSON তৈরি করো..."
 elif is_image_mode:
-    placeholder = "যেমন: সূর্যাস্তের সময় নদীর ধারে একটি নৌকা..."
+    placeholder = "ছবির বর্ণনা লিখুন, অথবা ছবি দিয়ে কী বদলাতে চান লিখুন..."
 else:
     placeholder = "এখানে লিখুন, অথবা ক্লিপ আইকন থেকে ছবি ও ফাইল দিন..."
 
@@ -649,7 +723,7 @@ if user_input:
     inline_img_bytes = None
     inline_img_mime = None
     attach_name = None
-    can_use_image = not (is_agent_mode or is_image_mode)
+    can_use_image = not is_agent_mode
 
     if user_input.files:
         f = user_input.files[0]
@@ -657,7 +731,7 @@ if user_input:
             inline_img_bytes = f.getvalue()
             inline_img_mime = f.type
             if not can_use_image:
-                st.info("এই মোডে ছবি ব্যবহার হবে না। সাধারণ চ্যাট বা JSON মোডে ছবি দাও।")
+                st.info("Agent মোডে ছবি ব্যবহার হবে না। সাধারণ চ্যাট, JSON বা ছবি মোডে ছবি দাও।")
         else:
             try:
                 extracted = read_file(f.name, f.getvalue())
@@ -673,8 +747,11 @@ if user_input:
             elif extracted is not None:
                 st.warning("ফাইলে কোনো text পাওয়া যায়নি (scanned PDF হতে পারে)।")
 
+    if is_image_mode and inline_img_bytes and not prompt:
+        st.info("ছবিটি এডিট করতে কী পরিবর্তন করতে চাও তা লিখে দাও।")
+
     if not prompt:
-        if inline_img_bytes and can_use_image:
+        if inline_img_bytes and can_use_image and not is_image_mode:
             prompt = "এই ছবিটি বিস্তারিত বিশ্লেষণ করে বর্ণনা করো।"
         elif attach_name:
             prompt = f"'{attach_name}' ফাইলটি বিশ্লেষণ করে সংক্ষেপে বোঝাও।"
@@ -732,20 +809,27 @@ if st.session_state.pending:
     else:
         last_user = messages[-1]
         system_instruction = build_system_instruction()
+        intent = resolve_intent(last_user)
         success = False
         with st.chat_message("assistant"):
             try:
-                if is_image_mode:
-                    with st.spinner("🎨 ছবি তৈরি হচ্ছে..."):
-                        img = generate_ai_image(last_user["content"])
+                if intent in ("create", "edit"):
+                    if intent == "create":
+                        with st.spinner("🎨 ছবি তৈরি হচ্ছে..."):
+                            img = generate_ai_image(last_user["content"])
+                        label = "🎨 ছবি তৈরি হয়েছে।"
+                    else:
+                        with st.spinner("🖌️ ছবি এডিট হচ্ছে..."):
+                            img = edit_ai_image(base64.b64decode(last_user["image"]), last_user["content"])
+                        label = "🖌️ ছবি এডিট হয়েছে।"
                     reply_msg = {
                         "role": "assistant",
-                        "content": f"🎨 ছবি তৈরি হয়েছে।\n\n**Prompt:** {img['prompt']}\n\n*Source: {img['source']}*",
+                        "content": f"{label}\n\n**Prompt:** {img['prompt']}\n\n*Source: {img['source']}*",
                         "image": base64.b64encode(img["bytes"]).decode(),
                         "mime": img["mime"],
                     }
                     render_message(reply_msg, len(messages))
-                elif is_agent_mode:
+                elif intent == "agent":
                     if not (WP_URL and WP_AUTH[0] and WP_AUTH[1]):
                         raise ValueError("WP_URL, WP_USER, WP_APP_PASSWORD সেট করা নেই।")
                     history = [{"role": m["role"], "content": m["content"]} for m in get_history()]
