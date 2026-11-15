@@ -12,6 +12,7 @@ from datetime import date
 
 import requests
 import streamlit as st
+from PIL import Image, ImageOps
 from dotenv import load_dotenv
 from groq import Groq
 from pypdf import PdfReader
@@ -151,9 +152,9 @@ WP_AUTH = (get_secret("WP_USER"), get_secret("WP_APP_PASSWORD"))
 MAX_HISTORY = 12
 GROQ_FILE_LIMIT = 20000  # Groq মডেলের জন্য নিরাপদ সীমা
 MAX_FILE_CHARS = 100000 if GEMINI_API_KEY else GROQ_FILE_LIMIT
-MAX_IMAGE_BYTES = 3_000_000
+MAX_IMAGE_BYTES = 2_500_000  # এর চেয়ে বড় ছবি অটো ছোট (compress) করা হবে
 MAX_CHATS = 30
-VISION_MODEL = "qwen/qwen3.8-27b"  # Groq-এর ছবি দেখার (Vision) মডেল
+VISION_MODEL = get_secret("VISION_MODEL") or "qwen/qwen3.8-27b"  # Groq-এর ছবি দেখার (Vision) মডেল
 HF_IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
 HF_EDIT_MODEL = "black-forest-labs/FLUX.1-Kontext-dev"
 try:
@@ -189,6 +190,24 @@ If the user attaches a screenshot, rebuild that design as closely as possible in
 No text outside the code block."""
 
 CHAT_PROMPT = "You are a helpful AI assistant. Answer clearly in the language the user uses."
+
+VISION_PROMPT = """You are a careful, expert teacher and tutor. The user attached an image.
+
+If the image is an exam paper, question paper, homework or any page with questions:
+1. First read the image carefully (it may be a phone photo, slightly tilted or handwritten).
+   Do NOT guess unreadable text; if some part is unclear, say which part and answer the rest.
+2. Go through EVERY question in order, keeping the original question number (1, 2, 3 / ক, খ, গ, ঘ ...).
+3. For each question, write a complete, well-organised answer:
+   - Maths / science / numerical: show the formula, each step of the working, and the final answer clearly.
+   - MCQ: give the correct option and a one-line reason.
+   - Short / broad / creative questions: write a proper answer with a good length matching the marks.
+   - Grammar / fill in the blanks / matching: give the exact answers.
+4. Write the answers in the same language as the questions (Bangla question -> Bangla answer,
+   English question -> English answer) unless the user asks for another language.
+5. Use clean Markdown: a bold heading for each question, short paragraphs, tidy lists.
+
+If the image is NOT a question paper, look at it carefully and do exactly what the user asks
+(describe, explain, read the text, answer a question about it, etc.)."""
 
 AGENT_PROMPT = """You are a WordPress + Elementor assistant connected to the user's real site via tools.
 - To build a page, call create_elementor_page with valid Elementor structure (unique 7-char hex ids, section > column > widget, real widgetType values).
@@ -254,9 +273,18 @@ FOLLOWUP_PATTERN = (
 NOT_VISUAL = r"(\b(code|python|html|css|javascript|js|wordpress|elementor|function|script|plugin|api|json)\b|কোড|ওয়ার্ডপ্রেস|এলিমেন্টর)"
 
 
+SOLVE_PATTERN = (
+    r"(\b(solve|answer|answers|question|questions|exam|paper|homework|assignment|explain|"
+    r"uttar|somadhan|proshno|porikkha)\b"
+    r"|উত্তর|সমাধান|প্রশ্ন|পরীক্ষা|হোমওয়ার্ক|ব্যাখ্যা)"
+)
+
+
 def detect_visual_intent(text, has_image):
     t = text.lower()
     if has_image:
+        if re.search(SOLVE_PATTERN, t):
+            return "vision"
         return "edit" if re.search(EDIT_PATTERN, t) else "vision"
     if re.search(NOT_VISUAL, t):
         return "chat"
@@ -1136,11 +1164,44 @@ with st.sidebar:
         st.caption("⚠️ APP_PASSWORD সেট না থাকলে অ্যাপের লিংক যার কাছে আছে সে সব চ্যাট দেখতে পারবে।")
 
 # ---------- System prompt ----------
+def last_msg_has_image():
+    msgs = cur().get("messages") or []
+    return bool(msgs and msgs[-1].get("role") == "user" and msgs[-1].get("image"))
+
+
+def shrink_image(data, mime, max_bytes=MAX_IMAGE_BYTES):
+    """বড় ছবি (যেমন মোবাইলের ফটো) ছোট করে JPEG বানায়, যাতে AI পাঠাতে পারে। (bytes, mime) ফেরত দেয়।"""
+    if len(data) <= max_bytes:
+        return data, mime or "image/png"
+    img = Image.open(io.BytesIO(data))
+    img = ImageOps.exif_transpose(img)  # ফোনের ঘোরানো ছবি সোজা করে
+    if img.mode not in ("RGB", "L"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        rgba = img.convert("RGBA")
+        bg.paste(rgba, mask=rgba.split()[-1])
+        img = bg
+    elif img.mode == "L":
+        img = img.convert("RGB")
+    side = 2000  # লেখা পড়ার জন্য যথেষ্ট বড়
+    for _ in range(8):
+        work = img.copy()
+        work.thumbnail((side, side), Image.LANCZOS)
+        for q in (88, 80, 70, 60):
+            buf = io.BytesIO()
+            work.save(buf, format="JPEG", quality=q, optimize=True)
+            if buf.tell() <= max_bytes:
+                return buf.getvalue(), "image/jpeg"
+        side = int(side * 0.8)
+    raise RuntimeError("ছবিটি ছোট করা যায়নি")
+
+
 def build_system_instruction(cap=None):
     if is_agent_mode:
         base = AGENT_PROMPT
     elif is_json_mode:
         base = ELEMENTOR_PROMPT
+    elif last_msg_has_image():
+        base = VISION_PROMPT
     else:
         base = CHAT_PROMPT
 
@@ -1208,6 +1269,8 @@ def pick_engine():
     """Gemini কী থাকলে: নিজে বেছে নিলে বা ফাইল বড় হলে Gemini, নইলে Groq"""
     if not GEMINI_API_KEY or is_agent_mode:
         return "groq"
+    if last_msg_has_image():
+        return "gemini"  # ছবি/হাতের লেখা পড়তে Gemini ভালো; ব্যর্থ হলে নিজে থেকেই Groq-এ যাবে
     if engine_choice.startswith("Gemini") or total_file_chars() > GROQ_FILE_LIMIT:
         return "gemini"
     return "groq"
@@ -1344,7 +1407,10 @@ if user_input:
 
     if not prompt:
         if inline_img_bytes and can_use_image and not is_image_mode:
-            prompt = "এই ছবিটি বিস্তারিত বিশ্লেষণ করে বর্ণনা করো।"
+            prompt = (
+                "এই ছবিতে প্রশ্ন বা পরীক্ষার কাগজ থাকলে সব প্রশ্ন পড়ে সুন্দর করে পুরো উত্তর লিখে দাও। "
+                "না থাকলে ছবিটি বিস্তারিত বর্ণনা করো।"
+            )
         elif attach_name:
             prompt = f"'{attach_name}' ফাইলটি বিশ্লেষণ করে সংক্ষেপে বোঝাও।"
 
@@ -1356,26 +1422,34 @@ if user_input:
             user_msg["attachment"] = attach_name
 
         # চ্যাট বক্সের ভেতর থেকে ছবি দিলে সেটি নেওয়া হবে
+        image_failed = False
         if inline_img_bytes and can_use_image:
-            if len(inline_img_bytes) > MAX_IMAGE_BYTES:
-                st.warning("ছবি ৩MB-এর বেশি বড়, তাই যুক্ত করা হয়নি। ছোট ছবি দাও।")
-            else:
-                user_msg["image"] = base64.b64encode(inline_img_bytes).decode()
-                user_msg["mime"] = inline_img_mime or "image/png"
+            try:
+                b, mm = shrink_image(inline_img_bytes, inline_img_mime)
+                user_msg["image"] = base64.b64encode(b).decode()
+                user_msg["mime"] = mm
+            except Exception as e:
+                image_failed = True
+                st.error(f"ছবিটি প্রসেস করা যায়নি: {e}. অন্য ছবি দিয়ে চেষ্টা করো।")
         # অথবা সাইডবার থেকে ছবি দিলে সেটি নেওয়া হবে
         elif uploaded_image is not None and can_use_image:
-            raw_img = uploaded_image.getvalue()
-            if len(raw_img) > MAX_IMAGE_BYTES:
-                st.warning("ছবি ৩MB-এর বেশি বড়, তাই যুক্ত করা হয়নি। ছোট ছবি দাও।")
-            else:
-                user_msg["image"] = base64.b64encode(raw_img).decode()
-                user_msg["mime"] = uploaded_image.type or "image/png"
+            try:
+                b, mm = shrink_image(uploaded_image.getvalue(), uploaded_image.type)
+                user_msg["image"] = base64.b64encode(b).decode()
+                user_msg["mime"] = mm
                 st.session_state.img_counter += 1
+            except Exception as e:
+                image_failed = True
+                st.error(f"ছবিটি প্রসেস করা যায়নি: {e}. অন্য ছবি দিয়ে চেষ্টা করো।")
 
-        if cur()["title"] == "নতুন চ্যাট":
-            cur()["title"] = prompt.replace("\n", " ")[:30]
-        push_message(user_msg)
-        st.session_state.pending = True
+        if image_failed:
+            prompt = ""  # ছবি ছাড়া ভুল উত্তর যাতে না যায়
+
+        if prompt:
+            if cur()["title"] == "নতুন চ্যাট":
+                cur()["title"] = prompt.replace("\n", " ")[:30]
+            push_message(user_msg)
+            st.session_state.pending = True
 
 # ---------- মেসেজ দেখানো ----------
 if not messages and not st.session_state.pending:
@@ -1437,6 +1511,7 @@ if st.session_state.pending:
                 else:
                     history = get_history()
                     use_vision = bool(history and history[-1].get("image"))
+                    temp_eff = min(temperature, 0.3) if use_vision else temperature  # পরীক্ষার উত্তরে নির্ভুলতা দরকার
                     search_block = ""
                     sources_md = ""
 
@@ -1464,7 +1539,7 @@ if st.session_state.pending:
                         try:
                             stream = _prime(gemini_stream(
                                 build_system_instruction(MAX_FILE_CHARS) + search_block,
-                                history, temperature, use_vision,
+                                history, temp_eff, use_vision,
                             ))
                         except Exception as e:
                             st.warning(f"⚠️ Gemini ব্যর্থ ({_short(e)}), Groq দিয়ে উত্তর দেওয়া হচ্ছে।")
@@ -1473,7 +1548,7 @@ if st.session_state.pending:
                         sys_text = build_system_instruction(GROQ_FILE_LIMIT) + search_block
                         model_to_use = VISION_MODEL if use_vision else selected_model
                         api_messages = build_api_messages(history, sys_text, use_vision)
-                        stream = stream_reply(model_to_use, api_messages, temperature)
+                        stream = stream_reply(model_to_use, api_messages, temp_eff)
 
                     reply = st.write_stream(stream)
                     if sources_md:
