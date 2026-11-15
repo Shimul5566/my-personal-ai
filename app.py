@@ -1171,7 +1171,8 @@ with st.sidebar:
 # ---------- System prompt ----------
 def last_msg_has_image():
     msgs = cur().get("messages") or []
-    return bool(msgs and msgs[-1].get("role") == "user" and msgs[-1].get("image"))
+    return any(m.get("role") == "user" and m.get("image") for m in msgs)
+
 
 
 def shrink_image(data, mime, max_bytes=MAX_IMAGE_BYTES):
@@ -1271,14 +1272,14 @@ def render_message(m, idx):
 
 
 def pick_engine():
-    """Gemini কী থাকলে: নিজে বেছে নিলে বা ফাইল বড় হলে Gemini, নইলে Groq"""
     if not GEMINI_API_KEY or is_agent_mode:
         return "groq"
-    if last_msg_has_image():
-        return "gemini"  # ছবি/হাতের লেখা পড়তে Gemini ভালো; ব্যর্থ হলে নিজে থেকেই Groq-এ যাবে
-    if engine_choice.startswith("Gemini") or total_file_chars() > GROQ_FILE_LIMIT:
+    msgs = cur().get("messages") or []
+    history_chars = sum(len(m.get("content", "")) for m in msgs[-MAX_HISTORY:])
+    if last_msg_has_image() or engine_choice.startswith("Gemini") or (total_file_chars() + history_chars) > 10000:
         return "gemini"
     return "groq"
+
 
 
 def stream_reply(model, messages, temp):
