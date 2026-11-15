@@ -17,6 +17,7 @@ from PIL import Image, ImageOps
 from dotenv import load_dotenv
 from groq import Groq
 from pypdf import PdfReader
+from docx import Document
 
 load_dotenv()
 
@@ -69,6 +70,13 @@ st.markdown(
         border: 1px solid #444444 !important;
         border-radius: 10px !important;
     }
+    [data-testid="stFormSubmitButton"] > button, button[kind="secondaryFormSubmit"] {
+        background-color: #2f2f2f !important;
+        color: #ececec !important;
+        border: 1px solid #444444 !important;
+        border-radius: 10px !important;
+    }
+    [data-testid="stForm"] { border: 1px solid #2f2f2f !important; border-radius: 12px !important; }
     .stButton > button:hover, .stDownloadButton > button:hover {
         background-color: #3d3d3d !important;
         border-color: #666666 !important;
@@ -159,6 +167,10 @@ GROQ_INPUT_TOKENS = 5000  # Groq-কে পাঠানো ইনপুটের
 MAX_FILE_CHARS = 3_000_000 if GEMINI_API_KEY else GROQ_FILE_LIMIT
 MAX_IMAGE_BYTES = 2_500_000  # এর চেয়ে বড় ছবি অটো ছোট (compress) করা হবে
 MAX_CHATS = 30
+MAX_IMAGES_PER_MSG = 5     # একসাথে সর্বোচ্চ কয়টি ছবি (Groq Vision-এর সীমাও ৫)
+MAX_MEMORIES = 30        # সর্বোচ্চ কতগুলো মেমোরি রাখা যাবে
+MEMORY_FACT_MAX = 300    # একটি তথ্যের সর্বোচ্চ অক্ষর
+MEMORY_MAX_CHARS = 1500  # AI-কে মোট যত অক্ষরের মেমোরি পাঠানো হবে
 VISION_MODEL = get_secret("VISION_MODEL") or "qwen/qwen3.8-27b"  # Groq-এর ছবি দেখার (Vision) মডেল
 HF_IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
 HF_EDIT_MODEL = "black-forest-labs/FLUX.1-Kontext-dev"
@@ -196,7 +208,9 @@ No text outside the code block."""
 
 CHAT_PROMPT = "You are a helpful AI assistant. Answer clearly in the language the user uses."
 
-VISION_PROMPT = """You are a careful, expert teacher and tutor. The user attached an image.
+VISION_PROMPT = """You are a careful, expert teacher and tutor. The user attached one or more images. If there are several images, treat them as consecutive pages
+of the same document, in the order given, and answer the questions of ALL images one after another
+without skipping or repeating any question.
 
 If the image is an exam paper, question paper, homework or any page with questions:
 1. First read the image carefully (it may be a phone photo, slightly tilted or handwritten).
@@ -426,11 +440,11 @@ def _gemini_error(r):
 
 def gemini_contents(history, use_image):
     contents = []
-    last = len(history) - 1
-    for i, m in enumerate(history):
+    for m in history:
         parts = [{"text": m["content"] or " "}]
-        if use_image and m["role"] == "user" and m.get("image"):
-            parts.append({"inlineData": {"mimeType": m.get("mime") or "image/png", "data": m["image"]}})
+        if use_image and m["role"] == "user":
+            for b64_data, mm in get_msg_images(m):
+                parts.append({"inlineData": {"mimeType": mm, "data": b64_data}})
         contents.append({"role": "user" if m["role"] == "user" else "model", "parts": parts})
     return contents
 
@@ -916,7 +930,22 @@ def init_db():
                 title TEXT NOT NULL,
                 file_name TEXT,
                 file_text TEXT,
+                pinned INTEGER DEFAULT 0,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        # পুরনো ডেটাবেসে pinned কলাম না থাকলে অটোমেটিক যুক্ত করে নেবে
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(chats)").fetchall()]
+        if "pinned" not in cols:
+            conn.execute("ALTER TABLE chats ADD COLUMN pinned INTEGER DEFAULT 0")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fact TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
@@ -936,23 +965,27 @@ def init_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id)")
+        # একাধিক ছবির জন্য নতুন কলাম (পুরনো ডেটাবেসে না থাকলে অটো যুক্ত হবে)
+        mcols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
+        if "images" not in mcols:
+            conn.execute("ALTER TABLE messages ADD COLUMN images TEXT")
 
 
 def db_list_chats():
     with _db() as conn:
         return conn.execute(
-            "SELECT id, title, file_name, file_text FROM chats ORDER BY updated_at ASC, rowid ASC"
+            "SELECT id, title, file_name, file_text, pinned FROM chats ORDER BY updated_at ASC, rowid ASC"
         ).fetchall()
 
 
 def db_load_messages(cid):
     with _db() as conn:
         rows = conn.execute(
-            "SELECT role, content, attachment, image, mime, force FROM messages WHERE chat_id = ? ORDER BY id ASC",
+            "SELECT role, content, attachment, image, mime, force, images FROM messages WHERE chat_id = ? ORDER BY id ASC",
             (cid,),
         ).fetchall()
     out = []
-    for role, content, attachment, image, mime, force in rows:
+    for role, content, attachment, image, mime, force, images_json in rows:
         m = {"role": role, "content": content}
         if attachment:
             m["attachment"] = attachment
@@ -962,6 +995,11 @@ def db_load_messages(cid):
             m["mime"] = mime
         if force:
             m["force"] = force
+        if images_json:
+            try:
+                m["images"] = json.loads(images_json)
+            except Exception:
+                pass
         out.append(m)
     return out
 
@@ -981,8 +1019,11 @@ def db_add_message(cid, chat, msg):
             (cid, chat["title"], chat.get("file_name"), chat.get("file_text")),
         )
         conn.execute(
-            "INSERT INTO messages (chat_id, role, content, attachment, image, mime, force) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (cid, msg["role"], msg["content"], msg.get("attachment"), msg.get("image"), msg.get("mime"), msg.get("force")),
+            "INSERT INTO messages (chat_id, role, content, attachment, image, mime, force, images) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                cid, msg["role"], msg["content"], msg.get("attachment"), msg.get("image"), msg.get("mime"),
+                msg.get("force"), json.dumps(msg["images"]) if msg.get("images") else None,
+            ),
         )
 
 
@@ -1010,6 +1051,26 @@ def db_delete_chat(cid):
         conn.execute("DELETE FROM chats WHERE id = ?", (cid,))
 
 
+def db_toggle_pin(cid, pinned_val):
+    with _db() as conn:
+        conn.execute("UPDATE chats SET pinned = ? WHERE id = ?", (1 if pinned_val else 0, cid))
+
+
+def db_get_memories():
+    with _db() as conn:
+        return conn.execute("SELECT id, fact FROM memories ORDER BY id ASC").fetchall()
+
+
+def db_add_memory(fact):
+    with _db() as conn:
+        conn.execute("INSERT INTO memories (fact) VALUES (?)", (fact.strip(),))
+
+
+def db_delete_memory(mid):
+    with _db() as conn:
+        conn.execute("DELETE FROM memories WHERE id = ?", (mid,))
+
+
 # ---------- Chat session state ----------
 def cur():
     """বর্তমান চ্যাট; মেসেজ প্রথমবার দরকার হলে ডেটাবেস থেকে লোড হয়"""
@@ -1022,7 +1083,10 @@ def cur():
 def trim_chats():
     chats = st.session_state.chats
     while len(chats) > MAX_CHATS:
-        oldest = next((c for c in chats if c != st.session_state.current), None)
+        oldest = next(
+            (c for c in chats if c != st.session_state.current and not chats[c].get("pinned")),
+            None,
+        )  # পিন করা চ্যাট কখনো অটো-ডিলিট হবে না
         if oldest is None:
             break
         del chats[oldest]
@@ -1086,8 +1150,8 @@ if "db_ready" not in st.session_state:
     st.session_state.db_ready = True
 if "chats" not in st.session_state:
     st.session_state.chats = {}
-    for _cid, _title, _fname, _ftext in (_db_safe(db_list_chats, default=[]) or []):
-        _c = {"title": _title, "messages": None}
+    for _cid, _title, _fname, _ftext, _pinned in (_db_safe(db_list_chats, default=[]) or []):
+        _c = {"title": _title, "messages": None, "pinned": bool(_pinned)}
         if _fname:
             _c["file_name"] = _fname
         if _ftext:
@@ -1124,13 +1188,45 @@ with st.sidebar:
     if st.session_state.get("db_error"):
         st.warning(f"⚠️ চ্যাট সেভ করা যাচ্ছে না: {st.session_state['db_error']}")
 
+    search_q = st.text_input(
+        "🔍 চ্যাট খুঁজুন:", placeholder="টাইটেল লিখুন...", label_visibility="collapsed", key="chat_search"
+    )
     st.caption("চ্যাট হিস্টরি")
-    for cid in reversed(list(st.session_state.chats)):
+    _all_ids = list(reversed(list(st.session_state.chats)))  # নতুন → পুরনো
+    _all_ids = [i for i in _all_ids if st.session_state.chats[i].get("pinned")] + [
+        i for i in _all_ids if not st.session_state.chats[i].get("pinned")
+    ]  # পিন করা চ্যাট সবার ওপরে
+    _shown = 0
+    for cid in _all_ids:
         c = st.session_state.chats[cid]
-        icon = "🟢" if cid == st.session_state.current else "💬"
-        if st.button(f"{icon} {c['title'][:26]}", key=f"chat_{cid}"):
+        if search_q and search_q.strip().lower() not in c["title"].lower():
+            continue
+        _shown += 1
+        is_pinned = c.get("pinned", False)
+        icon = "📌" if is_pinned else ("🟢" if cid == st.session_state.current else "💬")
+        if st.button(f"{icon} {c['title'][:24]}", key=f"chat_{cid}"):
             switch_chat(cid)
             st.rerun()
+    if search_q and not _shown:
+        st.caption("কোনো চ্যাট পাওয়া যায়নি।")
+
+    with st.expander("🧠 পার্সোনাল মেমোরি (AI মনে রাখবে)", expanded=False):
+        _mems = _db_safe(db_get_memories, default=[]) or []
+        with st.form("mem_form", clear_on_submit=True):
+            new_mem = st.text_input("নতুন তথ্য লিখুন:", placeholder="যেমন: আমি একজন Web Designer")
+            mem_submitted = st.form_submit_button("➕ মেমোরি সেভ করুন")
+        if mem_submitted and new_mem.strip():
+            if len(_mems) >= MAX_MEMORIES:
+                st.warning(f"সর্বোচ্চ {MAX_MEMORIES}টি মেমোরি রাখা যায়। আগে কিছু মুছুন।")
+            else:
+                _db_safe(db_add_memory, new_mem.strip()[:MEMORY_FACT_MAX])
+                st.rerun()
+        for mid, fact in _mems:
+            col1, col2 = st.columns([5, 1])
+            col1.caption(f"• {fact}")
+            if col2.button("❌", key=f"del_mem_{mid}"):
+                _db_safe(db_delete_memory, mid)
+                st.rerun()
 
     st.divider()
     app_mode = st.radio(
@@ -1196,7 +1292,7 @@ with st.sidebar:
 
     file_context = ""
     uploaded_file = None
-    uploaded_image = None
+    uploaded_images = []
     with st.expander("📎 ফাইল ও ছবি", expanded=False):
         uploaded_file = st.file_uploader(
             "PDF, TXT, PY বা কোড ফাইল:",
@@ -1215,13 +1311,16 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"ফাইল পড়তে সমস্যা হয়েছে: {e}")
 
-        uploaded_image = st.file_uploader(
-            "ছবি দিন (AI ছবি দেখে উত্তর দেবে):",
+        uploaded_images = st.file_uploader(
+            "ছবি দিন (একসাথে একাধিক সিলেক্ট করা যাবে):",
             type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
             key=f"img_up_{st.session_state.img_counter}",
-        )
-        if uploaded_image is not None:
-            st.image(uploaded_image.getvalue(), width=160)
+        ) or []
+        if uploaded_images:
+            _pcols = st.columns(min(len(uploaded_images), 3))
+            for _i, _f in enumerate(uploaded_images):
+                _pcols[_i % 3].image(_f.getvalue(), width=90)
             if is_agent_mode:
                 st.caption("Agent মোডে ছবি ব্যবহার হবে না।")
 
@@ -1245,12 +1344,19 @@ with st.sidebar:
                 _db_safe(db_save_meta, st.session_state.current, cur())
             st.rerun()
 
+    if cur()["messages"]:  # মেসেজ সেভ হওয়ার পরই পিন করা যাবে
+        pin_label = "📍 আনপিন করুন" if cur().get("pinned") else "📌 চ্যাট পিন করুন"
+        if st.button(pin_label, key="pin_chat_btn"):
+            cur()["pinned"] = not cur().get("pinned", False)
+            _db_safe(db_toggle_pin, st.session_state.current, cur()["pinned"])
+            st.rerun()
+
     if st.button("🗑️ এই চ্যাট মুছুন", key="del_chat"):
         delete_current_chat()
         st.rerun()
 
     if cur()["messages"]:
-        export = [{k: v for k, v in m.items() if k not in ("image", "mime")} for m in cur()["messages"]]
+        export = [{k: v for k, v in m.items() if k not in ("image", "images", "mime")} for m in cur()["messages"]]
         st.download_button(
             label="💾 চ্যাট সেভ করুন (.json)",
             data=json.dumps(export, indent=2, ensure_ascii=False),
@@ -1262,9 +1368,48 @@ with st.sidebar:
         st.caption("⚠️ APP_PASSWORD সেট না থাকলে অ্যাপের লিংক যার কাছে আছে সে সব চ্যাট দেখতে পারবে।")
 
 # ---------- System prompt ----------
+def get_msg_images(m):
+    """মেসেজে থাকা এক বা একাধিক ছবি (b64, mime) লিস্ট আকারে দেয়"""
+    if m.get("images"):
+        return [(img["data"], img.get("mime", "image/jpeg")) for img in m["images"]]
+    if m.get("image"):
+        return [(m["image"], m.get("mime", "image/png"))]
+    return []
+
+
+def _add_md_runs(par, text):
+    """**বোল্ড** অংশ বোল্ড রেখে বাকি markdown চিহ্ন সরিয়ে paragraph-এ বসায়"""
+    text = text.replace("`", "")
+    for i, part in enumerate(text.split("**")):
+        if part:
+            par.add_run(part).bold = (i % 2 == 1)
+
+
+def text_to_docx(md_text):
+    """AI-এর উত্তরকে সুন্দর Microsoft Word (.docx) ফাইলে রূপান্তর করে"""
+    doc = Document()
+    for line in (md_text or "").splitlines():
+        clean = line.strip()
+        if not clean or re.fullmatch(r"[-*_]{3,}", clean):
+            continue
+        if clean.startswith("### "):
+            doc.add_heading(clean[4:].replace("**", ""), level=3)
+        elif clean.startswith("## "):
+            doc.add_heading(clean[3:].replace("**", ""), level=2)
+        elif clean.startswith("# "):
+            doc.add_heading(clean[2:].replace("**", ""), level=1)
+        elif clean.startswith(("- ", "* ")):
+            _add_md_runs(doc.add_paragraph(style="List Bullet"), clean[2:])
+        else:
+            _add_md_runs(doc.add_paragraph(), clean)
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
 def last_msg_has_image():
     msgs = cur().get("messages") or []
-    return any(m.get("role") == "user" and m.get("image") for m in msgs)
+    return any(m.get("role") == "user" and get_msg_images(m) for m in msgs)
 
 
 
@@ -1306,6 +1451,15 @@ def build_system_instruction(cap=None):
 
     base = base + f"\n\nToday's date: {date.today().isoformat()}."
 
+    if not is_json_mode:  # JSON মোডে শুধু JSON আউটপুট দরকার, তাই মেমোরি বাদ
+        mems = _db_safe(db_get_memories, default=[]) or []
+        if mems:
+            mem_lines = "\n".join(f"- {fact}" for _, fact in mems)[:MEMORY_MAX_CHARS]
+            base += (
+                "\n\nUSER MEMORY (facts the user saved about themselves; use them naturally when "
+                "relevant, and don't repeat them unprompted):\n" + mem_lines
+            )
+
     cap = cap or GROQ_FILE_LIMIT
     files = []
     if cur().get("file_text"):
@@ -1338,18 +1492,21 @@ def render_message(m, idx):
     if m.get("attachment"):
         st.caption(f"📎 {m['attachment']}")
     st.markdown(m["content"])
-    if m.get("image"):
-        raw = base64.b64decode(m["image"])
+    imgs = get_msg_images(m)
+    if imgs:
         if m["role"] == "user":
-            st.image(raw, width=260)
+            cols = st.columns(min(len(imgs), 3))
+            for i, (b64_data, _) in enumerate(imgs):
+                cols[i % 3].image(base64.b64decode(b64_data), width=220)
         else:
+            raw = base64.b64decode(imgs[0][0])
             st.image(raw, width=512)
-            ext = "jpg" if "jpeg" in m.get("mime", "") else "png"
+            ext = "jpg" if "jpeg" in imgs[0][1] else "png"
             st.download_button(
                 "📥 ছবি ডাউনলোড করুন",
                 data=raw,
                 file_name=f"ai-image-{idx}.{ext}",
-                mime=m.get("mime", "image/png"),
+                mime=imgs[0][1],
                 key=f"img_{st.session_state.current}_{idx}",
             )
     if m["role"] == "assistant":
@@ -1361,6 +1518,14 @@ def render_message(m, idx):
                 file_name=f"wordpress-template-{idx}.json",
                 mime="application/json",
                 key=f"dl_{st.session_state.current}_{idx}",
+            )
+        elif len(m["content"]) > 120 and not imgs:
+            st.download_button(
+                label="📄 Word ফাইল ডাউনলোড (.docx)",
+                data=text_to_docx(m["content"]),
+                file_name=f"ai-answer-{idx}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key=f"docx_{st.session_state.current}_{idx}",
             )
 
 
@@ -1452,31 +1617,30 @@ def build_api_messages(history, system_text, use_vision):
 
     # Vision মডেলে system prompt আলাদা না দিয়ে user মেসেজের সাথে মিশিয়ে দেওয়া হয়
     last = history[-1]
-    data_url = f"data:{last.get('mime', 'image/png')};base64,{last['image']}"
-    clean[-1] = {
-        "role": "user",
-        "content": [
-            {"type": "text", "text": f"{system_text}\n\nUser request: {last['content']}"},
-            {"type": "image_url", "image_url": {"url": data_url}},
-        ],
-    }
+    content = [{"type": "text", "text": f"{system_text}\n\nUser request: {last['content']}"}]
+    for b64_data, mm in get_msg_images(last):
+        content.append({"type": "image_url", "image_url": {"url": f"data:{mm};base64,{b64_data}"}})
+    clean[-1] = {"role": "user", "content": content}
     return clean
 
 
 def get_edit_source(last_user):
     """এডিটের ছবি: এই মেসেজের সাথের ছবি, না থাকলে ঠিক আগের AI-র তৈরি ছবি"""
-    if last_user.get("image"):
-        return last_user["image"], last_user.get("mime", "image/png")
+    imgs = get_msg_images(last_user)
+    if imgs:
+        return imgs[0]  # এডিটে প্রথম ছবিটিই ব্যবহার হয়
     msgs = cur()["messages"]
-    if len(msgs) >= 2 and msgs[-2]["role"] == "assistant" and msgs[-2].get("image"):
-        return msgs[-2]["image"], msgs[-2].get("mime", "image/png")
+    if len(msgs) >= 2 and msgs[-2]["role"] == "assistant":
+        prev = get_msg_images(msgs[-2])
+        if prev:
+            return prev[0]
     return None
 
 
 def resolve_intent(last_user):
     if is_agent_mode:
         return "agent"
-    has_image = bool(last_user.get("image"))
+    has_image = bool(get_msg_images(last_user))
     force = last_user.get("force")
     if force == "create":
         return "create"
@@ -1517,48 +1681,46 @@ else:
 
 user_input = st.chat_input(
     placeholder,
-    accept_file=True,
+    accept_file="multiple",
     file_type=["png", "jpg", "jpeg", "webp", "pdf", "txt", "py", "html", "css", "js", "json", "md"],
 )
 messages = cur()["messages"]
 
 if user_input:
     force, prompt = parse_command((user_input.text or "").strip())
-    inline_img_bytes = None
-    inline_img_mime = None
+    inline_imgs = []
     attach_name = None
     can_use_image = not is_agent_mode
 
     if user_input.files:
-        f = user_input.files[0]
-        if f.type and f.type.startswith("image/"):
-            inline_img_bytes = f.getvalue()
-            inline_img_mime = f.type
-            if not can_use_image:
-                st.info("Agent মোডে ছবি ব্যবহার হবে না। সাধারণ চ্যাট, JSON বা ছবি মোডে ছবি দাও।")
-        else:
-            try:
-                extracted = read_file(f.name, f.getvalue())
-            except Exception as e:
-                extracted = None
-                st.warning(f"ফাইল পড়তে সমস্যা হয়েছে: {e}")
-            if extracted and extracted.strip():
-                cur()["file_name"] = f.name
-                cur()["file_text"] = extracted[:MAX_FILE_CHARS]
-                attach_name = f.name
-                if len(extracted) > MAX_FILE_CHARS:
-                    st.info(f"ফাইল বড়, শুধু প্রথম {MAX_FILE_CHARS} অক্ষর ব্যবহার হবে।")
-            elif extracted is not None:
-                st.warning("ফাইলে কোনো text পাওয়া যায়নি (scanned PDF হতে পারে)।")
+        for f in user_input.files:
+            if f.type and f.type.startswith("image/"):
+                inline_imgs.append((f.getvalue(), f.type))
+            else:
+                try:
+                    extracted = read_file(f.name, f.getvalue())
+                except Exception as e:
+                    extracted = None
+                    st.warning(f"ফাইল পড়তে সমস্যা হয়েছে: {e}")
+                if extracted and extracted.strip():
+                    cur()["file_name"] = f.name
+                    cur()["file_text"] = extracted[:MAX_FILE_CHARS]
+                    attach_name = f.name
+                    if len(extracted) > MAX_FILE_CHARS:
+                        st.info(f"ফাইল বড়, শুধু প্রথম {MAX_FILE_CHARS} অক্ষর ব্যবহার হবে।")
+                elif extracted is not None:
+                    st.warning("ফাইলে কোনো text পাওয়া যায়নি (scanned PDF হতে পারে)।")
+        if inline_imgs and not can_use_image:
+            st.info("Agent মোডে ছবি ব্যবহার হবে না। সাধারণ চ্যাট, JSON বা ছবি মোডে ছবি দাও।")
 
-    if is_image_mode and inline_img_bytes and not prompt:
+    if is_image_mode and inline_imgs and not prompt:
         st.info("ছবিটি এডিট করতে কী পরিবর্তন করতে চাও তা লিখে দাও।")
 
     if not prompt:
-        if inline_img_bytes and can_use_image and not is_image_mode:
+        if (inline_imgs or uploaded_images) and can_use_image and not is_image_mode:
             prompt = (
-                "এই ছবিতে প্রশ্ন বা পরীক্ষার কাগজ থাকলে সব প্রশ্ন পড়ে সুন্দর করে পুরো উত্তর লিখে দাও। "
-                "না থাকলে ছবিটি বিস্তারিত বর্ণনা করো।"
+                "এই ছবি/ছবিগুলোতে প্রশ্ন বা পরীক্ষার কাগজ থাকলে সব ছবির সব প্রশ্ন ধারাবাহিকভাবে পড়ে সুন্দর করে পুরো উত্তর লিখে দাও। "
+                "না থাকলে ছবিগুলো বিস্তারিত বর্ণনা করো।"
             )
         elif attach_name:
             prompt = f"'{attach_name}' ফাইলটি বিশ্লেষণ করে সংক্ষেপে বোঝাও।"
@@ -1572,24 +1734,25 @@ if user_input:
 
         # চ্যাট বক্সের ভেতর থেকে ছবি দিলে সেটি নেওয়া হবে
         image_failed = False
-        if inline_img_bytes and can_use_image:
-            try:
-                b, mm = shrink_image(inline_img_bytes, inline_img_mime)
-                user_msg["image"] = base64.b64encode(b).decode()
-                user_msg["mime"] = mm
-            except Exception as e:
-                image_failed = True
-                st.error(f"ছবিটি প্রসেস করা যায়নি: {e}. অন্য ছবি দিয়ে চেষ্টা করো।")
-        # অথবা সাইডবার থেকে ছবি দিলে সেটি নেওয়া হবে
-        elif uploaded_image is not None and can_use_image:
-            try:
-                b, mm = shrink_image(uploaded_image.getvalue(), uploaded_image.type)
-                user_msg["image"] = base64.b64encode(b).decode()
-                user_msg["mime"] = mm
-                st.session_state.img_counter += 1
-            except Exception as e:
-                image_failed = True
-                st.error(f"ছবিটি প্রসেস করা যায়নি: {e}. অন্য ছবি দিয়ে চেষ্টা করো।")
+        # অথবা সাইডবার থেকে ছবি দিলে সেগুলো নেওয়া হবে
+        from_sidebar = not inline_imgs and bool(uploaded_images)
+        src_imgs = inline_imgs or [(f.getvalue(), f.type) for f in uploaded_images]
+        if src_imgs and can_use_image:
+            if len(src_imgs) > MAX_IMAGES_PER_MSG:
+                st.info(f"একসাথে সর্বোচ্চ {MAX_IMAGES_PER_MSG}টি ছবি নেওয়া হয়; প্রথম {MAX_IMAGES_PER_MSG}টি ব্যবহার হবে।")
+            processed = []
+            for raw_img, raw_mime in src_imgs[:MAX_IMAGES_PER_MSG]:
+                try:
+                    b, mm = shrink_image(raw_img, raw_mime)
+                    processed.append({"data": base64.b64encode(b).decode(), "mime": mm})
+                except Exception as e:
+                    image_failed = True
+                    st.error(f"একটি ছবি প্রসেস করা যায়নি: {e}. অন্য ছবি দিয়ে চেষ্টা করো।")
+                    break
+            if not image_failed:
+                user_msg["images"] = processed
+                if from_sidebar:
+                    st.session_state.img_counter += 1
 
         if image_failed:
             prompt = ""  # ছবি ছাড়া ভুল উত্তর যাতে না যায়
@@ -1698,7 +1861,7 @@ if st.session_state.pending:
                         sys_text, g_history, g_trimmed = fit_for_groq(sys_text, history)
                         if g_trimmed:
                             st.info("ℹ️ Groq-এর সীমার কারণে ফাইল/আগের চ্যাটের কিছু অংশ বাদ দেওয়া হয়েছে। পুরোটা পড়াতে Gemini ইঞ্জিন বেছে নাও।")
-                        has_last_img = bool(g_history and g_history[-1].get("image"))
+                        has_last_img = bool(g_history and get_msg_images(g_history[-1]))
                         model_to_use = VISION_MODEL if has_last_img else selected_model
                         api_messages = build_api_messages(g_history, sys_text, has_last_img)
                         stream = stream_reply(model_to_use, api_messages, temp_eff)
