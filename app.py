@@ -6,6 +6,7 @@ import uuid
 import base64
 import itertools
 import sqlite3
+import time
 import urllib.parse
 from contextlib import contextmanager
 from datetime import date
@@ -151,6 +152,10 @@ WP_AUTH = (get_secret("WP_USER"), get_secret("WP_APP_PASSWORD"))
 
 MAX_HISTORY = 12
 GROQ_FILE_LIMIT = 20000  # Groq মডেলের জন্য নিরাপদ সীমা
+# Groq ফ্রি টায়ারে প্রতি মিনিটে মোট ~8000 টোকেন (ইনপুট + max_tokens মিলিয়ে)। তাই দুটোই ছোট রাখা হয়েছে।
+GROQ_MAX_OUT = 2500       # Groq উত্তরের সর্বোচ্চ টোকেন
+GROQ_AGENT_MAX_OUT = 4000
+GROQ_INPUT_TOKENS = 5000  # Groq-কে পাঠানো ইনপুটের আনুমানিক সর্বোচ্চ টোকেন
 MAX_FILE_CHARS = 100000 if GEMINI_API_KEY else GROQ_FILE_LIMIT
 MAX_IMAGE_BYTES = 2_500_000  # এর চেয়ে বড় ছবি অটো ছোট (compress) করা হবে
 MAX_CHATS = 30
@@ -376,7 +381,7 @@ def run_agent(model, system_text, history, temp, max_steps=5):
             tools=WP_TOOLS,
             tool_choice="auto",
             temperature=temp,
-            max_tokens=8000,
+            max_tokens=GROQ_AGENT_MAX_OUT,
         )
         m = resp.choices[0].message
         if not m.tool_calls:
@@ -430,46 +435,86 @@ def gemini_contents(history, use_image):
     return contents
 
 
-def gemini_stream(system_text, history, temp, use_image):
-    """Gemini থেকে লেখা একটু একটু করে আসে (SSE)"""
-    body = {
+GEMINI_FALLBACK_MODELS = ("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash")
+_RETRY_CODES = (500, 502, 503, 504)
+
+
+def _gemini_body(system_text, history, temp, use_image, thinking):
+    gen_cfg = {"temperature": temp, "maxOutputTokens": 8000}
+    if thinking:
+        gen_cfg["thinkingConfig"] = {"thinkingBudget": 1024}
+    return {
         "systemInstruction": {"parts": [{"text": system_text}]},
         "contents": gemini_contents(history, use_image),
-        "generationConfig": {
-    "temperature": temp,
-    "maxOutputTokens": 8000,
-    "thinkingConfig": {"thinkingBudget": 1024},
-},
-
+        "generationConfig": gen_cfg,
     }
-    url = f"{GEMINI_BASE}/{GEMINI_MODEL}:streamGenerateContent?alt=sse"
-    with requests.post(url, headers=_gemini_headers(), json=body, stream=True, timeout=120) as r:
-        if r.status_code != 200:
-            raise RuntimeError(_gemini_error(r))
-        got_text = False
-        for raw in r.iter_lines():
-            if not raw:
-                continue
-            line = raw.decode("utf-8", errors="ignore")
-            if not line.startswith("data:"):
-                continue
-            payload = line[5:].strip()
-            if payload == "[DONE]":
-                break
+
+
+def gemini_stream(system_text, history, temp, use_image):
+    """Gemini থেকে লেখা একটু একটু করে আসে (SSE)। ব্যস্ত থাকলে আবার চেষ্টা করে, তারপর পরের মডেলে যায়।"""
+    models_to_try = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
+    last_err = None
+
+    for m_name in models_to_try:
+        # thinkingBudget শুধু 2.5 মডেলে চলে; 2.0 মডেলে দিলে 400 এরর আসে
+        use_thinking = "2.5" in m_name
+        url = f"{GEMINI_BASE}/{m_name}:streamGenerateContent?alt=sse"
+
+        for attempt in range(2):  # একই মডেলে সর্বোচ্চ ২ বার
+            body = _gemini_body(system_text, history, temp, use_image, use_thinking)
             try:
-                obj = json.loads(payload)
-            except Exception:
-                continue
-            block = (obj.get("promptFeedback") or {}).get("blockReason")
-            if block:
-                raise RuntimeError(f"Gemini অনুরোধ আটকে দিয়েছে ({block})")
-            for cand in obj.get("candidates", []):
-                for part in (cand.get("content") or {}).get("parts", []):
-                    if part.get("text") and not part.get("thought"):
-                        got_text = True
-                        yield part["text"]
-        if not got_text:
-            raise RuntimeError("Gemini কোনো উত্তর দেয়নি")
+                r = requests.post(url, headers=_gemini_headers(), json=body, stream=True, timeout=120)
+            except requests.RequestException as e:
+                last_err = f"Gemini নেটওয়ার্ক সমস্যা: {str(e)[:150]}"
+                break
+
+            with r:
+                if r.status_code != 200:
+                    last_err = _gemini_error(r)
+                    if r.status_code == 400 and use_thinking and "think" in last_err.lower():
+                        use_thinking = False  # thinking সাপোর্ট নেই, ছাড়া আবার চেষ্টা
+                        continue
+                    if r.status_code in _RETRY_CODES and attempt == 0:
+                        time.sleep(1.5)  # সাময়িক ভিড় (503), একটু থেমে আবার
+                        continue
+                    if r.status_code in (404, 429) or r.status_code in _RETRY_CODES:
+                        break  # পরের মডেলে যাও
+                    raise RuntimeError(last_err)  # 400/401/403 ইত্যাদি: মডেল বদলে লাভ নেই
+
+                got_text = False
+                try:
+                    for raw in r.iter_lines():
+                        if not raw:
+                            continue
+                        line = raw.decode("utf-8", errors="ignore")
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(payload)
+                        except Exception:
+                            continue
+                        block = (obj.get("promptFeedback") or {}).get("blockReason")
+                        if block:
+                            raise RuntimeError(f"Gemini অনুরোধ আটকে দিয়েছে ({block})")
+                        for cand in obj.get("candidates", []):
+                            for part in (cand.get("content") or {}).get("parts", []):
+                                if part.get("text") and not part.get("thought"):
+                                    got_text = True
+                                    yield part["text"]
+                except requests.RequestException as e:
+                    if got_text:  # অর্ধেক লেখার পর কাটলে আবার শুরু করলে লেখা দ্বিগুণ হবে
+                        raise RuntimeError(f"Gemini সংযোগ কেটে গেছে: {str(e)[:150]}")
+                    last_err = f"Gemini নেটওয়ার্ক সমস্যা: {str(e)[:150]}"
+                    break
+                if got_text:
+                    return
+                last_err = "Gemini কোনো উত্তর দেয়নি"
+                break
+
+    raise RuntimeError(last_err or "Gemini ব্যর্থ হয়েছে")
 
 
 def _prime(gen):
@@ -1282,12 +1327,60 @@ def pick_engine():
 
 
 
+def est_tokens(s):
+    """টোকেনের মোটামুটি হিসাব (বাংলা অক্ষর ~১ টোকেন, ইংরেজি ~৩ অক্ষরে ১)"""
+    s = s or ""
+    non_ascii = sum(1 for ch in s if ord(ch) > 127)
+    return non_ascii + (len(s) - non_ascii) // 3 + 1
+
+
+def fit_for_groq(sys_text, history, budget=GROQ_INPUT_TOKENS):
+    """Groq-এর সীমায় ধরাতে system/ফাইল ও আগের চ্যাট ছোট করে। (sys_text, history, trimmed) ফেরত দেয়।"""
+    trimmed = False
+    sys_budget = int(budget * 0.6)
+    t_sys = est_tokens(sys_text)
+    if t_sys > sys_budget:
+        sys_text = sys_text[: int(len(sys_text) * sys_budget / t_sys)] + "\n...[ছোট করা হয়েছে]"
+        trimmed = True
+    remaining = budget - est_tokens(sys_text)
+
+    kept = []
+    for m in reversed(history):
+        t = est_tokens(m.get("content") or "")
+        if not kept:  # সর্বশেষ প্রশ্ন সবসময় থাকবে, দরকারে ছোট করে
+            floor = max(remaining, 600)
+            if t > floor:
+                m = dict(m, content=m["content"][: int(len(m["content"]) * floor / t)])
+                t = floor
+                trimmed = True
+        elif t > remaining:
+            trimmed = True
+            break
+        kept.append(m)
+        remaining -= t
+    kept.reverse()
+    while kept and kept[0]["role"] != "user":
+        kept.pop(0)
+    return sys_text, kept, trimmed
+
+
+def friendly_error(e):
+    s = str(e)
+    low = s.lower()
+    if "413" in s or "rate_limit" in low or "tokens per minute" in low or "429" in s:
+        return ("Groq-এর টোকেন/রেট সীমা পার হয়ে গেছে। ১ মিনিট অপেক্ষা করে আবার চেষ্টা করো, "
+                "বা সেটিংস থেকে Gemini ইঞ্জিন বেছে নাও। (ছোট ছবি/কম লেখা দিলেও কাজ করবে)")
+    if "503" in s or "overloaded" in low or "high demand" in low:
+        return "AI সার্ভার এখন খুব ব্যস্ত। একটু পরে আবার চেষ্টা করো।"
+    return f"একটি সমস্যা হয়েছে: {s}"
+
+
 def stream_reply(model, messages, temp):
     stream = client.chat.completions.create(
         model=model,
         messages=messages,
         temperature=temp,
-        max_tokens=8000,
+        max_tokens=GROQ_MAX_OUT,
         stream=True,
     )
     for chunk in stream:
@@ -1552,8 +1645,11 @@ if st.session_state.pending:
 
                     if stream is None:
                         sys_text = build_system_instruction(GROQ_FILE_LIMIT) + search_block
+                        sys_text, g_history, g_trimmed = fit_for_groq(sys_text, history)
+                        if g_trimmed:
+                            st.info("ℹ️ Groq-এর সীমার কারণে ফাইল/আগের চ্যাটের কিছু অংশ বাদ দেওয়া হয়েছে। পুরোটা পড়াতে Gemini ইঞ্জিন বেছে নাও।")
                         model_to_use = VISION_MODEL if use_vision else selected_model
-                        api_messages = build_api_messages(history, sys_text, use_vision)
+                        api_messages = build_api_messages(g_history, sys_text, use_vision)
                         stream = stream_reply(model_to_use, api_messages, temp_eff)
 
                     reply = st.write_stream(stream)
@@ -1566,7 +1662,7 @@ if st.session_state.pending:
                 success = True
             except Exception as e:
                 pop_message()
-                st.error(f"একটি সমস্যা হয়েছে: {e}")
+                st.error(friendly_error(e))
 
         st.session_state.pending = False
         if success:
