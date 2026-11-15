@@ -588,25 +588,60 @@ elif is_json_mode:
 elif is_image_mode:
     placeholder = "যেমন: সূর্যাস্তের সময় নদীর ধারে একটি নৌকা..."
 else:
-    placeholder = "এখানে আপনার প্রশ্ন লিখুন..."
+    placeholder = "এখানে লিখুন, অথবা ক্লিপ আইকন থেকে ছবি ও ফাইল দিন..."
 
-prompt = st.chat_input(placeholder)
+user_input = st.chat_input(
+    placeholder,
+    accept_file=True,
+    file_type=["png", "jpg", "jpeg", "webp", "pdf", "txt", "py", "html", "css", "js", "json", "md"],
+)
 messages = cur()["messages"]
 
-if prompt:
-    user_msg = {"role": "user", "content": prompt}
-    if uploaded_image is not None and not (is_agent_mode or is_image_mode):
-        raw_img = uploaded_image.getvalue()
-        if len(raw_img) > MAX_IMAGE_BYTES:
-            st.warning("ছবি ৩MB-এর বেশি বড়, তাই যুক্ত করা হয়নি। ছোট ছবি দাও।")
+if user_input:
+    prompt = user_input.text or ""
+    attached_file_text = ""
+    inline_img_bytes = None
+    inline_img_mime = None
+
+    if user_input.files:
+        f = user_input.files[0]
+        if f.type and f.type.startswith("image/"):
+            inline_img_bytes = f.getvalue()
+            inline_img_mime = f.type
+            if not prompt:
+                prompt = "এই ছবিটি বিস্তারিত বিশ্লেষণ করে বর্ণনা করো।"
         else:
-            user_msg["image"] = base64.b64encode(raw_img).decode()
-            user_msg["mime"] = uploaded_image.type or "image/png"
-            st.session_state.img_counter += 1  # আপলোডার খালি করে দেয়
-    if cur()["title"] == "নতুন চ্যাট":
-        cur()["title"] = prompt.strip().replace("\n", " ")[:30]
-    messages.append(user_msg)
-    st.session_state.pending = True
+            extracted = read_file(f.name, f.getvalue())
+            if extracted.strip():
+                attached_file_text = f"\n\n[Attached File: {f.name}]\n{extracted[:MAX_FILE_CHARS]}"
+                if not prompt:
+                    prompt = f"'{f.name}' ফাইলটি বিশ্লেষণ করে সংক্ষেপে বোঝাও।"
+
+    if prompt or inline_img_bytes or attached_file_text:
+        full_content = prompt + attached_file_text
+        user_msg = {"role": "user", "content": full_content}
+
+        # চ্যাট বক্সের ভেতর থেকে ছবি দিলে সেটি নেওয়া হবে
+        if inline_img_bytes and not (is_agent_mode or is_image_mode):
+            if len(inline_img_bytes) > MAX_IMAGE_BYTES:
+                st.warning("ছবি ৩MB-এর বেশি বড়, তাই যুক্ত করা হয়নি। ছোট ছবি দাও।")
+            else:
+                user_msg["image"] = base64.b64encode(inline_img_bytes).decode()
+                user_msg["mime"] = inline_img_mime or "image/png"
+        # অথবা সাইডবার থেকে ছবি দিলে সেটি নেওয়া হবে
+        elif uploaded_image is not None and not (is_agent_mode or is_image_mode):
+            raw_img = uploaded_image.getvalue()
+            if len(raw_img) > MAX_IMAGE_BYTES:
+                st.warning("ছবি ৩MB-এর বেশি বড়, তাই যুক্ত করা হয়নি। ছোট ছবি দাও।")
+            else:
+                user_msg["image"] = base64.b64encode(raw_img).decode()
+                user_msg["mime"] = uploaded_image.type or "image/png"
+                st.session_state.img_counter += 1
+
+        if cur()["title"] == "নতুন চ্যাট":
+            cur()["title"] = (prompt or "ফাইল/ছবি বিশ্লেষণ").strip().replace("\n", " ")[:30]
+        messages.append(user_msg)
+        st.session_state.pending = True
 
 # ---------- মেসেজ দেখানো ----------
 if not messages and not st.session_state.pending:
