@@ -136,7 +136,7 @@ if not api_key:
     st.stop()
 
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
-GEMINI_MODEL = get_secret("GEMINI_MODEL") or "gemini-2.5-flash"
+GEMINI_MODEL = get_secret("GEMINI_MODEL") or "gemini-3.8-flash"
 GEMINI_IMAGE_MODEL = get_secret("GEMINI_IMAGE_MODEL") or "gemini-2.5-flash-image"
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 HF_TOKEN = get_secret("HF_TOKEN")
