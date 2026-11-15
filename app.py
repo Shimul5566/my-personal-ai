@@ -156,7 +156,7 @@ GROQ_FILE_LIMIT = 20000  # Groq মডেলের জন্য নিরাপ�
 GROQ_MAX_OUT = 2500       # Groq উত্তরের সর্বোচ্চ টোকেন
 GROQ_AGENT_MAX_OUT = 4000
 GROQ_INPUT_TOKENS = 5000  # Groq-কে পাঠানো ইনপুটের আনুমানিক সর্বোচ্চ টোকেন
-MAX_FILE_CHARS = 100000 if GEMINI_API_KEY else GROQ_FILE_LIMIT
+MAX_FILE_CHARS = 3_000_000 if GEMINI_API_KEY else GROQ_FILE_LIMIT
 MAX_IMAGE_BYTES = 2_500_000  # এর চেয়ে বড় ছবি অটো ছোট (compress) করা হবে
 MAX_CHATS = 30
 VISION_MODEL = get_secret("VISION_MODEL") or "qwen/qwen3.8-27b"  # Groq-এর ছবি দেখার (Vision) মডেল
@@ -1644,13 +1644,20 @@ if st.session_state.pending:
                             st.warning(f"⚠️ Gemini ব্যর্থ ({_short(e)}), Groq দিয়ে উত্তর দেওয়া হচ্ছে।")
 
                     if stream is None:
+                        if total_file_chars() > GROQ_FILE_LIMIT:
+                            raise RuntimeError(
+                                "ফাইলটি অনেক বড় হওয়ায় শুধুমাত্র Gemini এটি পুরোপুরি পড়তে পারবে। "
+                                "এখন Gemini সার্ভার সাময়িক ব্যস্ত আছে, দয়া করে ১০-১৫ সেকেন্ড পর আবার চেষ্টা করুন।"
+                            )
                         sys_text = build_system_instruction(GROQ_FILE_LIMIT) + search_block
                         sys_text, g_history, g_trimmed = fit_for_groq(sys_text, history)
                         if g_trimmed:
-                            st.info("ℹ️ Groq-এর সীমার কারণে ফাইল/আগের চ্যাটের কিছু অংশ বাদ দেওয়া হয়েছে। পুরোটা পড়াতে Gemini ইঞ্জিন বেছে নাও।")
-                        model_to_use = VISION_MODEL if use_vision else selected_model
-                        api_messages = build_api_messages(g_history, sys_text, use_vision)
+                            st.info("ℹ️ Groq-এর সীমার কারণে আগের চ্যাটের কিছু অংশ বাদ দেওয়া হয়েছে।")
+                        has_last_img = bool(history and history[-1].get("image"))
+                        model_to_use = VISION_MODEL if has_last_img else selected_model
+                        api_messages = build_api_messages(g_history, sys_text, has_last_img)
                         stream = stream_reply(model_to_use, api_messages, temp_eff)
+
 
                     reply = st.write_stream(stream)
                     if sources_md:
