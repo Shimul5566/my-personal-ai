@@ -4,7 +4,9 @@ import re
 import json
 import uuid
 import base64
+import sqlite3
 import urllib.parse
+from contextlib import contextmanager
 from datetime import date
 
 import requests
@@ -145,10 +147,15 @@ WP_AUTH = (get_secret("WP_USER"), get_secret("WP_APP_PASSWORD"))
 MAX_HISTORY = 12
 MAX_FILE_CHARS = 20000
 MAX_IMAGE_BYTES = 3_000_000
-MAX_CHATS = 20
+MAX_CHATS = 30
 VISION_MODEL = "qwen/qwen3.8-27b"  # Groq-এর ছবি দেখার (Vision) মডেল
 HF_IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
 HF_EDIT_MODEL = "black-forest-labs/FLUX.1-Kontext-dev"
+try:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _BASE_DIR = os.getcwd()
+DB_FILE = get_secret("CHAT_DB_PATH") or os.path.join(_BASE_DIR, "chat_history.db")
 
 IMAGE_SIZES = {
     "⬜ বর্গাকার (1024×1024)": (1024, 1024, "1024x1024"),
@@ -593,6 +600,7 @@ def edit_ai_image(image_bytes, instruction, mime, quality):
         "notes": notes,
     }
 
+
 # ---------- Web search (Tavily) ----------
 def search_query(user_text):
     return _llm_rewrite(
@@ -622,36 +630,228 @@ def read_file(name, data: bytes):
     return data.decode("utf-8", errors="ignore")
 
 
+# ---------- SQLite ডেটাবেস (স্থায়ী চ্যাট হিস্ট্রি) ----------
+@contextmanager
+def _db():
+    """কানেকশন কাজ শেষে commit/rollback করে বন্ধ করে দেয় (লিক হয় না)"""
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _db_safe(fn, *args, default=None):
+    """ডেটাবেস সমস্যা হলে অ্যাপ বন্ধ না করে শুধু সতর্কবার্তা দেখায়"""
+    try:
+        return fn(*args)
+    except Exception as e:
+        st.session_state["db_error"] = str(e)[:200]
+        return default
+
+
+def init_db():
+    with _db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chats (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                file_name TEXT,
+                file_text TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                attachment TEXT,
+                image TEXT,
+                mime TEXT,
+                force TEXT,
+                FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id)")
+
+
+def db_list_chats():
+    with _db() as conn:
+        return conn.execute(
+            "SELECT id, title, file_name, file_text FROM chats ORDER BY updated_at ASC, rowid ASC"
+        ).fetchall()
+
+
+def db_load_messages(cid):
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT role, content, attachment, image, mime, force FROM messages WHERE chat_id = ? ORDER BY id ASC",
+            (cid,),
+        ).fetchall()
+    out = []
+    for role, content, attachment, image, mime, force in rows:
+        m = {"role": role, "content": content}
+        if attachment:
+            m["attachment"] = attachment
+        if image:
+            m["image"] = image
+        if mime:
+            m["mime"] = mime
+        if force:
+            m["force"] = force
+        out.append(m)
+    return out
+
+
+def db_add_message(cid, chat, msg):
+    with _db() as conn:
+        conn.execute(
+            """
+            INSERT INTO chats (id, title, file_name, file_text, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                file_name = excluded.file_name,
+                file_text = excluded.file_text,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (cid, chat["title"], chat.get("file_name"), chat.get("file_text")),
+        )
+        conn.execute(
+            "INSERT INTO messages (chat_id, role, content, attachment, image, mime, force) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (cid, msg["role"], msg["content"], msg.get("attachment"), msg.get("image"), msg.get("mime"), msg.get("force")),
+        )
+
+
+def db_pop_last_message(cid):
+    with _db() as conn:
+        row = conn.execute("SELECT MAX(id) FROM messages WHERE chat_id = ?", (cid,)).fetchone()
+        if row and row[0] is not None:
+            conn.execute("DELETE FROM messages WHERE id = ?", (row[0],))
+        left = conn.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ?", (cid,)).fetchone()[0]
+        if left == 0:
+            conn.execute("DELETE FROM chats WHERE id = ?", (cid,))
+
+
+def db_save_meta(cid, chat):
+    with _db() as conn:
+        conn.execute(
+            "UPDATE chats SET title = ?, file_name = ?, file_text = ? WHERE id = ?",
+            (chat["title"], chat.get("file_name"), chat.get("file_text"), cid),
+        )
+
+
+def db_delete_chat(cid):
+    with _db() as conn:
+        conn.execute("DELETE FROM messages WHERE chat_id = ?", (cid,))
+        conn.execute("DELETE FROM chats WHERE id = ?", (cid,))
+
+
 # ---------- Chat session state ----------
+def cur():
+    """বর্তমান চ্যাট; মেসেজ প্রথমবার দরকার হলে ডেটাবেস থেকে লোড হয়"""
+    chat = st.session_state.chats[st.session_state.current]
+    if chat["messages"] is None:
+        chat["messages"] = _db_safe(db_load_messages, st.session_state.current, default=[]) or []
+    return chat
+
+
+def trim_chats():
+    chats = st.session_state.chats
+    while len(chats) > MAX_CHATS:
+        oldest = next((c for c in chats if c != st.session_state.current), None)
+        if oldest is None:
+            break
+        del chats[oldest]
+        _db_safe(db_delete_chat, oldest)
+
+
 def new_chat():
+    chats = st.session_state.chats
+    current = st.session_state.get("current")
+    st.session_state.pending = False
+    if current in chats and chats[current]["messages"] == []:
+        return  # খালি চ্যাট আছে, নতুন না বানিয়ে সেটাই ব্যবহার হবে
     cid = uuid.uuid4().hex[:8]
-    st.session_state.chats[cid] = {"title": "নতুন চ্যাট", "messages": []}
+    chats[cid] = {"title": "নতুন চ্যাট", "messages": []}
+    st.session_state.current = cid
+    trim_chats()
+
+
+def switch_chat(cid):
+    chats = st.session_state.chats
+    prev = st.session_state.current
+    if prev != cid and prev in chats and chats[prev]["messages"] == []:
+        del chats[prev]  # খালি, সংরক্ষিত নয় এমন চ্যাট বাদ
     st.session_state.current = cid
     st.session_state.pending = False
-    while len(st.session_state.chats) > MAX_CHATS:
-        oldest = next(iter(st.session_state.chats))
-        if oldest == cid:
-            break
-        del st.session_state.chats[oldest]
 
 
+def delete_current_chat():
+    chats = st.session_state.chats
+    cid = st.session_state.current
+    chats.pop(cid, None)
+    _db_safe(db_delete_chat, cid)
+    if chats:
+        st.session_state.current = list(chats)[-1]
+        st.session_state.pending = False
+    else:
+        new_chat()
+
+
+def push_message(msg):
+    cid = st.session_state.current
+    chat = cur()
+    chat["messages"].append(msg)
+    if msg["role"] == "user":  # সাম্প্রতিক চ্যাট তালিকার ওপরে আসবে
+        st.session_state.chats[cid] = st.session_state.chats.pop(cid)
+    _db_safe(db_add_message, cid, chat, msg)
+
+
+def pop_message():
+    cid = st.session_state.current
+    chat = cur()
+    if chat["messages"]:
+        chat["messages"].pop()
+        _db_safe(db_pop_last_message, cid)
+    if not chat["messages"]:
+        chat["title"] = "নতুন চ্যাট"
+
+
+if "db_ready" not in st.session_state:
+    _db_safe(init_db)
+    st.session_state.db_ready = True
 if "chats" not in st.session_state:
     st.session_state.chats = {}
-    new_chat()
+    for _cid, _title, _fname, _ftext in (_db_safe(db_list_chats, default=[]) or []):
+        _c = {"title": _title, "messages": None}
+        if _fname:
+            _c["file_name"] = _fname
+        if _ftext:
+            _c["file_text"] = _ftext
+        st.session_state.chats[_cid] = _c
+    new_chat()  # প্রতিবার খালি নতুন চ্যাট দিয়ে শুরু, পুরনোগুলো সাইডবারে থাকবে
 if "pending" not in st.session_state:
     st.session_state.pending = False
 if "img_counter" not in st.session_state:
     st.session_state.img_counter = 0
 
 
-def cur():
-    return st.session_state.chats[st.session_state.current]
-
-
 def regen_cb():
     msgs = cur()["messages"]
     if msgs and msgs[-1]["role"] == "assistant":
-        msgs.pop()
+        pop_message()
         st.session_state.pending = True
 
 
@@ -662,13 +862,15 @@ with st.sidebar:
         new_chat()
         st.rerun()
 
+    if st.session_state.get("db_error"):
+        st.warning(f"⚠️ চ্যাট সেভ করা যাচ্ছে না: {st.session_state['db_error']}")
+
     st.caption("চ্যাট হিস্টরি")
     for cid in reversed(list(st.session_state.chats)):
         c = st.session_state.chats[cid]
         icon = "🟢" if cid == st.session_state.current else "💬"
         if st.button(f"{icon} {c['title'][:26]}", key=f"chat_{cid}"):
-            st.session_state.current = cid
-            st.session_state.pending = False
+            switch_chat(cid)
             st.rerun()
 
     st.divider()
@@ -762,16 +964,21 @@ with st.sidebar:
         if st.button("❌ ফাইল সরান", key="clear_chat_file"):
             cur().pop("file_name", None)
             cur().pop("file_text", None)
+            if cur()["messages"]:
+                _db_safe(db_save_meta, st.session_state.current, cur())
             st.rerun()
 
     st.divider()
+    with st.expander("✏️ চ্যাটের নাম বদলান", expanded=False):
+        new_title = st.text_input("নতুন নাম:", value=cur()["title"], key=f"rename_{st.session_state.current}")
+        if st.button("সেভ করুন", key="rename_btn") and new_title.strip():
+            cur()["title"] = new_title.strip()[:40]
+            if cur()["messages"]:
+                _db_safe(db_save_meta, st.session_state.current, cur())
+            st.rerun()
+
     if st.button("🗑️ এই চ্যাট মুছুন", key="del_chat"):
-        del st.session_state.chats[st.session_state.current]
-        if not st.session_state.chats:
-            new_chat()
-        else:
-            st.session_state.current = list(st.session_state.chats)[-1]
-        st.session_state.pending = False
+        delete_current_chat()
         st.rerun()
 
     if cur()["messages"]:
@@ -782,6 +989,9 @@ with st.sidebar:
             file_name="chat-history.json",
             mime="application/json",
         )
+
+    if not APP_PASSWORD:
+        st.caption("⚠️ APP_PASSWORD সেট না থাকলে অ্যাপের লিংক যার কাছে আছে সে সব চ্যাট দেখতে পারবে।")
 
 # ---------- System prompt ----------
 def build_system_instruction():
@@ -1012,7 +1222,7 @@ if user_input:
 
         if cur()["title"] == "নতুন চ্যাট":
             cur()["title"] = prompt.replace("\n", " ")[:30]
-        messages.append(user_msg)
+        push_message(user_msg)
         st.session_state.pending = True
 
 # ---------- মেসেজ দেখানো ----------
@@ -1106,10 +1316,10 @@ if st.session_state.pending:
                         reply += sources_md
                     reply_msg = {"role": "assistant", "content": reply}
 
-                messages.append(reply_msg)
+                push_message(reply_msg)
                 success = True
             except Exception as e:
-                messages.pop()
+                pop_message()
                 st.error(f"একটি সমস্যা হয়েছে: {e}")
 
         st.session_state.pending = False
