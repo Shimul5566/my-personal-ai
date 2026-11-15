@@ -5,6 +5,7 @@ import json
 import uuid
 import base64
 import urllib.parse
+from datetime import date
 
 import requests
 import streamlit as st
@@ -131,7 +132,11 @@ if not api_key:
     st.error("GROQ_API_KEY পাওয়া যায়নি। Secrets বা .env ফাইলে key সেট করো।")
     st.stop()
 
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 HF_TOKEN = get_secret("HF_TOKEN")
+TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
+OPENAI_IMAGE_MODEL = get_secret("OPENAI_IMAGE_MODEL") or "gpt-image-1"
+HAS_EDIT = bool(OPENAI_API_KEY or HF_TOKEN)
 client = Groq(api_key=api_key)
 
 WP_URL = get_secret("WP_URL").rstrip("/")
@@ -144,6 +149,13 @@ MAX_CHATS = 20
 VISION_MODEL = "qwen/qwen3.8-27b"  # Groq-এর ছবি দেখার (Vision) মডেল
 HF_IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
 HF_EDIT_MODEL = "black-forest-labs/FLUX.1-Kontext-dev"
+
+IMAGE_SIZES = {
+    "⬜ বর্গাকার (1024×1024)": (1024, 1024, "1024x1024"),
+    "📱 পোর্ট্রেট (1024×1536)": (1024, 1536, "1024x1536"),
+    "🖥️ ল্যান্ডস্কেপ (1536×1024)": (1536, 1024, "1536x1024"),
+}
+IMAGE_QUALITIES = ["auto", "low", "medium", "high"]
 
 ELEMENTOR_PROMPT = """You are an expert WordPress and Elementor developer.
 When the user asks for a template, page, section, or block, output ONLY one valid JSON object
@@ -215,12 +227,17 @@ WP_TOOLS = [
 ]
 
 
-# ---------- Intent Detection (ছবি তৈরি বা এডিট বোঝার জন্য) ----------
+# ---------- Intent Detection (ছবি তৈরি / এডিট / চ্যাট) ----------
 CREATE_VERBS = r"(\b(create|make|generate|draw|design)\b|বানাও|বানিয়ে|তৈরি|আঁক)"
 CREATE_NOUNS = r"(\b(logo|poster|banner|thumbnail|wallpaper|avatar|illustration|picture|image|photo)\b|লোগো|ছবি|পোস্টার|ব্যানার)"
 EDIT_PATTERN = (
-    r"(\b(remove|replace|change|edit)\b.*\b(background|clothes|shirt|suit|hair|colou?r|object)\b"
-    r"|ব্যাকগ্রাউন্ড|এডিট|বদলে|সরিয়ে)"
+    r"(\b(remove|replace|change|edit|make|turn|wear|add)\b.*\b(background|clothes|shirt|suit|hair|colou?r|object|style)\b"
+    r"|\bturn\b.*\binto\b|\bmake it\b"
+    r"|ব্যাকগ্রাউন্ড|এডিট|বদলে|সরিয়ে|পরিবর্তন)"
+)
+FOLLOWUP_PATTERN = (
+    r"(\b(darker|brighter|lighter|sharper|blur|crop|zoom|vintage|cartoon|black and white|recolou?r)\b"
+    r"|রং বদল|রঙ বদল|উজ্জ্বল|সাদা-কালো|কার্টুন)"
 )
 NOT_VISUAL = r"(\b(code|python|html|css|javascript|js|wordpress|elementor|function|script|plugin|api|json)\b|কোড|ওয়ার্ডপ্রেস|এলিমেন্টর)"
 
@@ -234,6 +251,23 @@ def detect_visual_intent(text, has_image):
     if re.search(CREATE_VERBS, t) and re.search(CREATE_NOUNS, t):
         return "create"
     return "chat"
+
+
+def wants_followup_edit(text):
+    """আগের তৈরি করা ছবিটাই আবার বদলাতে চাইছে কি না"""
+    t = text.lower()
+    if re.search(CREATE_VERBS, t) and re.search(CREATE_NOUNS, t):
+        return False
+    return bool(re.search(EDIT_PATTERN, t) or re.search(FOLLOWUP_PATTERN, t))
+
+
+def parse_command(text):
+    """/create, /image, /edit, /chat দিয়ে জোর করে মোড ঠিক করা"""
+    low = text.lower()
+    for cmd, mode in (("/create", "create"), ("/image", "create"), ("/edit", "edit"), ("/chat", "chat")):
+        if low == cmd or low.startswith(cmd + " "):
+            return mode, text[len(cmd):].strip()
+    return None, text
 
 
 # ---------- Elementor / WordPress ----------
@@ -367,6 +401,42 @@ def enhance_edit_prompt(user_prompt):
     )
 
 
+# --- OpenAI (gpt-image) ---
+def _openai_check(r):
+    if r.status_code == 200:
+        return
+    try:
+        msg = r.json().get("error", {}).get("message", r.text[:200])
+    except Exception:
+        msg = r.text[:200]
+    raise RuntimeError(f"OpenAI {r.status_code}: {msg}")
+
+
+def openai_text_to_image(prompt, size, quality):
+    r = requests.post(
+        "https://api.openai.com/v1/images/generations",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+        json={"model": OPENAI_IMAGE_MODEL, "prompt": prompt, "size": size, "quality": quality, "n": 1},
+        timeout=180,
+    )
+    _openai_check(r)
+    return base64.b64decode(r.json()["data"][0]["b64_json"])
+
+
+def openai_edit_image(image_bytes, prompt, mime, quality):
+    ext = "jpg" if "jpeg" in mime or "jpg" in mime else ("webp" if "webp" in mime else "png")
+    r = requests.post(
+        "https://api.openai.com/v1/images/edits",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+        files={"image": (f"image.{ext}", image_bytes, mime or "image/png")},
+        data={"model": OPENAI_IMAGE_MODEL, "prompt": prompt, "quality": quality, "n": "1"},
+        timeout=180,
+    )
+    _openai_check(r)
+    return base64.b64decode(r.json()["data"][0]["b64_json"])
+
+
+# --- Hugging Face (FLUX) ---
 def _hf_call(fn):
     """HF InferenceClient: আগে provider=auto, না হলে fal-ai দিয়ে চেষ্টা"""
     from huggingface_hub import InferenceClient
@@ -386,47 +456,99 @@ def _pil_to_bytes(img):
     return buf.getvalue()
 
 
-def hf_text_to_image(prompt):
-    img = _hf_call(lambda c: c.text_to_image(prompt, model=HF_IMAGE_MODEL))
+def hf_text_to_image(prompt, width, height):
+    img = _hf_call(lambda c: c.text_to_image(prompt, model=HF_IMAGE_MODEL, width=width, height=height))
     return _pil_to_bytes(img)
 
 
 def hf_edit_image(image_bytes, prompt):
-    if not HF_TOKEN:
-        raise RuntimeError("ছবি এডিট করতে HF_TOKEN লাগবে। Secrets বা .env-এ HF_TOKEN সেট করো।")
     img = _hf_call(lambda c: c.image_to_image(image_bytes, prompt=prompt, model=HF_EDIT_MODEL))
     return _pil_to_bytes(img)
 
 
-def generate_ai_image(prompt):
-    """ছবি তৈরি: HF_TOKEN থাকলে FLUX, না থাকলে (বা fail করলে) ফ্রি Pollinations"""
-    eng_prompt = enhance_image_prompt(prompt)
+def _short(e):
+    return str(e).replace("\n", " ")[:160]
+
+
+def generate_ai_image(prompt, size_key, quality):
+    """ছবি তৈরি: OpenAI → FLUX (HF) → ফ্রি Pollinations, যেটা আগে কাজ করে"""
+    width, height, osize = IMAGE_SIZES[size_key]
+    eng = enhance_image_prompt(prompt)
+    notes = []
+
+    if OPENAI_API_KEY:
+        try:
+            return {"bytes": openai_text_to_image(eng, osize, quality), "mime": "image/png",
+                    "prompt": eng, "source": f"OpenAI ({OPENAI_IMAGE_MODEL})", "notes": notes}
+        except Exception as e:
+            notes.append(f"OpenAI ব্যর্থ: {_short(e)}")
 
     if HF_TOKEN:
         try:
-            return {"bytes": hf_text_to_image(eng_prompt), "mime": "image/png",
-                    "prompt": eng_prompt, "source": "FLUX (Hugging Face)"}
-        except Exception:
-            pass
+            return {"bytes": hf_text_to_image(eng, width, height), "mime": "image/png",
+                    "prompt": eng, "source": "FLUX (Hugging Face)", "notes": notes}
+        except Exception as e:
+            notes.append(f"HF ব্যর্থ: {_short(e)}")
 
-    seed = uuid.uuid4().int % 100000
-    url = (
-        "https://image.pollinations.ai/prompt/"
-        f"{urllib.parse.quote(eng_prompt)}?width=1024&height=1024&nologo=true&seed={seed}"
-    )
-    r = requests.get(url, timeout=120)
-    r.raise_for_status()
-    ctype = r.headers.get("content-type", "image/jpeg").split(";")[0]
-    if not ctype.startswith("image"):
-        raise RuntimeError("ছবি তৈরি করা যায়নি, একটু পরে আবার চেষ্টা করো।")
-    return {"bytes": r.content, "mime": ctype, "prompt": eng_prompt, "source": "Pollinations"}
+    try:
+        seed = uuid.uuid4().int % 100000
+        url = (
+            "https://image.pollinations.ai/prompt/"
+            f"{urllib.parse.quote(eng)}?width={width}&height={height}&nologo=true&seed={seed}"
+        )
+        r = requests.get(url, timeout=120)
+        r.raise_for_status()
+        ctype = r.headers.get("content-type", "image/jpeg").split(";")[0]
+        if not ctype.startswith("image"):
+            raise RuntimeError("ছবি পাওয়া যায়নি")
+        return {"bytes": r.content, "mime": ctype, "prompt": eng, "source": "Pollinations", "notes": notes}
+    except Exception as e:
+        notes.append(f"Pollinations ব্যর্থ: {_short(e)}")
+        raise RuntimeError("ছবি তৈরি করা যায়নি। " + " | ".join(notes))
 
 
-def edit_ai_image(image_bytes, instruction):
-    """আপলোড করা ছবি এডিট (FLUX Kontext, HF_TOKEN লাগবে)"""
+def edit_ai_image(image_bytes, instruction, mime, quality):
+    """আপলোড বা আগে তৈরি করা ছবি এডিট: OpenAI → FLUX Kontext (HF)"""
+    if not HAS_EDIT:
+        raise RuntimeError("ছবি এডিট করতে OPENAI_API_KEY অথবা HF_TOKEN সেট করো।")
     eng = enhance_edit_prompt(instruction)
-    out = hf_edit_image(image_bytes, eng)
-    return {"bytes": out, "mime": "image/png", "prompt": eng, "source": "FLUX Kontext (Hugging Face)"}
+    notes = []
+
+    if OPENAI_API_KEY:
+        try:
+            return {"bytes": openai_edit_image(image_bytes, eng, mime, quality), "mime": "image/png",
+                    "prompt": eng, "source": f"OpenAI ({OPENAI_IMAGE_MODEL})", "notes": notes}
+        except Exception as e:
+            notes.append(f"OpenAI ব্যর্থ: {_short(e)}")
+
+    if HF_TOKEN:
+        try:
+            return {"bytes": hf_edit_image(image_bytes, eng), "mime": "image/png",
+                    "prompt": eng, "source": "FLUX Kontext (Hugging Face)", "notes": notes}
+        except Exception as e:
+            notes.append(f"HF ব্যর্থ: {_short(e)}")
+
+    raise RuntimeError("ছবি এডিট করা যায়নি। " + " | ".join(notes))
+
+
+# ---------- Web search (Tavily) ----------
+def search_query(user_text):
+    return _llm_rewrite(
+        "Rewrite the user's message as one concise web search query, in the same language as the message. "
+        "Output ONLY the query.",
+        user_text,
+    )[:200]
+
+
+def web_search(query, max_results=5):
+    r = requests.post(
+        "https://api.tavily.com/search",
+        headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
+        json={"query": query, "search_depth": "basic", "max_results": max_results},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json().get("results", [])
 
 
 # ---------- File reader ----------
@@ -513,6 +635,16 @@ with st.sidebar:
             key=f"temp_{app_mode}",
         )
 
+        size_key = st.selectbox("ছবির সাইজ:", list(IMAGE_SIZES))
+        image_quality = st.selectbox("ছবির কোয়ালিটি (OpenAI):", IMAGE_QUALITIES)
+
+    use_search = False
+    if app_mode.startswith("💬"):
+        if TAVILY_API_KEY:
+            use_search = st.toggle("🌐 ওয়েব সার্চ", value=False)
+        else:
+            st.caption("🌐 ওয়েব সার্চ চালু করতে TAVILY_API_KEY সেট করো।")
+
     if is_agent_mode:
         if WP_URL and WP_AUTH[0] and WP_AUTH[1]:
             st.success(f"✅ Connected: {WP_URL}")
@@ -520,9 +652,17 @@ with st.sidebar:
             st.warning("WP_URL, WP_USER, WP_APP_PASSWORD সেট করো।")
         st.caption("Tool calling-এর জন্য gpt-oss-120b বা qwen3.8-27b ব্যবহার করো।")
     if is_image_mode:
-        st.caption("ছবি না দিলে নতুন ছবি তৈরি হবে (HF_TOKEN না থাকলে ফ্রি জেনারেটর)। ছবি দিলে সেটি এডিট হবে (HF_TOKEN লাগবে)।")
+        providers = []
+        if OPENAI_API_KEY:
+            providers.append("OpenAI")
+        if HF_TOKEN:
+            providers.append("FLUX (HF)")
+        providers.append("Pollinations (ফ্রি)")
+        st.caption("ছবি তৈরি: " + " → ".join(providers))
+        st.caption("ছবি দিলে বা আগের ছবির পর 'ব্যাকগ্রাউন্ড বদলাও' লিখলে এডিট হবে।" if HAS_EDIT
+                   else "ছবি এডিট করতে OPENAI_API_KEY বা HF_TOKEN লাগবে।")
     if app_mode.startswith("💬"):
-        st.caption("চ্যাটে 'লোগো বানাও' লিখলে ছবি তৈরি, ছবি দিয়ে 'ব্যাকগ্রাউন্ড বদলাও' লিখলে এডিট হবে।")
+        st.caption("চ্যাটে 'লোগো বানাও' লিখলে ছবি তৈরি, ছবি দিয়ে 'ব্যাকগ্রাউন্ড বদলাও' লিখলে এডিট। জোর করতে লিখুন: /create, /edit বা /chat")
 
     file_context = ""
     uploaded_file = None
@@ -589,6 +729,8 @@ def build_system_instruction():
         base = ELEMENTOR_PROMPT
     else:
         base = CHAT_PROMPT
+
+    base = base + f"\n\nToday's date: {date.today().isoformat()}."
 
     files = []
     if cur().get("file_text"):
@@ -685,19 +827,45 @@ def build_api_messages(history, system_text, use_vision):
     return clean
 
 
+def get_edit_source(last_user):
+    """এডিটের ছবি: এই মেসেজের সাথের ছবি, না থাকলে ঠিক আগের AI-র তৈরি ছবি"""
+    if last_user.get("image"):
+        return last_user["image"], last_user.get("mime", "image/png")
+    msgs = cur()["messages"]
+    if len(msgs) >= 2 and msgs[-2]["role"] == "assistant" and msgs[-2].get("image"):
+        return msgs[-2]["image"], msgs[-2].get("mime", "image/png")
+    return None
+
+
 def resolve_intent(last_user):
-    has_image = bool(last_user.get("image"))
     if is_agent_mode:
         return "agent"
+    has_image = bool(last_user.get("image"))
+    force = last_user.get("force")
+    if force == "create":
+        return "create"
+    if force == "edit":
+        return "edit"
+    if force == "chat":
+        return "vision" if has_image else "chat"
+
+    followup = (
+        not has_image
+        and HAS_EDIT
+        and get_edit_source(last_user) is not None
+        and wants_followup_edit(last_user["content"])
+    )
     if is_image_mode:
-        return "edit" if has_image else "create"
+        return "edit" if (has_image or followup) else "create"
     if is_json_mode:
         return "vision" if has_image else "chat"
     if last_user.get("attachment"):
         return "vision" if has_image else "chat"
+    if followup:
+        return "edit"
     intent = detect_visual_intent(last_user["content"], has_image)
-    if intent == "edit" and not HF_TOKEN:
-        intent = "vision"  # এডিটের জন্য HF_TOKEN না থাকলে সাধারণ ছবি-বিশ্লেষণ
+    if intent == "edit" and not HAS_EDIT:
+        intent = "vision"  # এডিটের কী না থাকলে সাধারণ ছবি-বিশ্লেষণ
     return intent
 
 
@@ -719,7 +887,7 @@ user_input = st.chat_input(
 messages = cur()["messages"]
 
 if user_input:
-    prompt = (user_input.text or "").strip()
+    force, prompt = parse_command((user_input.text or "").strip())
     inline_img_bytes = None
     inline_img_mime = None
     attach_name = None
@@ -758,6 +926,8 @@ if user_input:
 
     if prompt:
         user_msg = {"role": "user", "content": prompt}
+        if force:
+            user_msg["force"] = force
         if attach_name:
             user_msg["attachment"] = attach_name
 
@@ -809,22 +979,26 @@ if st.session_state.pending:
     else:
         last_user = messages[-1]
         system_instruction = build_system_instruction()
-        intent = resolve_intent(last_user)
         success = False
         with st.chat_message("assistant"):
             try:
+                intent = resolve_intent(last_user)
                 if intent in ("create", "edit"):
                     if intent == "create":
                         with st.spinner("🎨 ছবি তৈরি হচ্ছে..."):
-                            img = generate_ai_image(last_user["content"])
+                            img = generate_ai_image(last_user["content"], size_key, image_quality)
                         label = "🎨 ছবি তৈরি হয়েছে।"
                     else:
+                        src = get_edit_source(last_user)
+                        if not src:
+                            raise RuntimeError("এডিট করার মতো কোনো ছবি পাওয়া যায়নি। আগে একটি ছবি দাও।")
                         with st.spinner("🖌️ ছবি এডিট হচ্ছে..."):
-                            img = edit_ai_image(base64.b64decode(last_user["image"]), last_user["content"])
+                            img = edit_ai_image(base64.b64decode(src[0]), last_user["content"], src[1], image_quality)
                         label = "🖌️ ছবি এডিট হয়েছে।"
+                    note_text = f"\n\n⚠️ {' | '.join(img['notes'])}" if img.get("notes") else ""
                     reply_msg = {
                         "role": "assistant",
-                        "content": f"{label}\n\n**Prompt:** {img['prompt']}\n\n*Source: {img['source']}*",
+                        "content": f"{label}\n\n**Prompt:** {img['prompt']}\n\n*Source: {img['source']}*{note_text}",
                         "image": base64.b64encode(img["bytes"]).decode(),
                         "mime": img["mime"],
                     }
@@ -841,8 +1015,33 @@ if st.session_state.pending:
                     history = get_history()
                     use_vision = bool(history and history[-1].get("image"))
                     model_to_use = VISION_MODEL if use_vision else selected_model
-                    api_messages = build_api_messages(history, system_instruction, use_vision)
+                    sys_text = system_instruction
+                    sources_md = ""
+
+                    if use_search and TAVILY_API_KEY and intent == "chat" and app_mode.startswith("💬"):
+                        try:
+                            with st.spinner("🌐 ওয়েবে খোঁজা হচ্ছে..."):
+                                results = web_search(search_query(last_user["content"]))
+                            if results:
+                                blocks, links = [], []
+                                for i, item in enumerate(results, 1):
+                                    title = (item.get("title") or "Source").replace("[", "(").replace("]", ")")
+                                    url = item.get("url", "")
+                                    blocks.append(f"[{i}] {title}\n{url}\n{(item.get('content') or '')[:700]}")
+                                    links.append(f"{i}. [{title}]({url})")
+                                sys_text += (
+                                    "\n\nWEB SEARCH RESULTS (use them when relevant, cite inline like [1], [2]; "
+                                    "if they are not enough, say so):\n" + "\n\n".join(blocks)
+                                )
+                                sources_md = "\n\n**🌐 সূত্র:**\n" + "\n".join(links)
+                        except Exception as e:
+                            st.warning(f"ওয়েব সার্চ ব্যর্থ হয়েছে: {_short(e)}")
+
+                    api_messages = build_api_messages(history, sys_text, use_vision)
                     reply = st.write_stream(stream_reply(model_to_use, api_messages, temperature))
+                    if sources_md:
+                        st.markdown(sources_md)
+                        reply += sources_md
                     reply_msg = {"role": "assistant", "content": reply}
 
                 messages.append(reply_msg)
