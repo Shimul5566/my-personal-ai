@@ -8,6 +8,7 @@ import itertools
 import sqlite3
 import time
 import urllib.parse
+import zipfile
 from contextlib import contextmanager
 from datetime import date
 
@@ -888,11 +889,91 @@ def web_search(query, max_results=5):
 
 
 # ---------- File reader ----------
+ZIP_EXTS = (".py", ".html", ".css", ".js", ".ts", ".jsx", ".tsx", ".php", ".json", ".md", ".txt", ".xml", ".sql")
+ZIP_SKIP_DIRS = ("node_modules/", "vendor/", "__pycache__/", "dist/", "build/", "site-packages/")
+ZIP_SKIP_FILES = ("package-lock.json", "yarn.lock", "composer.lock", ".min.js", ".min.css")
+ZIP_MAX_FILE_BYTES = 500_000  # এর চেয়ে বড় একক ফাইল বাদ (বেশিরভাগ ক্ষেত্রে ডেটা/মিনিফাইড ফাইল)
+
+
+def _zip_to_text(data):
+    """ZIP-এর ভেতরের কোড/টেক্সট ফাইল পড়ে একটি টেক্সট বানায় (ফাইল-তালিকাসহ, সীমার মধ্যে)"""
+    entries, skipped = [], 0
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for info in zf.infolist():
+            name = info.filename
+            low = name.lower()
+            if info.is_dir() or name.startswith("__MACOSX") or any(p.startswith(".") for p in name.split("/")):
+                continue  # ফোল্ডার, macOS জাঙ্ক, লুকানো ফাইল (.git, .env ইত্যাদি)
+            if not low.endswith(ZIP_EXTS):
+                continue
+            if any(("/" + low).find("/" + d) != -1 for d in ZIP_SKIP_DIRS) or low.endswith(ZIP_SKIP_FILES):
+                skipped += 1
+                continue
+            if info.file_size == 0:
+                continue
+            if info.file_size > ZIP_MAX_FILE_BYTES:
+                skipped += 1
+                continue
+            entries.append(info)
+        # রুটের ফাইল আগে, তারপর গভীরতা ও নাম অনুযায়ী
+        entries.sort(key=lambda i: (i.filename.count("/"), i.filename.lower()))
+
+        tree_lines, tree_len, tree_cap = [], 0, max(1500, MAX_FILE_CHARS // 10)  # তালিকা যেন বেশি জায়গা না নেয়
+        for i in entries:
+            line = f"- {i.filename}"
+            if tree_len + len(line) > tree_cap:
+                tree_lines.append(f"... আরও {len(entries) - len(tree_lines)}টি ফাইল")
+                break
+            tree_lines.append(line)
+            tree_len += len(line) + 1
+        tree = "\n".join(tree_lines)
+        header = f"ZIP-এর ফাইল তালিকা (মোট {len(entries)}টি কোড/টেক্সট ফাইল):\n{tree}\n"
+
+        budget = max(MAX_FILE_CHARS - len(header) - 400, 1000)  # শেষে নোটের জন্য জায়গা
+        parts, used, omitted = [], 0, []
+        for info in entries:
+            if used >= budget:
+                omitted.append(info.filename)
+                continue
+            try:
+                content = zf.read(info.filename).decode("utf-8-sig", errors="ignore")
+            except Exception:  # পাসওয়ার্ড দেওয়া/নষ্ট ফাইল
+                skipped += 1
+                continue
+            if not content.strip():
+                continue
+            block = f"=== FILE: {info.filename} ===\n{content}"
+            if used + len(block) > budget:
+                room = budget - used
+                if room > 500:
+                    block = block[:room] + "\n...[ফাইলটি এখানে কেটে দেওয়া হয়েছে]"
+                    parts.append(block)
+                    used = budget
+                else:
+                    omitted.append(info.filename)
+                    used = budget
+                continue
+            parts.append(block)
+            used += len(block)
+
+    if not parts:
+        return ""
+    note = ""
+    if omitted:
+        note += f"\n\n[সীমার কারণে বাদ পড়েছে: {', '.join(omitted[:30])}{'...' if len(omitted) > 30 else ''}]"
+    if skipped:
+        note += f"\n[{skipped}টি ফাইল বাদ: node_modules/vendor/minified/অতিবড় ফাইল]"
+    return header + "\n" + "\n\n".join(parts) + note
+
+
 @st.cache_data(show_spinner=False)
 def read_file(name, data: bytes):
-    if name.lower().endswith(".pdf"):
+    low = name.lower()
+    if low.endswith(".pdf"):
         reader = PdfReader(io.BytesIO(data))
         return "\n".join(p.extract_text() or "" for p in reader.pages)
+    if low.endswith(".zip"):
+        return _zip_to_text(data)
     return data.decode("utf-8", errors="ignore")
 
 
@@ -1295,14 +1376,14 @@ with st.sidebar:
     uploaded_images = []
     with st.expander("📎 ফাইল ও ছবি", expanded=False):
         uploaded_file = st.file_uploader(
-            "PDF, TXT, PY বা কোড ফাইল:",
-            type=["pdf", "txt", "py", "html", "css", "js", "json", "md"],
+            "PDF, TXT, ZIP (প্রজেক্ট/প্লাগিন) বা কোড ফাইল:",
+            type=["pdf", "txt", "zip", "py", "html", "css", "js", "json", "md"],
         )
         if uploaded_file is not None:
             try:
                 file_context = read_file(uploaded_file.name, uploaded_file.getvalue())
                 if not file_context.strip():
-                    st.warning("ফাইলে কোনো text পাওয়া যায়নি (scanned PDF হতে পারে)।")
+                    st.warning("ফাইলে কোনো text পাওয়া যায়নি (scanned PDF, বা ZIP-এ কোড/টেক্সট ফাইল না থাকতে পারে)।")
                     file_context = ""
                 else:
                     st.success(f"✅ '{uploaded_file.name}' লোড হয়েছে!")
@@ -1682,7 +1763,7 @@ else:
 user_input = st.chat_input(
     placeholder,
     accept_file="multiple",
-    file_type=["png", "jpg", "jpeg", "webp", "pdf", "txt", "py", "html", "css", "js", "json", "md"],
+    file_type=["png", "jpg", "jpeg", "webp", "pdf", "zip", "txt", "py", "html", "css", "js", "json", "md"],
 )
 messages = cur()["messages"]
 
@@ -1709,7 +1790,7 @@ if user_input:
                     if len(extracted) > MAX_FILE_CHARS:
                         st.info(f"ফাইল বড়, শুধু প্রথম {MAX_FILE_CHARS} অক্ষর ব্যবহার হবে।")
                 elif extracted is not None:
-                    st.warning("ফাইলে কোনো text পাওয়া যায়নি (scanned PDF হতে পারে)।")
+                    st.warning("ফাইলে কোনো text পাওয়া যায়নি (scanned PDF, বা ZIP-এ কোড/টেক্সট ফাইল না থাকতে পারে)।")
         if inline_imgs and not can_use_image:
             st.info("Agent মোডে ছবি ব্যবহার হবে না। সাধারণ চ্যাট, JSON বা ছবি মোডে ছবি দাও।")
 
