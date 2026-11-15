@@ -4,6 +4,7 @@ import re
 import json
 import uuid
 import base64
+import itertools
 import sqlite3
 import urllib.parse
 from contextlib import contextmanager
@@ -134,18 +135,22 @@ if not api_key:
     st.error("GROQ_API_KEY পাওয়া যায়নি। Secrets বা .env ফাইলে key সেট করো।")
     st.stop()
 
+GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
+GEMINI_MODEL = get_secret("GEMINI_MODEL") or "gemini-2.5-flash"
+GEMINI_IMAGE_MODEL = get_secret("GEMINI_IMAGE_MODEL") or "gemini-2.5-flash-image"
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 HF_TOKEN = get_secret("HF_TOKEN")
 TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
 OPENAI_IMAGE_MODEL = get_secret("OPENAI_IMAGE_MODEL") or "gpt-image-1"
-HAS_EDIT = bool(OPENAI_API_KEY or HF_TOKEN)
+HAS_EDIT = bool(OPENAI_API_KEY or GEMINI_API_KEY or HF_TOKEN)
 client = Groq(api_key=api_key)
 
 WP_URL = get_secret("WP_URL").rstrip("/")
 WP_AUTH = (get_secret("WP_USER"), get_secret("WP_APP_PASSWORD"))
 
 MAX_HISTORY = 12
-MAX_FILE_CHARS = 20000
+GROQ_FILE_LIMIT = 20000  # Groq মডেলের জন্য নিরাপদ সীমা
+MAX_FILE_CHARS = 100000 if GEMINI_API_KEY else GROQ_FILE_LIMIT
 MAX_IMAGE_BYTES = 3_000_000
 MAX_CHATS = 30
 VISION_MODEL = "qwen/qwen3.8-27b"  # Groq-এর ছবি দেখার (Vision) মডেল
@@ -371,6 +376,106 @@ def run_agent(model, system_text, history, temp, max_steps=5):
     return "⚠️ Maximum step অতিক্রম করেছে। আবার চেষ্টা করো।"
 
 
+# ---------- Gemini (বড় ফাইল, ছবি-বোঝা, ছবি তৈরি/এডিট) ----------
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
+
+def _gemini_headers():
+    return {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+
+
+def _gemini_error(r):
+    try:
+        return f"Gemini {r.status_code}: {r.json().get('error', {}).get('message', '')[:200]}"
+    except Exception:
+        return f"Gemini {r.status_code}: {r.text[:200]}"
+
+
+def gemini_contents(history, use_image):
+    contents = []
+    last = len(history) - 1
+    for i, m in enumerate(history):
+        parts = [{"text": m["content"] or " "}]
+        if use_image and i == last and m["role"] == "user" and m.get("image"):
+            parts.append({"inlineData": {"mimeType": m.get("mime") or "image/png", "data": m["image"]}})
+        contents.append({"role": "user" if m["role"] == "user" else "model", "parts": parts})
+    return contents
+
+
+def gemini_stream(system_text, history, temp, use_image):
+    """Gemini থেকে লেখা একটু একটু করে আসে (SSE)"""
+    body = {
+        "systemInstruction": {"parts": [{"text": system_text}]},
+        "contents": gemini_contents(history, use_image),
+        "generationConfig": {"temperature": temp, "maxOutputTokens": 8000},
+    }
+    url = f"{GEMINI_BASE}/{GEMINI_MODEL}:streamGenerateContent?alt=sse"
+    with requests.post(url, headers=_gemini_headers(), json=body, stream=True, timeout=120) as r:
+        if r.status_code != 200:
+            raise RuntimeError(_gemini_error(r))
+        got_text = False
+        for raw in r.iter_lines():
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="ignore")
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                obj = json.loads(payload)
+            except Exception:
+                continue
+            block = (obj.get("promptFeedback") or {}).get("blockReason")
+            if block:
+                raise RuntimeError(f"Gemini অনুরোধ আটকে দিয়েছে ({block})")
+            for cand in obj.get("candidates", []):
+                for part in (cand.get("content") or {}).get("parts", []):
+                    if part.get("text") and not part.get("thought"):
+                        got_text = True
+                        yield part["text"]
+        if not got_text:
+            raise RuntimeError("Gemini কোনো উত্তর দেয়নি")
+
+
+def _prime(gen):
+    """প্রথম অংশ এনে দেখে নেয় ঠিকঠাক চলছে কি না (না হলে ফলব্যাক করা যায়)"""
+    try:
+        first = next(gen)
+    except StopIteration:
+        raise RuntimeError("Gemini কোনো উত্তর দেয়নি")
+    return itertools.chain([first], gen)
+
+
+def _gemini_image_call(parts):
+    body = {"contents": [{"parts": parts}], "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}}
+    r = requests.post(f"{GEMINI_BASE}/{GEMINI_IMAGE_MODEL}:generateContent",
+                      headers=_gemini_headers(), json=body, timeout=180)
+    if r.status_code != 200:
+        raise RuntimeError(_gemini_error(r))
+    for cand in r.json().get("candidates", []):
+        for part in (cand.get("content") or {}).get("parts", []):
+            blob = part.get("inlineData") or part.get("inline_data")
+            if blob and blob.get("data"):
+                return base64.b64decode(blob["data"]), (blob.get("mimeType") or blob.get("mime_type") or "image/png")
+    raise RuntimeError("Gemini ছবি দেয়নি (সেফটি ফিল্টার বা কোটা হতে পারে)")
+
+
+def gemini_text_to_image(prompt, size_key):
+    hint = {"পোর্ট্রেট": "portrait 2:3", "ল্যান্ডস্কেপ": "landscape 3:2"}
+    ratio = next((v for k, v in hint.items() if k in size_key), "square 1:1")
+    return _gemini_image_call([{"text": f"{prompt}\n\nAspect ratio: {ratio}."}])
+
+
+def gemini_edit_image(image_bytes, prompt, mime):
+    parts = [
+        {"text": prompt},
+        {"inlineData": {"mimeType": mime or "image/png", "data": base64.b64encode(image_bytes).decode()}},
+    ]
+    return _gemini_image_call(parts)
+
+
 # ---------- Image generation / editing ----------
 def _llm_rewrite(system_text, user_text):
     try:
@@ -490,6 +595,14 @@ def generate_ai_image(prompt, size_key, quality):
         except Exception as e:
             notes.append(f"OpenAI ব্যর্থ: {_short(e)}")
 
+    if GEMINI_API_KEY:
+        try:
+            data, gmime = gemini_text_to_image(eng, size_key)
+            return {"bytes": data, "mime": gmime, "prompt": eng,
+                    "source": f"Gemini ({GEMINI_IMAGE_MODEL})", "notes": notes}
+        except Exception as e:
+            notes.append(f"Gemini ব্যর্থ: {_short(e)}")
+
     if HF_TOKEN:
         try:
             return {"bytes": hf_text_to_image(eng, width, height), "mime": "image/png",
@@ -531,6 +644,19 @@ def edit_ai_image(image_bytes, instruction, mime, quality):
             }
         except Exception as e:
             notes.append(f"OpenAI ব্যর্থ: {_short(e)}")
+
+    if GEMINI_API_KEY:
+        try:
+            data, gmime = gemini_edit_image(image_bytes, eng, mime)
+            return {
+                "bytes": data,
+                "mime": gmime,
+                "prompt": eng,
+                "source": f"Gemini ({GEMINI_IMAGE_MODEL})",
+                "notes": notes,
+            }
+        except Exception as e:
+            notes.append(f"Gemini ব্যর্থ: {_short(e)}")
 
     if HF_TOKEN:
         try:
@@ -855,6 +981,13 @@ def regen_cb():
         st.session_state.pending = True
 
 
+def total_file_chars():
+    n = len(cur().get("file_text") or "")
+    if file_context and uploaded_file is not None:
+        n += len(file_context)
+    return n
+
+
 # ---------- সাইডবার ----------
 with st.sidebar:
     st.markdown("## 🤖 আমার AI")
@@ -901,6 +1034,13 @@ with st.sidebar:
 
         size_key = st.selectbox("ছবির সাইজ:", list(IMAGE_SIZES))
         image_quality = st.selectbox("ছবির কোয়ালিটি (OpenAI):", IMAGE_QUALITIES)
+        if GEMINI_API_KEY:
+            engine_choice = st.selectbox(
+                "🧠 AI ইঞ্জিন (চ্যাট ও JSON):",
+                ["Groq (দ্রুত)", "Gemini (বড় ফাইল, ভালো ছবি-বোঝা)"],
+            )
+        else:
+            engine_choice = "Groq (দ্রুত)"
 
     use_search = False
     if app_mode.startswith("💬"):
@@ -961,6 +1101,8 @@ with st.sidebar:
 
     if cur().get("file_name"):
         st.caption(f"📎 এই চ্যাটের ফাইল: {cur()['file_name']}")
+        if GEMINI_API_KEY and total_file_chars() > GROQ_FILE_LIMIT:
+            st.caption("📚 ফাইল বড়, তাই উত্তর Gemini দেবে।")
         if st.button("❌ ফাইল সরান", key="clear_chat_file"):
             cur().pop("file_name", None)
             cur().pop("file_text", None)
@@ -994,7 +1136,7 @@ with st.sidebar:
         st.caption("⚠️ APP_PASSWORD সেট না থাকলে অ্যাপের লিংক যার কাছে আছে সে সব চ্যাট দেখতে পারবে।")
 
 # ---------- System prompt ----------
-def build_system_instruction():
+def build_system_instruction(cap=None):
     if is_agent_mode:
         base = AGENT_PROMPT
     elif is_json_mode:
@@ -1004,6 +1146,7 @@ def build_system_instruction():
 
     base = base + f"\n\nToday's date: {date.today().isoformat()}."
 
+    cap = cap or GROQ_FILE_LIMIT
     files = []
     if cur().get("file_text"):
         files.append((cur().get("file_name", "attached file"), cur()["file_text"]))
@@ -1014,7 +1157,7 @@ def build_system_instruction():
 
     text = base + "\n\nThe user attached the following file(s). Use them to answer accurately:"
     for name, content in files:
-        text += f"\n--- FILE START: {name} ---\n{content[:MAX_FILE_CHARS]}\n--- FILE END ---"
+        text += f"\n--- FILE START: {name} ---\n{content[:cap]}\n--- FILE END ---"
     return text
 
 
@@ -1059,6 +1202,15 @@ def render_message(m, idx):
                 mime="application/json",
                 key=f"dl_{st.session_state.current}_{idx}",
             )
+
+
+def pick_engine():
+    """Gemini কী থাকলে: নিজে বেছে নিলে বা ফাইল বড় হলে Gemini, নইলে Groq"""
+    if not GEMINI_API_KEY or is_agent_mode:
+        return "groq"
+    if engine_choice.startswith("Gemini") or total_file_chars() > GROQ_FILE_LIMIT:
+        return "gemini"
+    return "groq"
 
 
 def stream_reply(model, messages, temp):
@@ -1250,7 +1402,6 @@ if st.session_state.pending:
         st.session_state.pending = False
     else:
         last_user = messages[-1]
-        system_instruction = build_system_instruction()
         success = False
         with st.chat_message("assistant"):
             try:
@@ -1280,14 +1431,13 @@ if st.session_state.pending:
                         raise ValueError("WP_URL, WP_USER, WP_APP_PASSWORD সেট করা নেই।")
                     history = [{"role": m["role"], "content": m["content"]} for m in get_history()]
                     with st.spinner("ভাবছি..."):
-                        reply = run_agent(selected_model, system_instruction, history, temperature)
+                        reply = run_agent(selected_model, build_system_instruction(GROQ_FILE_LIMIT), history, temperature)
                     st.markdown(reply)
                     reply_msg = {"role": "assistant", "content": reply}
                 else:
                     history = get_history()
                     use_vision = bool(history and history[-1].get("image"))
-                    model_to_use = VISION_MODEL if use_vision else selected_model
-                    sys_text = system_instruction
+                    search_block = ""
                     sources_md = ""
 
                     if use_search and TAVILY_API_KEY and intent == "chat" and app_mode.startswith("💬"):
@@ -1301,7 +1451,7 @@ if st.session_state.pending:
                                     url = item.get("url", "")
                                     blocks.append(f"[{i}] {title}\n{url}\n{(item.get('content') or '')[:700]}")
                                     links.append(f"{i}. [{title}]({url})")
-                                sys_text += (
+                                search_block = (
                                     "\n\nWEB SEARCH RESULTS (use them when relevant, cite inline like [1], [2]; "
                                     "if they are not enough, say so):\n" + "\n\n".join(blocks)
                                 )
@@ -1309,8 +1459,23 @@ if st.session_state.pending:
                         except Exception as e:
                             st.warning(f"ওয়েব সার্চ ব্যর্থ হয়েছে: {_short(e)}")
 
-                    api_messages = build_api_messages(history, sys_text, use_vision)
-                    reply = st.write_stream(stream_reply(model_to_use, api_messages, temperature))
+                    stream = None
+                    if pick_engine() == "gemini":
+                        try:
+                            stream = _prime(gemini_stream(
+                                build_system_instruction(MAX_FILE_CHARS) + search_block,
+                                history, temperature, use_vision,
+                            ))
+                        except Exception as e:
+                            st.warning(f"⚠️ Gemini ব্যর্থ ({_short(e)}), Groq দিয়ে উত্তর দেওয়া হচ্ছে।")
+
+                    if stream is None:
+                        sys_text = build_system_instruction(GROQ_FILE_LIMIT) + search_block
+                        model_to_use = VISION_MODEL if use_vision else selected_model
+                        api_messages = build_api_messages(history, sys_text, use_vision)
+                        stream = stream_reply(model_to_use, api_messages, temperature)
+
+                    reply = st.write_stream(stream)
                     if sources_md:
                         st.markdown(sources_md)
                         reply += sources_md
