@@ -463,6 +463,13 @@ with st.sidebar:
             if is_agent_mode or is_image_mode:
                 st.caption("এই মোডে ছবি ব্যবহার হবে না।")
 
+    if cur().get("file_name"):
+        st.caption(f"📎 এই চ্যাটের ফাইল: {cur()['file_name']}")
+        if st.button("❌ ফাইল সরান", key="clear_chat_file"):
+            cur().pop("file_name", None)
+            cur().pop("file_text", None)
+            st.rerun()
+
     st.divider()
     if st.button("🗑️ এই চ্যাট মুছুন", key="del_chat"):
         del st.session_state.chats[st.session_state.current]
@@ -483,22 +490,26 @@ with st.sidebar:
         )
 
 # ---------- System prompt ----------
-if is_agent_mode:
-    base_instruction = AGENT_PROMPT
-elif is_json_mode:
-    base_instruction = ELEMENTOR_PROMPT
-else:
-    base_instruction = CHAT_PROMPT
+def build_system_instruction():
+    if is_agent_mode:
+        base = AGENT_PROMPT
+    elif is_json_mode:
+        base = ELEMENTOR_PROMPT
+    else:
+        base = CHAT_PROMPT
 
-if file_context:
-    system_instruction = (
-        f"{base_instruction}\n\n"
-        f"The user uploaded a file named '{uploaded_file.name}'. "
-        f"Use the following file content to answer their questions accurately:\n"
-        f"--- FILE CONTENT START ---\n{file_context[:MAX_FILE_CHARS]}\n--- FILE CONTENT END ---"
-    )
-else:
-    system_instruction = base_instruction
+    files = []
+    if cur().get("file_text"):
+        files.append((cur().get("file_name", "attached file"), cur()["file_text"]))
+    if file_context and uploaded_file is not None:
+        files.append((uploaded_file.name, file_context))
+    if not files:
+        return base
+
+    text = base + "\n\nThe user attached the following file(s). Use them to answer accurately:"
+    for name, content in files:
+        text += f"\n--- FILE START: {name} ---\n{content[:MAX_FILE_CHARS]}\n--- FILE END ---"
+    return text
 
 
 # ---------- Helper functions ----------
@@ -515,6 +526,8 @@ def extract_json(text):
 
 
 def render_message(m, idx):
+    if m.get("attachment"):
+        st.caption(f"📎 {m['attachment']}")
     st.markdown(m["content"])
     if m.get("image"):
         raw = base64.b64decode(m["image"])
@@ -598,38 +611,54 @@ user_input = st.chat_input(
 messages = cur()["messages"]
 
 if user_input:
-    prompt = user_input.text or ""
-    attached_file_text = ""
+    prompt = (user_input.text or "").strip()
     inline_img_bytes = None
     inline_img_mime = None
+    attach_name = None
+    can_use_image = not (is_agent_mode or is_image_mode)
 
     if user_input.files:
         f = user_input.files[0]
         if f.type and f.type.startswith("image/"):
             inline_img_bytes = f.getvalue()
             inline_img_mime = f.type
-            if not prompt:
-                prompt = "এই ছবিটি বিস্তারিত বিশ্লেষণ করে বর্ণনা করো।"
+            if not can_use_image:
+                st.info("এই মোডে ছবি ব্যবহার হবে না। সাধারণ চ্যাট বা JSON মোডে ছবি দাও।")
         else:
-            extracted = read_file(f.name, f.getvalue())
-            if extracted.strip():
-                attached_file_text = f"\n\n[Attached File: {f.name}]\n{extracted[:MAX_FILE_CHARS]}"
-                if not prompt:
-                    prompt = f"'{f.name}' ফাইলটি বিশ্লেষণ করে সংক্ষেপে বোঝাও।"
+            try:
+                extracted = read_file(f.name, f.getvalue())
+            except Exception as e:
+                extracted = None
+                st.warning(f"ফাইল পড়তে সমস্যা হয়েছে: {e}")
+            if extracted and extracted.strip():
+                cur()["file_name"] = f.name
+                cur()["file_text"] = extracted[:MAX_FILE_CHARS]
+                attach_name = f.name
+                if len(extracted) > MAX_FILE_CHARS:
+                    st.info(f"ফাইল বড়, শুধু প্রথম {MAX_FILE_CHARS} অক্ষর ব্যবহার হবে।")
+            elif extracted is not None:
+                st.warning("ফাইলে কোনো text পাওয়া যায়নি (scanned PDF হতে পারে)।")
 
-    if prompt or inline_img_bytes or attached_file_text:
-        full_content = prompt + attached_file_text
-        user_msg = {"role": "user", "content": full_content}
+    if not prompt:
+        if inline_img_bytes and can_use_image:
+            prompt = "এই ছবিটি বিস্তারিত বিশ্লেষণ করে বর্ণনা করো।"
+        elif attach_name:
+            prompt = f"'{attach_name}' ফাইলটি বিশ্লেষণ করে সংক্ষেপে বোঝাও।"
 
-        # চ্যাট বক্সের ভেতর থেকে ছবি দিলে সেটি নেওয়া হবে
-        if inline_img_bytes and not (is_agent_mode or is_image_mode):
+    if prompt:
+        user_msg = {"role": "user", "content": prompt}
+        if attach_name:
+            user_msg["attachment"] = attach_name
+
+        # চ্যাট বক্সের ভেতর থেকে ছবি দিলে সেটি নেওয়া হবে
+        if inline_img_bytes and can_use_image:
             if len(inline_img_bytes) > MAX_IMAGE_BYTES:
                 st.warning("ছবি ৩MB-এর বেশি বড়, তাই যুক্ত করা হয়নি। ছোট ছবি দাও।")
             else:
                 user_msg["image"] = base64.b64encode(inline_img_bytes).decode()
                 user_msg["mime"] = inline_img_mime or "image/png"
-        # অথবা সাইডবার থেকে ছবি দিলে সেটি নেওয়া হবে
-        elif uploaded_image is not None and not (is_agent_mode or is_image_mode):
+        # অথবা সাইডবার থেকে ছবি দিলে সেটি নেওয়া হবে
+        elif uploaded_image is not None and can_use_image:
             raw_img = uploaded_image.getvalue()
             if len(raw_img) > MAX_IMAGE_BYTES:
                 st.warning("ছবি ৩MB-এর বেশি বড়, তাই যুক্ত করা হয়নি। ছোট ছবি দাও।")
@@ -639,7 +668,7 @@ if user_input:
                 st.session_state.img_counter += 1
 
         if cur()["title"] == "নতুন চ্যাট":
-            cur()["title"] = (prompt or "ফাইল/ছবি বিশ্লেষণ").strip().replace("\n", " ")[:30]
+            cur()["title"] = prompt.replace("\n", " ")[:30]
         messages.append(user_msg)
         st.session_state.pending = True
 
@@ -668,6 +697,7 @@ if st.session_state.pending:
         st.session_state.pending = False
     else:
         last_user = messages[-1]
+        system_instruction = build_system_instruction()
         success = False
         with st.chat_message("assistant"):
             try:
