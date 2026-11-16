@@ -14,6 +14,7 @@ from datetime import date
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 from dotenv import load_dotenv
 from groq import Groq
@@ -148,11 +149,12 @@ if not api_key:
 
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 GEMINI_MODEL = get_secret("GEMINI_MODEL") or "gemini-3.8-flash"
-GEMINI_IMAGE_MODEL = get_secret("GEMINI_IMAGE_MODEL") or "gemini-2.5-flash-image"
+GEMINI_IMAGE_MODEL = get_secret("GEMINI_IMAGE_MODEL") or "gemini-nano-banana-2.1"
+GEMINI_IMAGE_FALLBACKS = ("gemini-3.1-flash-image", "gemini-2.5-flash-image")  # প্রথমটি না চললে এগুলো
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 HF_TOKEN = get_secret("HF_TOKEN")
 TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
-OPENAI_IMAGE_MODEL = get_secret("OPENAI_IMAGE_MODEL") or "gpt-image-1"
+OPENAI_IMAGE_MODEL = get_secret("OPENAI_IMAGE_MODEL") or "gpt-image-2.6-sunburst"
 HAS_EDIT = bool(OPENAI_API_KEY or GEMINI_API_KEY or HF_TOKEN)
 client = Groq(api_key=api_key)
 
@@ -208,6 +210,43 @@ If the user attaches a screenshot, rebuild that design as closely as possible in
 No text outside the code block."""
 
 CHAT_PROMPT = "You are a helpful AI assistant. Answer clearly in the language the user uses."
+
+PERSONAS = {
+    "🤖 সাধারণ সহকারী": "",
+    "💻 কোডিং এক্সপার্ট": (
+        "Act as a senior software engineer and code reviewer. Give correct, working, production-quality code "
+        "with brief explanations. Point out bugs, security issues and edge cases. Prefer simple, maintainable "
+        "solutions. For HTML/CSS/JS demos give complete runnable code in fenced code blocks."
+    ),
+    "📘 ইংরেজি শিক্ষক": (
+        "Act as a friendly, patient English teacher for a Bangla-speaking learner. Explain grammar and vocabulary "
+        "simply (in Bangla when helpful), correct the user's English mistakes kindly with the corrected sentence, "
+        "give 2-3 example sentences and a short practice question when appropriate."
+    ),
+    "✍️ কনটেন্ট রাইটার": (
+        "Act as a professional content writer and editor. Write clear, engaging, well-structured content "
+        "(headings, short paragraphs, strong opening, call to action when suitable) in the requested tone and "
+        "language. Ask no unnecessary questions; produce a complete draft first."
+    ),
+    "🎨 UI/UX ডিজাইনার": (
+        "Act as a senior UI/UX designer who also knows WordPress and Elementor. Give practical, modern design "
+        "advice: layout, spacing, typography, color palettes (with hex codes), accessibility and responsive "
+        "behavior. When useful, provide ready-to-use CSS or HTML."
+    ),
+    "✏️ কাস্টম": "",
+}
+
+
+def persona_prompt():
+    """সাইডবারে বাছাই করা পারসোনা অনুযায়ী সিস্টেম প্রম্পট"""
+    choice = st.session_state.get("persona", "🤖 সাধারণ সহকারী")
+    if choice == "✏️ কাস্টম":
+        extra = (st.session_state.get("persona_custom") or "").strip()[:1000]
+    else:
+        extra = PERSONAS.get(choice, "")
+    if not extra:
+        return CHAT_PROMPT
+    return CHAT_PROMPT + "\n\nROLE / PERSONA (follow this role in every answer):\n" + extra
 
 VISION_PROMPT = """You are a careful, expert teacher and tutor. The user attached one or more images. If there are several images, treat them as consecutive pages
 of the same document, in the order given, and answer the questions of ALL images one after another
@@ -591,16 +630,21 @@ def _prime(gen):
 
 def _gemini_image_call(parts):
     body = {"contents": [{"parts": parts}], "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}}
-    r = requests.post(f"{GEMINI_BASE}/{GEMINI_IMAGE_MODEL}:generateContent",
-                      headers=_gemini_headers(), json=body, timeout=180)
-    if r.status_code != 200:
-        raise RuntimeError(_gemini_error(r))
-    for cand in r.json().get("candidates", []):
-        for part in (cand.get("content") or {}).get("parts", []):
-            blob = part.get("inlineData") or part.get("inline_data")
-            if blob and blob.get("data"):
-                return base64.b64decode(blob["data"]), (blob.get("mimeType") or blob.get("mime_type") or "image/png")
-    raise RuntimeError("Gemini ছবি দেয়নি (সেফটি ফিল্টার বা কোটা হতে পারে)")
+    last_err = None
+    for m_name in dict.fromkeys([GEMINI_IMAGE_MODEL, *GEMINI_IMAGE_FALLBACKS]):
+        r = requests.post(f"{GEMINI_BASE}/{m_name}:generateContent",
+                          headers=_gemini_headers(), json=body, timeout=180)
+        if r.status_code != 200:
+            last_err = f"{m_name}: {_gemini_error(r)}"
+            continue  # এই মডেল বন্ধ/অনুপলব্ধ হলে পরের মডেলে
+        for cand in r.json().get("candidates", []):
+            for part in (cand.get("content") or {}).get("parts", []):
+                blob = part.get("inlineData") or part.get("inline_data")
+                if blob and blob.get("data"):
+                    st.session_state["_gemini_img_used"] = m_name
+                    return base64.b64decode(blob["data"]), (blob.get("mimeType") or blob.get("mime_type") or "image/png")
+        last_err = f"{m_name}: ছবি দেয়নি (সেফটি ফিল্টার বা কোটা হতে পারে)"
+    raise RuntimeError(last_err or "Gemini ছবি দেয়নি")
 
 
 def gemini_text_to_image(prompt, size_key):
@@ -740,7 +784,7 @@ def generate_ai_image(prompt, size_key, quality):
         try:
             data, gmime = gemini_text_to_image(eng, size_key)
             return {"bytes": data, "mime": gmime, "prompt": eng,
-                    "source": f"Gemini ({GEMINI_IMAGE_MODEL})", "notes": notes}
+                    "source": f"Gemini ({st.session_state.get('_gemini_img_used', GEMINI_IMAGE_MODEL)})", "notes": notes}
         except Exception as e:
             notes.append(f"Gemini ব্যর্থ: {_short(e)}")
 
@@ -793,7 +837,7 @@ def edit_ai_image(image_bytes, instruction, mime, quality):
                 "bytes": data,
                 "mime": gmime,
                 "prompt": eng,
-                "source": f"Gemini ({GEMINI_IMAGE_MODEL})",
+                "source": f"Gemini ({st.session_state.get('_gemini_img_used', GEMINI_IMAGE_MODEL)})",
                 "notes": notes,
             }
         except Exception as e:
@@ -1318,6 +1362,22 @@ with st.sidebar:
     is_agent_mode = app_mode.startswith("🔌")
     is_image_mode = app_mode.startswith("🎨")
 
+    if app_mode.startswith("💬"):
+        with st.expander("🎭 AI-এর ভূমিকা (Persona)", expanded=False):
+            st.radio(
+                "এক ক্লিকে ভূমিকা বদলাও:",
+                list(PERSONAS),
+                key="persona",
+                label_visibility="collapsed",
+            )
+            if st.session_state.get("persona") == "✏️ কাস্টম":
+                st.text_area(
+                    "নিজের ভূমিকা লিখুন:",
+                    key="persona_custom",
+                    placeholder="যেমন: তুমি একজন অভিজ্ঞ SEO বিশেষজ্ঞ, সংক্ষেপে ও পয়েন্ট আকারে উত্তর দাও।",
+                    height=100,
+                )
+
     with st.expander("⚙️ সেটিংস", expanded=False):
         preset_model = st.selectbox(
             "AI মডেল বেছে নিন:",
@@ -1528,7 +1588,7 @@ def build_system_instruction(cap=None):
     elif last_msg_has_image():
         base = VISION_PROMPT
     else:
-        base = CHAT_PROMPT
+        base = persona_prompt()
 
     base = base + f"\n\nToday's date: {date.today().isoformat()}."
 
@@ -1569,6 +1629,129 @@ def extract_json(text):
     return json.dumps(parsed, indent=2, ensure_ascii=False)
 
 
+def build_preview_html(text):
+    """উত্তরের ```html / ```css / ```js কোড ব্লক জুড়ে একটি চলার মতো HTML পেজ বানায় (না থাকলে None)"""
+    blocks = re.findall(r"```([A-Za-z0-9+#]*)[ \t]*\n(.*?)```", text or "", re.S)
+    html_b = [c for lang, c in blocks if lang.lower() in ("html", "htm")]
+    css_b = [c for lang, c in blocks if lang.lower() == "css"]
+    js_b = [c for lang, c in blocks if lang.lower() in ("js", "javascript")]
+    if not html_b:
+        return None
+    page = "\n".join(html_b)
+    if not re.search(r"<html|<!doctype", page, re.I):
+        page = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'></head>"
+            f"<body>{page}</body></html>"
+        )
+    css_new = [c for c in css_b if c.strip() and c.strip() not in page]
+    js_new = [c for c in js_b if c.strip() and c.strip() not in page]
+    if css_new:  # আলাদা style.css লিংক সরিয়ে কোড সরাসরি বসাই
+        page = re.sub(r"<link[^>]+href=[\"'](?!https?:|//|data:)[^\"']+\.css[\"'][^>]*>", "", page, flags=re.I)
+        tag = "<style>\n" + "\n".join(css_new) + "\n</style>"
+        page = re.sub(r"</head>", tag + "</head>", page, count=1, flags=re.I) if re.search(r"</head>", page, re.I) else tag + page
+    if js_new:
+        page = re.sub(r"<script[^>]+src=[\"'](?!https?:|//)[^\"']+\.js[\"'][^>]*>\s*</script>", "", page, flags=re.I)
+        tag = "<script>\n" + "\n".join(js_new) + "\n</script>"
+        page = re.sub(r"</body>", tag + "</body>", page, count=1, flags=re.I) if re.search(r"</body>", page, re.I) else page + tag
+    return page
+
+
+def render_preview(page, height=520):
+    """কোড আলাদা sandbox-এ চালায় (অ্যাপের পেজ/ডেটায় হাত দিতে পারে না)"""
+    import html as _html
+    inner = _html.escape(page, quote=True)
+    components.html(
+        '<iframe sandbox="allow-scripts allow-forms allow-modals allow-popups" '
+        f'srcdoc="{inner}" style="width:100%;height:{height - 10}px;border:1px solid #444;'
+        'border-radius:10px;background:#fff"></iframe>',
+        height=height,
+    )
+
+
+def _md_blocks(md_text):
+    """Markdown-কে সহজ ব্লকে ভাগ করে (HTML এক্সপোর্টের জন্য)"""
+    blocks, lines, i = [], (md_text or "").splitlines(), 0
+    while i < len(lines):
+        s = lines[i].strip()
+        if s.startswith("```"):
+            code = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                code.append(lines[i])
+                i += 1
+            blocks.append(("code", "\n".join(code)))
+        elif s.startswith("|"):
+            rows = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                if not all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+                    rows.append(cells)
+                i += 1
+            blocks.append(("table", rows))
+            continue
+        elif not s or re.fullmatch(r"[-*_]{3,}", s):
+            pass
+        elif re.match(r"#{1,6}\s", s):
+            level = len(s) - len(s.lstrip("#"))
+            blocks.append(("h", min(level, 3), s[level:].strip()))
+        elif re.match(r"[-*•]\s+", s):
+            blocks.append(("ul", re.sub(r"^[-*•]\s+", "", s)))
+        else:
+            blocks.append(("p", s))
+        i += 1
+    return blocks
+
+
+def _inline_html(text):
+    import html as _html
+    t = _html.escape(text)
+    t = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", t)
+    return re.sub(r"`([^`]+)`", r"<code>\1</code>", t)
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def text_to_html(md_text, title="AI Answer"):
+    """সুন্দর HTML পেজ (ব্রাউজারে খুলে Print → Save as PDF করলেই PDF হবে)"""
+    import html as _html
+    body, in_ul = [], False
+    for kind in _md_blocks(md_text):
+        if kind[0] != "ul" and in_ul:
+            body.append("</ul>")
+            in_ul = False
+        if kind[0] == "h":
+            body.append(f"<h{kind[1]}>{_inline_html(kind[2])}</h{kind[1]}>")
+        elif kind[0] == "ul":
+            if not in_ul:
+                body.append("<ul>")
+                in_ul = True
+            body.append(f"<li>{_inline_html(kind[1])}</li>")
+        elif kind[0] == "code":
+            body.append(f"<pre>{_html.escape(kind[1])}</pre>")
+        elif kind[0] == "table":
+            rows = "".join(
+                "<tr>" + "".join(f"<{'th' if ri == 0 else 'td'}>{_inline_html(c)}</{'th' if ri == 0 else 'td'}>" for c in row) + "</tr>"
+                for ri, row in enumerate(kind[1])
+            )
+            body.append(f"<table>{rows}</table>")
+        else:
+            body.append(f"<p>{_inline_html(kind[1])}</p>")
+    if in_ul:
+        body.append("</ul>")
+    css = (
+        "body{font-family:'Noto Sans Bengali','Nirmala UI','Kalpurush',system-ui,sans-serif;"
+        "max-width:800px;margin:32px auto;padding:0 20px;line-height:1.75;color:#111}"
+        "h1,h2,h3{margin:1.2em 0 .4em}p{margin:.5em 0}pre{background:#f4f4f4;padding:12px;border-radius:8px;"
+        "overflow-x:auto;white-space:pre-wrap}code{background:#f4f4f4;padding:1px 5px;border-radius:4px}"
+        "table{border-collapse:collapse;margin:10px 0}th,td{border:1px solid #bbb;padding:6px 10px}"
+        "@media print{body{margin:0;max-width:none}}"
+    )
+    return (
+        f"<!doctype html><html lang='bn'><head><meta charset='utf-8'><title>{_html.escape(title)}</title>"
+        f"<style>{css}</style></head><body>{''.join(body)}</body></html>"
+    ).encode("utf-8")
+
+
 def render_message(m, idx):
     if m.get("attachment"):
         st.caption(f"📎 {m['attachment']}")
@@ -1601,13 +1784,35 @@ def render_message(m, idx):
                 key=f"dl_{st.session_state.current}_{idx}",
             )
         elif len(m["content"]) > 120 and not imgs:
-            st.download_button(
-                label="📄 Word ফাইল ডাউনলোড (.docx)",
+            c_docx, c_html = st.columns(2)
+            c_docx.download_button(
+                label="📄 Word (.docx)",
                 data=text_to_docx(m["content"]),
                 file_name=f"ai-answer-{idx}.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 key=f"docx_{st.session_state.current}_{idx}",
             )
+            c_html.download_button(
+                label="🌐 HTML / PDF",
+                data=text_to_html(m["content"]),
+                file_name=f"ai-answer-{idx}.html",
+                mime="text/html",
+                key=f"html_{st.session_state.current}_{idx}",
+                help="ফাইলটি ব্রাউজারে খুলে Print → Save as PDF করলে PDF হবে",
+            )
+
+        preview_page = build_preview_html(m["content"])
+        if preview_page:
+            pk = f"{st.session_state.current}_{idx}"
+            if st.toggle("▶ লাইভ প্রিভিউ দেখুন", key=f"prev_{pk}"):
+                render_preview(preview_page)
+                st.download_button(
+                    "⬇️ প্রিভিউ পেজ (.html)",
+                    data=preview_page.encode("utf-8"),
+                    file_name=f"preview-{idx}.html",
+                    mime="text/html",
+                    key=f"prevdl_{pk}",
+                )
 
 
 def pick_engine():
