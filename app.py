@@ -32,12 +32,11 @@ load_dotenv()
 APP_VERSION = "2.3.0"  # Mic icon fix, mobile composer lift, English hero + logo
 
 st.set_page_config(
-    page_title="Personal AI Studio",
-    page_icon="data:image/svg+xml;utf8,%3Csvg xmlns='http://w3.org' viewBox='0 0 64 64'%3E%3Crect x='2' y='2' width='60' height='60' rx='16' fill='%2318181b' stroke='%23d4af37' stroke-width='3'/%3E%3Cg fill='none' stroke='%23f5d061' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M32 13 C25 22, 25 32, 32 39 C39 32, 39 22, 32 13 Z'/%3E%3Cpath d='M26 23 C19 20, 15 26, 21 35 C25 38, 29 39, 32 39'/%3E%3Cpath d='M38 23 C45 20, 49 26, 43 35 C39 38, 35 39, 32 39'/%3E%3Cpath d='M18 30 C11 31, 10 38, 19 42 C25 44, 29 41, 32 39'/%3E%3Cpath d='M46 30 C53 31, 54 38, 45 42 C39 44, 35 41, 32 39'/%3E%3Cpath d='M32 39 C27 42, 27 47, 32 51 C37 47, 37 42, 32 39 Z'/%3E%3C/g%3E%3C/svg%3E",
+    page_title="আমার পার্সোনাল AI",
+    page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
 
 # --- ChatGPT স্টাইল কাস্টম CSS (মোবাইল ও ডেস্কটপ ফিক্সড) ---
 st.markdown(
@@ -3184,6 +3183,18 @@ if _new_mems:
     st.toast("🧠 মেমোরিতে সেভ হয়েছে: " + " | ".join(_new_mems), icon="🧠")
 
 if not messages and not st.session_state.pending:
+    st.markdown(
+        "<div class='empty-hero'>"
+        "<svg viewBox='0 0 64 64' xmlns='http://www.w3.org/2000/svg'>"
+        "<defs><linearGradient id='lg' x1='0' y1='0' x2='1' y2='1'>"
+        "<stop offset='0' stop-color='#3b82f6'/><stop offset='1' stop-color='#8b5cf6'/></linearGradient></defs>"
+        "<rect width='64' height='64' rx='19' fill='url(#lg)'/>"
+        "<path d='M32 12c1.6 10.4 7.6 16.4 20 20-12.4 3.6-18.4 9.6-20 20-1.6-10.4-7.6-16.4-20-20 12.4-3.6 18.4-9.6 20-20z' fill='#fff'/>"
+        "</svg>"
+        "<h2 class='empty-title'>How can I help you today?</h2>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
 last_idx = len(messages) - 1
 for idx, m in enumerate(messages):
