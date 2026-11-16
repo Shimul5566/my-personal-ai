@@ -628,12 +628,19 @@ def _prime(gen):
     return itertools.chain([first], gen)
 
 
-def _gemini_image_call(parts):
-    body = {"contents": [{"parts": parts}], "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}}
+def _gemini_image_call(parts, image_config=None):
+    """image_config: যেমন {"imageSize": "2K"}; মডেল না নিলে (400) config ছাড়া আবার চেষ্টা করে"""
     last_err = None
     for m_name in dict.fromkeys([GEMINI_IMAGE_MODEL, *GEMINI_IMAGE_FALLBACKS]):
-        r = requests.post(f"{GEMINI_BASE}/{m_name}:generateContent",
-                          headers=_gemini_headers(), json=body, timeout=180)
+        r = None
+        for cfg in ([image_config, None] if image_config else [None]):
+            gen = {"responseModalities": ["TEXT", "IMAGE"]}
+            if cfg:
+                gen["imageConfig"] = cfg
+            r = requests.post(f"{GEMINI_BASE}/{m_name}:generateContent", headers=_gemini_headers(),
+                              json={"contents": [{"parts": parts}], "generationConfig": gen}, timeout=240)
+            if not (r.status_code == 400 and cfg):
+                break
         if r.status_code != 200:
             last_err = f"{m_name}: {_gemini_error(r)}"
             continue  # এই মডেল বন্ধ/অনুপলব্ধ হলে পরের মডেলে
@@ -653,12 +660,13 @@ def gemini_text_to_image(prompt, size_key):
     return _gemini_image_call([{"text": f"{prompt}\n\nAspect ratio: {ratio}."}])
 
 
-def gemini_edit_image(image_bytes, prompt, mime):
-    parts = [
-        {"text": prompt},
-        {"inlineData": {"mimeType": mime or "image/png", "data": base64.b64encode(image_bytes).decode()}},
-    ]
-    return _gemini_image_call(parts)
+def gemini_edit_image(images, prompt, quality="auto"):
+    """images: [(bytes, mime), ...] — একাধিক ছবি দিলে প্রম্পটে 'image 1', 'image 2' বলে উল্লেখ করা যায়।
+    aspectRatio দেওয়া হয় না, তাই আউটপুট আসল ছবির অনুপাতই রাখে; কোয়ালিটি 'high' হলে 2K।"""
+    parts = [{"text": prompt}]
+    for data, mm in images:
+        parts.append({"inlineData": {"mimeType": mm or "image/png", "data": base64.b64encode(data).decode()}})
+    return _gemini_image_call(parts, {"imageSize": "2K"} if quality == "high" else None)
 
 
 # ---------- Image generation / editing ----------
@@ -688,12 +696,20 @@ def enhance_image_prompt(user_prompt):
     )
 
 
+EDIT_KEEP_CLAUSE = (
+    "Edit only what is requested. Keep everything else exactly the same: the subject's identity and face, pose, "
+    "composition, framing, camera angle, lighting, colors, existing text and overall image quality. "
+    "Do not crop, keep the original aspect ratio, and give a sharp, high-resolution, natural-looking result."
+)
+
+
 def enhance_edit_prompt(user_prompt):
-    """এডিটের নির্দেশনাকে ছোট, স্পষ্ট ইংরেজি নির্দেশনায় রূপান্তর করে"""
+    """এডিটের নির্দেশ হুবহু ইংরেজিতে (ছোট না করে) রূপান্তর করে"""
     return _llm_rewrite(
-        "Convert the user's image editing request into one short, clear English editing instruction "
-        "(for example: 'Replace the background with a beach at sunset, keep the person unchanged'). "
-        "Output ONLY the instruction, nothing else.",
+        "Translate and clarify the user's image editing request into precise English. Keep every detail the user "
+        "gave (objects, colors, positions, styles). Keep any text the user wants written on the image exactly as "
+        "given, inside double quotes. If several images are attached, refer to them as 'image 1', 'image 2' in "
+        "order. Do not shorten the request and do not add new ideas. Output ONLY the instruction.",
         user_prompt,
     )
 
@@ -720,17 +736,35 @@ def openai_text_to_image(prompt, size, quality):
     return base64.b64decode(r.json()["data"][0]["b64_json"])
 
 
-def openai_edit_image(image_bytes, prompt, mime, quality):
-    ext = "jpg" if "jpeg" in mime or "jpg" in mime else ("webp" if "webp" in mime else "png")
-    r = requests.post(
-        "https://api.openai.com/v1/images/edits",
-        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-        files={"image": (f"image.{ext}", image_bytes, mime or "image/png")},
-        data={"model": OPENAI_IMAGE_MODEL, "prompt": prompt, "quality": quality, "n": "1"},
-        timeout=180,
-    )
+def openai_edit_image(images, prompt, quality, transparent=False):
+    """images: [(bytes, mime), ...] (সর্বোচ্চ ১৬)। (ছবি_bytes, transparent_হয়েছে_কিনা) ফেরত দেয়।
+    নতুন প্যারামিটার (background/output_format) মডেল না নিলে 400 আসে — তখন একটি একটি করে বাদ দিয়ে আবার চেষ্টা।
+    input_fidelity ইচ্ছে করেই পাঠানো হয় না: নতুন gpt-image মডেলে সবসময় high, পাঠালে 400 আসে।"""
+    field = "image[]" if len(images) > 1 else "image"
+    files = []
+    for i, (data, mm) in enumerate(images):
+        mm = mm or "image/png"
+        ext = "jpg" if ("jpeg" in mm or "jpg" in mm) else ("webp" if "webp" in mm else "png")
+        files.append((field, (f"image{i + 1}.{ext}", data, mm)))
+    base = {"model": OPENAI_IMAGE_MODEL, "prompt": prompt, "n": "1"}
+    variants = []
+    if transparent:
+        variants.append(({**base, "quality": quality, "output_format": "png", "background": "transparent"}, True))
+    variants.append(({**base, "quality": quality, "output_format": "png"}, False))
+    variants.append(({**base, "quality": quality}, False))
+    variants.append((base, False))
+
+    r = None
+    for data, is_transparent in variants:
+        r = requests.post(
+            "https://api.openai.com/v1/images/edits",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            files=files, data=data, timeout=240,
+        )
+        if r.status_code != 400:
+            break
     _openai_check(r)
-    return base64.b64decode(r.json()["data"][0]["b64_json"])
+    return base64.b64decode(r.json()["data"][0]["b64_json"]), is_transparent
 
 
 # --- Hugging Face (FLUX) ---
@@ -812,49 +846,48 @@ def generate_ai_image(prompt, size_key, quality):
         raise RuntimeError("ছবি তৈরি করা যায়নি। " + " | ".join(notes))
 
 
-def edit_ai_image(image_bytes, instruction, mime, quality):
-    """OpenAI -> FLUX Kontext (HF) -> ফ্রি Groq Vision + Pollinations Flux ফলব্যাক"""
-    eng = enhance_edit_prompt(instruction)
+def edit_ai_image(image_bytes, instruction, mime, quality, extra=None, transparent=False):
+    """OpenAI -> Gemini -> FLUX Kontext (HF) -> ফ্রি ফলব্যাক। extra = বাড়তি ছবির তালিকা [(bytes, mime)]"""
+    core = enhance_edit_prompt(instruction)
+    full = f"{core}\n\n{EDIT_KEEP_CLAUSE}"
     notes = []
     mime = mime or "image/png"
+    images = [(image_bytes, mime)] + list(extra or [])
+    # ট্রান্সপারেন্ট শুধু OpenAI-তে চেষ্টা হয়; অন্যগুলোতে সাদা ব্যাকগ্রাউন্ড
+    white = full + " Place the subject on a plain, pure white background."
 
     if OPENAI_API_KEY:
         try:
-            return {
-                "bytes": openai_edit_image(image_bytes, eng, mime, quality),
-                "mime": "image/png",
-                "prompt": eng,
-                "source": f"OpenAI ({OPENAI_IMAGE_MODEL})",
-                "notes": notes,
-            }
+            out, got_t = openai_edit_image(images, full, quality, transparent)
+            if transparent and not got_t:
+                notes.append("মডেল ট্রান্সপারেন্ট ব্যাকগ্রাউন্ড নেয়নি; সাধারণ ব্যাকগ্রাউন্ডে এডিট হয়েছে।")
+            return {"bytes": out, "mime": "image/png", "prompt": core,
+                    "source": f"OpenAI ({OPENAI_IMAGE_MODEL})", "notes": notes}
         except Exception as e:
             notes.append(f"OpenAI ব্যর্থ: {_short(e)}")
 
+    if transparent:
+        notes.append("ট্রান্সপারেন্ট PNG শুধু OpenAI দিয়ে হয়; এখানে সাদা ব্যাকগ্রাউন্ড দেওয়া হচ্ছে।")
+
     if GEMINI_API_KEY:
         try:
-            data, gmime = gemini_edit_image(image_bytes, eng, mime)
-            return {
-                "bytes": data,
-                "mime": gmime,
-                "prompt": eng,
-                "source": f"Gemini ({st.session_state.get('_gemini_img_used', GEMINI_IMAGE_MODEL)})",
-                "notes": notes,
-            }
+            data, gmime = gemini_edit_image(images, white if transparent else full, quality)
+            return {"bytes": data, "mime": gmime, "prompt": core,
+                    "source": f"Gemini ({st.session_state.get('_gemini_img_used', GEMINI_IMAGE_MODEL)})",
+                    "notes": notes}
         except Exception as e:
             notes.append(f"Gemini ব্যর্থ: {_short(e)}")
 
     if HF_TOKEN:
         try:
-            return {
-                "bytes": hf_edit_image(image_bytes, eng),
-                "mime": "image/png",
-                "prompt": eng,
-                "source": "FLUX Kontext (Hugging Face)",
-                "notes": notes,
-            }
+            if len(images) > 1:
+                notes.append("FLUX শুধু প্রথম ছবিটি এডিট করে।")
+            return {"bytes": hf_edit_image(image_bytes, white if transparent else full), "mime": "image/png",
+                    "prompt": core, "source": "FLUX Kontext (Hugging Face)", "notes": notes}
         except Exception as e:
             notes.append(f"HF ব্যর্থ: {_short(e)}")
 
+    eng = core
     # ফ্রি ফলব্যাক: Groq Vision দিয়ে ছবির ডিজাইন বুঝে নতুন ছবি তৈরি (আসল ছবি এডিট হয় না)
     notes.append("আসল ছবি এডিট হয়নি। ছবির স্টাইল দেখে নতুন ছবি তৈরি হয়েছে (ফ্রি ফলব্যাক)।")
     combined_prompt = eng
@@ -909,6 +942,7 @@ def edit_ai_image(image_bytes, instruction, mime, quality):
         "prompt": combined_prompt,
         "source": "Pollinations Flux (ফ্রি স্টাইল-এডিট)",
         "notes": notes,
+        "real": False,  # আসল ছবি এডিট হয়নি, নতুন ছবি তৈরি হয়েছে
     }
 
 
@@ -1296,6 +1330,38 @@ def regen_cb():
         st.session_state.pending = True
 
 
+QUICK_EDITS = {
+    "🧼 ব্যাকগ্রাউন্ড সরাও (সাদা)": (
+        "Remove the background completely and replace it with a clean, plain pure white background. "
+        "Keep the subject exactly the same with clean, precise edges including hair and fine details, "
+        "and no halo or leftover fringe.", {}),
+    "🔲 ট্রান্সপারেন্ট ব্যাকগ্রাউন্ড (PNG)": (
+        "Remove the background completely so only the subject remains, with clean, precise edges "
+        "including hair and fine details.", {"transparent": True}),
+    "🏢 স্টুডিও ব্যাকগ্রাউন্ড": (
+        "Replace the background with a clean, professional studio backdrop (soft light-gray gradient) and "
+        "match the lighting on the subject. Keep the subject unchanged.", {}),
+    "✨ শার্প ও ক্লিয়ার করো": (
+        "Enhance this photo: natural sharpening, noise reduction, balanced exposure, contrast and color. "
+        "Do not change the content, faces or composition.", {}),
+    "🕰️ পুরনো ছবি রিস্টোর": (
+        "Restore this old or damaged photo: remove scratches, dust, stains and fading, recover contrast and "
+        "detail. Keep faces and details faithful to the original.", {}),
+}
+
+
+def quick_edit_cb(label):
+    """চ্যাটের সর্বশেষ ছবিতে এক ক্লিকে এডিট শুরু করে"""
+    prompt, opts = QUICK_EDITS[label]
+    msg = {"role": "user", "content": prompt, "force": "edit"}
+    if opts:
+        msg["edit_opts"] = opts
+    if cur()["title"] == "নতুন চ্যাট":
+        cur()["title"] = label[:30]
+    push_message(msg)
+    st.session_state.pending = True
+
+
 def total_file_chars():
     n = len(cur().get("file_text") or "")
     if file_context and uploaded_file is not None:
@@ -1377,6 +1443,14 @@ with st.sidebar:
                     placeholder="যেমন: তুমি একজন অভিজ্ঞ SEO বিশেষজ্ঞ, সংক্ষেপে ও পয়েন্ট আকারে উত্তর দাও।",
                     height=100,
                 )
+
+    if HAS_EDIT and not is_agent_mode and any((_m.get("images") or _m.get("image")) for _m in (cur().get("messages") or [])):
+        with st.expander("🖌️ এক-ক্লিক ছবি এডিট", expanded=False):
+            st.caption("চ্যাটের সর্বশেষ ছবিটি এডিট হবে। একটির পর আরেকটিও চালানো যায়।")
+            for _label in QUICK_EDITS:
+                if _label.startswith("🔲") and not OPENAI_API_KEY:
+                    continue  # ট্রান্সপারেন্ট PNG শুধু OpenAI-তে
+                st.button(_label, key=f"qe_{_label}", on_click=quick_edit_cb, args=(_label,))
 
     with st.expander("⚙️ সেটিংস", expanded=False):
         preset_model = st.selectbox(
@@ -1910,17 +1984,31 @@ def build_api_messages(history, system_text, use_vision):
     return clean
 
 
-def get_edit_source(last_user):
-    """এডিটের ছবি: এই মেসেজের সাথের ছবি, না থাকলে ঠিক আগের AI-র তৈরি ছবি"""
+def get_edit_sources(last_user, deep=None):
+    """এডিটের ছবি(গুলো): এই মেসেজের সাথের ছবি; না থাকলে ঠিক আগের AI-র ছবি।
+    deep=True (/edit বা এক-ক্লিক এডিট) হলে চ্যাটের সর্বশেষ ছবি (যার-ই হোক) খোঁজে।"""
     imgs = get_msg_images(last_user)
     if imgs:
-        return imgs[0]  # এডিটে প্রথম ছবিটিই ব্যবহার হয়
+        return imgs[:MAX_IMAGES_PER_MSG]
+    if deep is None:
+        deep = last_user.get("force") == "edit"
     msgs = cur()["messages"]
+    if deep:
+        for m in reversed(msgs[:-1]):
+            prev = get_msg_images(m)
+            if prev:
+                return prev[:MAX_IMAGES_PER_MSG] if m["role"] == "user" else prev[:1]
+        return None
     if len(msgs) >= 2 and msgs[-2]["role"] == "assistant":
         prev = get_msg_images(msgs[-2])
         if prev:
-            return prev[0]
+            return prev[:1]
     return None
+
+
+def get_edit_source(last_user):
+    srcs = get_edit_sources(last_user)
+    return srcs[0] if srcs else None
 
 
 def resolve_intent(last_user):
@@ -2084,12 +2172,19 @@ if st.session_state.pending:
                             img = generate_ai_image(last_user["content"], size_key, image_quality)
                         label = "🎨 ছবি তৈরি হয়েছে।"
                     else:
-                        src = get_edit_source(last_user)
-                        if not src:
+                        srcs = get_edit_sources(last_user)
+                        if not srcs:
                             raise RuntimeError("এডিট করার মতো কোনো ছবি পাওয়া যায়নি। আগে একটি ছবি দাও।")
-                        with st.spinner("🖌️ ছবি এডিট হচ্ছে..."):
-                            img = edit_ai_image(base64.b64decode(src[0]), last_user["content"], src[1], image_quality)
-                        label = "🖌️ ছবি এডিট হয়েছে।"
+                        with st.spinner("🖌️ ছবি এডিট হচ্ছে... (একটু সময় লাগতে পারে)"):
+                            img = edit_ai_image(
+                                base64.b64decode(srcs[0][0]), last_user["content"], srcs[0][1], image_quality,
+                                extra=[(base64.b64decode(b), mm) for b, mm in srcs[1:]],
+                                transparent=bool((last_user.get("edit_opts") or {}).get("transparent")),
+                            )
+                        label = (
+                            "🖌️ ছবি এডিট হয়েছে।" if img.get("real", True)
+                            else "⚠️ আসল ছবি এডিট করা যায়নি — স্টাইল দেখে নতুন ছবি তৈরি হয়েছে।"
+                        )
                     note_text = f"\n\n⚠️ {' | '.join(img['notes'])}" if img.get("notes") else ""
                     reply_msg = {
                         "role": "assistant",
