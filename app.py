@@ -29,7 +29,7 @@ from docx import Document
 
 load_dotenv()
 
-APP_VERSION = "2.0.0"  # Advanced Studio upgrade
+APP_VERSION = "2.1.0"  # Responsive mobile + voice composer refresh
 
 st.set_page_config(
     page_title="আমার পার্সোনাল AI",
@@ -142,6 +142,63 @@ st.markdown(
     a { color:#93c5fd !important; }
     ::selection { background:#315b91; color:#fff; }
     @media (max-width: 700px) { .block-container { padding:1rem .8rem 5rem !important; } [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { max-width:96%; } }
+
+    /* Accessible sidebar navigation controls */
+    [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarExpandButton"],
+    header button[kind="header"], header button[aria-label*="sidebar" i] {
+        color:#f8fafc !important; background:#263449 !important;
+        border:1px solid #64748b !important; border-radius:10px !important;
+        min-width:40px !important; min-height:40px !important;
+        opacity:1 !important; box-shadow:0 2px 10px rgba(0,0,0,.28) !important;
+    }
+    [data-testid="stSidebarCollapseButton"] svg, [data-testid="stSidebarExpandButton"] svg,
+    header button[kind="header"] svg { color:#fff !important; fill:#fff !important; stroke:#fff !important; opacity:1 !important; }
+
+    /* Consistent, high-contrast export buttons */
+    .stDownloadButton > button, .stDownloadButton > button:focus, .stDownloadButton > button:hover {
+        color:#f8fafc !important; background:linear-gradient(135deg,#263449,#34445d) !important;
+        border:1px solid #64748b !important; min-height:46px !important; width:100% !important;
+        white-space:normal !important; line-height:1.35 !important; padding:10px 12px !important;
+    }
+    .stDownloadButton > button *, .stDownloadButton > button svg {
+        color:#fff !important; fill:#fff !important; stroke:#fff !important; opacity:1 !important;
+    }
+
+    /* Compact microphone anchored inside the chat composer, before Send */
+    [data-testid="stAudioInput"] {
+        position:fixed !important; z-index:1005 !important; bottom:24px !important;
+        right:max(calc((100vw - 1040px)/2 + 76px), 76px) !important;
+        width:44px !important; min-width:44px !important; max-width:44px !important;
+        height:44px !important; overflow:hidden !important; display:flex !important;
+        align-items:center !important; justify-content:center !important; padding:0 !important;
+        margin:0 !important; border:1px solid #64748b !important; border-radius:50% !important;
+        background:#263449 !important; box-shadow:0 4px 16px rgba(0,0,0,.32) !important;
+    }
+    [data-testid="stAudioInput"] label, [data-testid="stAudioInput"] audio,
+    [data-testid="stAudioInput"] small, [data-testid="stAudioInput"] [data-testid="stCaptionContainer"] { display:none !important; }
+    [data-testid="stAudioInput"] button {
+        width:42px !important; height:42px !important; min-height:42px !important;
+        padding:8px !important; border:0 !important; border-radius:50% !important;
+        color:#fff !important; background:transparent !important;
+    }
+    [data-testid="stAudioInput"] button svg { color:#fff !important; fill:#fff !important; stroke:#fff !important; }
+    [data-testid="stChatInput"] textarea { padding-right:96px !important; }
+
+    @media (max-width:700px) {
+        .block-container { padding:.8rem .65rem 7rem !important; max-width:100% !important; }
+        [data-testid="stChatMessage"] { padding:10px 8px !important; overflow-wrap:anywhere !important; }
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { max-width:100% !important; }
+        [data-testid="stChatInput"] { left:8px !important; right:8px !important; width:calc(100% - 16px) !important; bottom:8px !important; }
+        [data-testid="stAudioInput"] { right:68px !important; bottom:20px !important; }
+        [data-testid="stChatInput"] textarea { font-size:16px !important; padding-right:92px !important; }
+        div[data-testid="stHorizontalBlock"]:has(.stDownloadButton) { flex-wrap:wrap !important; gap:.55rem !important; }
+        div[data-testid="stHorizontalBlock"]:has(.stDownloadButton) > div[data-testid="column"] {
+            flex:1 1 100% !important; min-width:100% !important; width:100% !important;
+        }
+        .stDownloadButton > button { min-height:48px !important; font-size:15px !important; }
+        [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarExpandButton"],
+        header button[kind="header"] { min-width:44px !important; min-height:44px !important; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -2189,7 +2246,7 @@ with st.sidebar:
     with st.expander("🎙️ ভয়েস সেটিংস", expanded=False):
         voice_lang_label = st.selectbox("আমি যে ভাষায় বলব:", list(STT_LANGS), key="voice_lang")
         voice_reply = st.toggle("🔊 ভয়েসে প্রশ্ন করলে উত্তরও অডিওতে শোনাও", value=True, key="voice_reply")
-        st.caption("মাইক চ্যাট বক্সের ওপরের '🎙️ ভয়েসে প্রশ্ন করুন' অংশে আছে। যেকোনো উত্তরের নিচে 🔊 বাটনে চাপলেও শোনা যায়।")
+        st.caption("মাইকটি নিচের মেসেজ বক্সের ডান পাশে আছে। যেকোনো উত্তরের নিচে 🔊 বাটনে চাপলেও শোনা যায়।")
 
     st.divider()
     app_mode = st.radio(
@@ -2892,11 +2949,12 @@ else:
 
 voice_prompt = None
 if hasattr(st, "audio_input"):
-    with st.expander("🎙️ ভয়েসে প্রশ্ন করুন", expanded=False):
-        _voice_audio = st.audio_input(
-            "মাইকে চাপ দিয়ে বলুন, থামালেই পাঠিয়ে দেওয়া হবে",
-            key=f"voice_{st.session_state.voice_counter}",
-        )
+    # CSS positions this compact recorder inside the bottom chat composer.
+    _voice_audio = st.audio_input(
+        "🎙️ ভয়েসে বলুন",
+        key=f"voice_{st.session_state.voice_counter}",
+        label_visibility="collapsed",
+    )
     if _voice_audio is not None:
         _raw = _voice_audio.getvalue()
         _vh = hashlib.md5(_raw).hexdigest()
