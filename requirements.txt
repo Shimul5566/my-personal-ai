@@ -6,3 +6,4 @@ pypdf
 huggingface_hub
 Pillow
 python-docx
+youtube-transcript-api
