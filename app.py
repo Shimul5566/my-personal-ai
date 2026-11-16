@@ -29,7 +29,7 @@ from docx import Document
 
 load_dotenv()
 
-APP_VERSION = "2.1.0"  # Responsive mobile + voice composer refresh
+APP_VERSION = "2.2.0"  # Header fix, unified background, new mic button, mobile polish
 
 st.set_page_config(
     page_title="আমার পার্সোনাল AI",
@@ -143,48 +143,62 @@ st.markdown(
     ::selection { background:#315b91; color:#fff; }
     @media (max-width: 700px) { .block-container { padding:1rem .8rem 5rem !important; } [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { max-width:96%; } }
 
-    /* Remove the empty Streamlit header strip; keep its action buttons floating. */
+    /* ===== v2.2 FIXES ===== */
+
+    /* 1) Header / top buttons: normal visible header (no more clipped Share/Fork/menu buttons) */
     header[data-testid="stHeader"] {
-        height:0 !important; min-height:0 !important;
-        background:transparent !important; border:0 !important;
-        box-shadow:none !important; overflow:visible !important;
+        height:3.5rem !important; min-height:3.5rem !important;
+        background:transparent !important; backdrop-filter:none !important;
+        border:0 !important; box-shadow:none !important; z-index:1000 !important;
     }
     header[data-testid="stHeader"] [data-testid="stToolbar"] {
-        position:fixed !important; top:8px !important; right:12px !important;
-        z-index:1100 !important; background:transparent !important;
+        position:static !important; top:auto !important; right:auto !important;
+        background:transparent !important; align-items:center !important;
+        padding-right:.5rem !important;
     }
-    header[data-testid="stHeader"] [data-testid="stToolbar"] button {
-        color:#f8fafc !important; background:#263449 !important;
-        border:1px solid #64748b !important; border-radius:10px !important;
-        opacity:1 !important; box-shadow:0 2px 10px rgba(0,0,0,.28) !important;
+    header[data-testid="stHeader"] [data-testid="stToolbar"] button,
+    header[data-testid="stHeader"] [data-testid="stToolbar"] a {
+        color:#e5edf8 !important; background:rgba(38,52,73,.85) !important;
+        border:1px solid #3d4d66 !important; border-radius:10px !important;
+        opacity:1 !important; min-height:34px !important;
     }
     header[data-testid="stHeader"] [data-testid="stToolbar"] button svg,
-    header[data-testid="stHeader"] [data-testid="stToolbar"] button svg *,
-    header[data-testid="stHeader"] [data-testid="stToolbar"] button img {
-        color:#fff !important; fill:#fff !important; stroke:#fff !important;
-        opacity:1 !important; filter:brightness(0) invert(1) !important;
+    header[data-testid="stHeader"] [data-testid="stToolbar"] button svg * {
+        color:#e5edf8 !important; fill:currentColor !important; opacity:1 !important;
     }
+    .block-container { padding-top:4.2rem !important; }
 
-    /* Center the sidebar chevron in a predictable touch target. */
-    [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarExpandButton"],
-    header button[aria-label*="sidebar" i] {
-        display:inline-flex !important; align-items:center !important;
-        justify-content:center !important; box-sizing:border-box !important;
-        padding:0 !important; line-height:1 !important;
-        width:44px !important; min-width:44px !important;
-        height:44px !important; min-height:44px !important;
-        color:#fff !important; background:#263449 !important;
-        border:1px solid #64748b !important; border-radius:11px !important;
-        opacity:1 !important; box-shadow:0 2px 10px rgba(0,0,0,.28) !important;
+    /* Sidebar open/close chevron: centered, clearly visible touch target */
+    [data-testid="stSidebarCollapseButton"] button, [data-testid="stExpandSidebarButton"],
+    [data-testid="stSidebarCollapsedControl"] button {
+        display:inline-flex !important; align-items:center !important; justify-content:center !important;
+        width:40px !important; height:40px !important; min-height:40px !important; padding:0 !important;
+        color:#fff !important; background:rgba(38,52,73,.9) !important;
+        border:1px solid #3d4d66 !important; border-radius:11px !important; opacity:1 !important;
     }
-    [data-testid="stSidebarCollapseButton"] svg,
-    [data-testid="stSidebarExpandButton"] svg,
-    header button[aria-label*="sidebar" i] svg {
-        display:block !important; margin:auto !important;
-        width:20px !important; height:20px !important;
-        color:#fff !important; fill:#none !important; stroke:#fff !important;
-        opacity:1 !important;
+    [data-testid="stSidebarCollapseButton"] svg, [data-testid="stExpandSidebarButton"] svg,
+    [data-testid="stSidebarCollapsedControl"] svg { color:#fff !important; fill:currentColor !important; }
+
+    /* 2) One single background everywhere; ONLY the input box has its own colour */
+    html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"],
+    [data-testid="stMainBlockContainer"] { background-color:#141922 !important; }
+    .stApp {
+        background:radial-gradient(ellipse at 50% -20%, #26354b 0%, #171b24 42%, #111318 100%) fixed !important;
     }
+    [data-testid="stAppViewContainer"], [data-testid="stMain"] { background:transparent !important; }
+    [data-testid="stBottom"], [data-testid="stBottom"] > div,
+    [data-testid="stBottomBlockContainer"], [data-testid="stChatInputContainer"] {
+        background:transparent !important; background-color:transparent !important; box-shadow:none !important;
+    }
+    [data-testid="stBottom"]::before, [data-testid="stBottom"]::after { display:none !important; }
+    /* the input box itself = the only different colour */
+    [data-testid="stChatInput"], [data-testid="stChatInput"] > div {
+        background:#262e3d !important; background-color:#262e3d !important;
+        border-radius:26px !important;
+    }
+    [data-testid="stChatInput"] { border:1px solid #3f4f68 !important; box-shadow:0 8px 28px rgba(0,0,0,.28) !important; }
+    [data-testid="stChatInput"] > div { border:0 !important; box-shadow:none !important; }
+    [data-testid="stChatInput"] textarea { background:transparent !important; padding-right:64px !important; }
 
     /* Consistent, high-contrast export buttons */
     .stDownloadButton > button, .stDownloadButton > button:focus, .stDownloadButton > button:hover {
@@ -196,51 +210,61 @@ st.markdown(
         color:#fff !important; fill:#fff !important; stroke:#fff !important; opacity:1 !important;
     }
 
-    /* Compact microphone anchored inside the chat composer, before Send */
+    /* 3) Voice button: clear gradient circle, white mic icon.
+          Final position is calculated by a small script (see voice section) so it always
+          sits INSIDE the composer, just left of the Send button, on desktop and mobile. */
     [data-testid="stAudioInput"] {
-        position:fixed !important; z-index:1005 !important; bottom:94px !important;
-        right:max(calc((100vw - 1040px)/2 + 76px), 76px) !important;
-        width:44px !important; min-width:44px !important; max-width:44px !important;
-        height:44px !important; overflow:hidden !important; display:flex !important;
-        align-items:center !important; justify-content:center !important; padding:0 !important;
-        margin:0 !important; border:1px solid #64748b !important; border-radius:50% !important;
-        background:#263449 !important; box-shadow:0 4px 16px rgba(0,0,0,.32) !important;
+        position:fixed !important; z-index:1006 !important;
+        right:76px !important; bottom:22px !important;           /* fallback before script runs */
+        width:40px !important; min-width:40px !important; max-width:40px !important;
+        height:40px !important; min-height:40px !important; overflow:hidden !important;
+        padding:0 !important; margin:0 !important; display:flex !important;
+        align-items:center !important; justify-content:center !important;
+        border-radius:50% !important; border:0 !important;
+        background:linear-gradient(135deg,#3b82f6,#8b5cf6) !important;
+        box-shadow:0 4px 14px rgba(59,130,246,.38) !important;
+        transition:transform .15s ease, box-shadow .15s ease;
     }
+    [data-testid="stAudioInput"]:hover { transform:scale(1.07); }
+    [data-testid="stAudioInput"] *  { background:transparent !important; background-color:transparent !important; }
     [data-testid="stAudioInput"] label, [data-testid="stAudioInput"] audio,
-    [data-testid="stAudioInput"] small, [data-testid="stAudioInput"] [data-testid="stCaptionContainer"] { display:none !important; }
+    [data-testid="stAudioInput"] small, [data-testid="stAudioInput"] canvas,
+    [data-testid="stAudioInput"] [data-testid="stCaptionContainer"] { display:none !important; }
+    [data-testid="stAudioInput"] > div { width:40px !important; min-width:40px !important; padding:0 !important; gap:0 !important; border:0 !important; }
     [data-testid="stAudioInput"] button {
-        width:42px !important; height:42px !important; min-height:42px !important;
-        padding:8px !important; border:0 !important; border-radius:50% !important;
-        color:#fff !important; background:transparent !important;
+        width:40px !important; height:40px !important; min-width:40px !important; min-height:40px !important;
+        padding:0 !important; margin:0 !important; border:0 !important; border-radius:50% !important;
+        display:flex !important; align-items:center !important; justify-content:center !important;
+        color:#ffffff !important; opacity:1 !important;
     }
-    [data-testid="stAudioInput"] button svg { color:#fff !important; fill:#fff !important; stroke:#fff !important; }
-    [data-testid="stChatInput"] textarea { padding-right:96px !important; }
+    [data-testid="stAudioInput"] button svg, [data-testid="stAudioInput"] button svg * {
+        width:20px !important; height:20px !important;
+        color:#ffffff !important; fill:#ffffff !important; opacity:1 !important; display:block !important;
+    }
+    /* while recording: turn red + pulse */
+    [data-testid="stAudioInput"]:has(button[aria-label*="top" i]) {
+        background:linear-gradient(135deg,#ef4444,#f97316) !important;
+        animation:micpulse 1.2s infinite;
+    }
+    @keyframes micpulse { 0%{box-shadow:0 0 0 0 rgba(239,68,68,.55)} 70%{box-shadow:0 0 0 12px rgba(239,68,68,0)} 100%{box-shadow:0 0 0 0 rgba(239,68,68,0)} }
+    iframe[height="0"] { display:none !important; }
 
+    /* 4) Mobile */
     @media (max-width:700px) {
-        .block-container { padding:.8rem .65rem 7rem !important; max-width:100% !important; }
-        [data-testid="stChatMessage"] { padding:10px 8px !important; overflow-wrap:anywhere !important; }
+        .block-container { padding:3.9rem .75rem 8rem !important; max-width:100% !important; }
+        [data-testid="stChatMessage"] { padding:10px 6px !important; overflow-wrap:anywhere !important; }
         [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { max-width:100% !important; }
-        [data-testid="stChatInput"] { left:8px !important; right:8px !important; width:calc(100% - 16px) !important; bottom:8px !important; }
-        /* Streamlit reserves a bottom gutter on mobile; align mic with composer center. */
-        [data-testid="stAudioInput"] { right:68px !important; bottom:118px !important; }
-        [data-testid="stChatInput"] textarea { font-size:16px !important; padding-right:92px !important; }
+        [data-testid="stBottom"] { padding-bottom:max(env(safe-area-inset-bottom), 6px) !important; }
+        [data-testid="stBottomBlockContainer"] { padding:.4rem .6rem .5rem !important; }
+        [data-testid="stChatInput"] textarea { font-size:16px !important; padding-right:56px !important; }
+        .empty-title { font-size:1.45rem !important; line-height:1.45 !important; margin-top:14vh !important; padding:0 .5rem; }
         div[data-testid="stHorizontalBlock"]:has(.stDownloadButton) { flex-wrap:wrap !important; gap:.55rem !important; }
         div[data-testid="stHorizontalBlock"]:has(.stDownloadButton) > div[data-testid="column"] {
             flex:1 1 100% !important; min-width:100% !important; width:100% !important;
         }
         .stDownloadButton > button { min-height:48px !important; font-size:15px !important; }
-        [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarExpandButton"],
-        header button[aria-label*="sidebar" i] {
-            width:44px !important; min-width:44px !important;
-            height:44px !important; min-height:44px !important;
-            padding:0 !important;
-        }
-        header[data-testid="stHeader"] [data-testid="stToolbar"] {
-            top:4px !important; right:6px !important;
-        }
-        header[data-testid="stHeader"] [data-testid="stToolbar"] button {
-            min-width:38px !important; min-height:38px !important;
-        }
+        pre, code { white-space:pre-wrap !important; word-break:break-word !important; }
+        [data-testid="stSidebar"] { max-width:86vw !important; }
     }
     </style>
     """,
@@ -3014,6 +3038,36 @@ if hasattr(st, "audio_input"):
             except Exception as e:
                 st.error(f"ভয়েস লেখায় রূপান্তর করা যায়নি: {friendly_error(e)}")
 
+# Mic button: keep it exactly inside the composer, left of the Send button (desktop + mobile).
+components.html(
+    """
+    <script>
+    (function () {
+      var P = window.parent, d = P.document;
+      if (P.__micTimer) P.clearInterval(P.__micTimer);
+      function place() {
+        var mic = d.querySelector('[data-testid="stAudioInput"]');
+        var box = d.querySelector('[data-testid="stChatInput"]');
+        if (!mic || !box) return;
+        var send = d.querySelector('[data-testid="stChatInputSubmitButton"]');
+        var r = (send || box).getBoundingClientRect();
+        if (!r.width) return;
+        var size = 40, gap = 10;
+        var left = send ? r.left - size - gap : r.right - size - 58;
+        var top = r.top + r.height / 2 - size / 2;
+        var set = function (k, v) { mic.style.setProperty(k, v, 'important'); };
+        set('left', Math.round(left) + 'px'); set('top', Math.round(top) + 'px');
+        set('right', 'auto'); set('bottom', 'auto');
+      }
+      place();
+      P.__micTimer = P.setInterval(place, 250);
+      P.addEventListener('resize', place);
+    })();
+    </script>
+    """,
+    height=0,
+)
+
 st.markdown(
     "<div style='display:flex;align-items:center;gap:12px;margin:0 0 1.1rem 0;'>"
     "<div style='width:42px;height:42px;border-radius:13px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);"
@@ -3114,7 +3168,7 @@ if _new_mems:
 
 if not messages and not st.session_state.pending:
     st.markdown(
-        "<h2 style='text-align:center; margin-top:18vh;'>আজ কীভাবে সাহায্য করতে পারি?</h2>",
+        "<h2 class='empty-title' style='text-align:center; margin-top:18vh;'>আজ কীভাবে সাহায্য করতে পারি?</h2>",
         unsafe_allow_html=True,
     )
 
