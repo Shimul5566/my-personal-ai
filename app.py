@@ -29,11 +29,18 @@ from docx import Document
 
 load_dotenv()
 
-APP_VERSION = "2.3.0"  # Mic icon fix, mobile composer lift, English hero + logo
+# App logo (embedded so the app stays a single file)
+LOGO_B64 = "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"
+try:
+    _LOGO_PIL = Image.open(io.BytesIO(base64.b64decode(LOGO_B64)))
+except Exception:
+    _LOGO_PIL = "🤖"
+
+APP_VERSION = "2.4.0"  # Slack logo, centred mic, no empty hero, advanced mobile UI
 
 st.set_page_config(
     page_title="আমার পার্সোনাল AI",
-    page_icon="🤖",
+    page_icon=_LOGO_PIL,
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -256,14 +263,6 @@ st.markdown(
     @keyframes micpulse { 0%{box-shadow:0 0 0 0 rgba(239,68,68,.55)} 70%{box-shadow:0 0 0 12px rgba(239,68,68,0)} 100%{box-shadow:0 0 0 0 rgba(239,68,68,0)} }
     iframe[height="0"] { display:none !important; }
 
-    /* empty-state hero: logo + soft translucent English title */
-    .empty-hero { display:flex; flex-direction:column; align-items:center; gap:14px; margin-top:16vh; text-align:center; }
-    .empty-hero svg { width:68px; height:68px; filter:drop-shadow(0 10px 26px rgba(99,102,241,.45)); }
-    .stApp .empty-hero h2.empty-title {
-        margin:0 !important; padding:0 .5rem; font-weight:600; letter-spacing:.2px;
-        color:rgba(236,240,247,.55) !important; -webkit-text-fill-color:rgba(236,240,247,.55) !important;
-    }
-
     /* 4) Mobile */
     @media (max-width:700px) {
         .block-container { padding:3.9rem .75rem 11rem !important; max-width:100% !important; }
@@ -273,7 +272,6 @@ st.markdown(
         /* lift the composer so the Streamlit badge + profile avatar (bottom-right) never cover Send */
         [data-testid="stBottomBlockContainer"] { padding:.4rem .6rem 5.2rem !important; }
         [data-testid="stChatInput"] textarea { font-size:16px !important; padding-right:56px !important; }
-        .empty-title { font-size:1.5rem !important; line-height:1.45 !important; margin-top:14vh !important; padding:0 .5rem; }
         div[data-testid="stHorizontalBlock"]:has(.stDownloadButton) { flex-wrap:wrap !important; gap:.55rem !important; }
         div[data-testid="stHorizontalBlock"]:has(.stDownloadButton) > div[data-testid="column"] {
             flex:1 1 100% !important; min-width:100% !important; width:100% !important;
@@ -281,6 +279,72 @@ st.markdown(
         .stDownloadButton > button { min-height:48px !important; font-size:15px !important; }
         pre, code { white-space:pre-wrap !important; word-break:break-word !important; }
         [data-testid="stSidebar"] { max-width:86vw !important; }
+    }
+
+    /* ===== v2.4: app bar, centred mic, advanced mobile ===== */
+    .app-bar { display:flex; align-items:center; gap:12px; margin:0 0 1.1rem 0; }
+    .app-bar .app-logo { width:40px; height:40px; object-fit:contain; flex:none; filter:drop-shadow(0 6px 16px rgba(0,0,0,.35)); }
+    .app-bar .app-text { min-width:0; flex:1; }
+    .app-bar .app-title { font-size:1.15rem; font-weight:750; letter-spacing:.1px; line-height:1.2; color:#ececec; }
+    .app-bar .app-sub { font-size:.78rem; color:#9caec4; margin-top:2px; }
+    .app-bar .gh-fallback { display:none; flex:none; width:38px; height:38px; border-radius:11px; align-items:center; justify-content:center;
+        background:rgba(38,52,73,.9); border:1px solid #3d4d66; }
+    .app-bar .gh-fallback svg { width:20px; height:20px; fill:#e5edf8; }
+    /* mic stays hidden until the script has centred it inside the composer (safety net: shows after 1.4s anyway) */
+    [data-testid="stAudioInput"] { opacity:0; animation:micshow .01s linear 1.4s forwards; }
+    @keyframes micshow { to { opacity:1; } }
+
+    @media (max-width:700px) {
+        html, body, .stApp { overflow-x:hidden !important; -webkit-tap-highlight-color:transparent; }
+        .stApp { font-size:15.5px; }
+
+        /* top bar: keep Share / star / edit / GitHub buttons visible on phones */
+        header[data-testid="stHeader"] { height:3.2rem !important; min-height:3.2rem !important; padding:0 .4rem !important; }
+        header[data-testid="stHeader"] [data-testid="stToolbar"],
+        header[data-testid="stHeader"] [data-testid="stToolbarActions"],
+        header[data-testid="stHeader"] [data-testid="stToolbar"] > div {
+            display:flex !important; overflow:visible !important; align-items:center !important;
+            gap:6px !important; flex-wrap:nowrap !important;
+        }
+        header[data-testid="stHeader"] [data-testid="stToolbarActions"] * { visibility:visible !important; }
+        header[data-testid="stHeader"] [data-testid="stToolbar"] button,
+        header[data-testid="stHeader"] [data-testid="stToolbar"] a {
+            min-width:34px !important; min-height:34px !important;
+            display:inline-flex !important; align-items:center !important; justify-content:center !important;
+        }
+        header[data-testid="stHeader"] a[href*="github.com"] { display:inline-flex !important; }
+        /* if Streamlit still hides its own GitHub icon, show ours (needs GITHUB_URL secret) */
+        .stApp:not(:has(header a[href*="github.com"])) .app-bar .gh-fallback { display:flex; }
+
+        /* compact app bar */
+        .app-bar { gap:10px; margin:0 0 .8rem 0; }
+        .app-bar .app-logo { width:34px; height:34px; }
+        .app-bar .app-title { font-size:1.02rem; }
+        .app-bar .app-sub { font-size:.7rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+        /* composer: hide the hint text inside the box on mobile */
+        [data-testid="stChatInput"] textarea::placeholder {
+            color:transparent !important; opacity:0 !important; -webkit-text-fill-color:transparent !important;
+        }
+        [data-testid="stChatInput"] { border-radius:28px !important; }
+        [data-testid="stChatInput"] textarea { min-height:24px; line-height:1.5 !important; }
+
+        /* cleaner, roomier chat on phones */
+        [data-testid="stChatMessageAvatarUser"], [data-testid="stChatMessageAvatarAssistant"] { display:none !important; }
+        [data-testid="stChatMessage"] { gap:0 !important; padding:8px 2px !important; }
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
+            border-radius:20px 20px 6px 20px !important; padding:10px 14px !important; max-width:90% !important;
+        }
+        [data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li { line-height:1.7; }
+        [data-testid="stMarkdownContainer"] table { display:block; overflow-x:auto; max-width:100%; }
+        [data-testid="stMarkdownContainer"] pre { font-size:12.5px !important; border-radius:12px !important; }
+        [data-testid="stImage"] img { border-radius:12px; max-width:100%; height:auto; }
+
+        /* bigger touch targets */
+        .stButton > button { min-height:44px !important; }
+        [data-testid="stSidebar"] { border-radius:0 22px 22px 0; box-shadow:12px 0 40px rgba(0,0,0,.45); }
+        [data-testid="stSidebar"] .stButton > button { min-height:46px !important; font-size:15px !important; border-radius:12px !important; }
+        [data-testid="stSidebar"] [data-testid="stSidebarUserContent"] { padding:1rem .8rem !important; }
     }
     </style>
     """,
@@ -3065,18 +3129,23 @@ components.html(
         var mic = d.querySelector('[data-testid="stAudioInput"]');
         var box = d.querySelector('[data-testid="stChatInput"]');
         if (!mic || !box) return;
+        var rb = box.getBoundingClientRect();
+        if (!rb.width || !rb.height) return;
         var send = d.querySelector('[data-testid="stChatInputSubmitButton"]');
-        var r = (send || box).getBoundingClientRect();
-        if (!r.width) return;
-        var size = 40, gap = 10;
-        var left = send ? r.left - size - gap : r.right - size - 58;
-        var top = r.top + r.height / 2 - size / 2;
+        var rs = send ? send.getBoundingClientRect() : null;
+        var size = 40, gap = 8;
+        var hasSend = rs && rs.width > 0;
+        /* single line: centre on the whole pill; multi-line: stay on the Send button's row */
+        var cy = (rb.height < 76 || !hasSend) ? rb.top + rb.height / 2 : rs.top + rs.height / 2;
+        var left = hasSend ? rs.left - size - gap : rb.right - size - 58;
         var set = function (k, v) { mic.style.setProperty(k, v, 'important'); };
-        set('left', Math.round(left) + 'px'); set('top', Math.round(top) + 'px');
+        set('left', Math.round(left) + 'px');
+        set('top', Math.round(cy - size / 2) + 'px');
         set('right', 'auto'); set('bottom', 'auto');
+        set('opacity', '1'); set('animation', 'none');
       }
       place();
-      P.__micTimer = P.setInterval(place, 250);
+      P.__micTimer = P.setInterval(place, 150);
       P.addEventListener('resize', place);
     })();
     </script>
@@ -3084,12 +3153,22 @@ components.html(
     height=0,
 )
 
+# Optional: set GITHUB_URL in secrets to get a GitHub button in the app bar if Streamlit hides its own on mobile
+_gh_url = (get_secret("GITHUB_URL") or "").strip()
+_gh_html = ""
+if _gh_url.startswith("http"):
+    _gh_html = (
+        "<a class='gh-fallback' href='" + urllib.parse.quote(_gh_url, safe=":/?#@!$&()*+,;=%~-._") + "' "
+        "target='_blank' rel='noopener' aria-label='GitHub'>"
+        "<svg viewBox='0 0 16 16'><path d='M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z'/></svg></a>"
+    )
+
 st.markdown(
-    "<div style='display:flex;align-items:center;gap:12px;margin:0 0 1.1rem 0;'>"
-    "<div style='width:42px;height:42px;border-radius:13px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);"
-    "display:grid;place-items:center;font-size:22px;box-shadow:0 8px 24px rgba(59,130,246,.22)'>✦</div>"
-    "<div><div style='font-size:1.15rem;font-weight:750;letter-spacing:.1px'>Personal AI Studio</div>"
-    "<div style='font-size:.78rem;color:#9caec4'>Chat · Vision · Image Studio · WordPress</div></div></div>",
+    "<div class='app-bar'>"
+    f"<img class='app-logo' src='data:image/png;base64,{LOGO_B64}' alt='logo'/>"
+    "<div class='app-text'><div class='app-title'>Personal AI Studio</div>"
+    "<div class='app-sub'>Chat · Vision · Image Studio · WordPress</div></div>"
+    + _gh_html + "</div>",
     unsafe_allow_html=True,
 )
 
@@ -3181,20 +3260,6 @@ if user_input or voice_prompt:
 _new_mems = st.session_state.pop("_mem_toast", None)
 if _new_mems:
     st.toast("🧠 মেমোরিতে সেভ হয়েছে: " + " | ".join(_new_mems), icon="🧠")
-
-if not messages and not st.session_state.pending:
-    st.markdown(
-        "<div class='empty-hero'>"
-        "<svg viewBox='0 0 64 64' xmlns='http://www.w3.org/2000/svg'>"
-        "<defs><linearGradient id='lg' x1='0' y1='0' x2='1' y2='1'>"
-        "<stop offset='0' stop-color='#3b82f6'/><stop offset='1' stop-color='#8b5cf6'/></linearGradient></defs>"
-        "<rect width='64' height='64' rx='19' fill='url(#lg)'/>"
-        "<path d='M32 12c1.6 10.4 7.6 16.4 20 20-12.4 3.6-18.4 9.6-20 20-1.6-10.4-7.6-16.4-20-20 12.4-3.6 18.4-9.6 20-20z' fill='#fff'/>"
-        "</svg>"
-        "<h2 class='empty-title'>How can I help you today?</h2>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
 
 last_idx = len(messages) - 1
 for idx, m in enumerate(messages):
