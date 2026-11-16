@@ -31,25 +31,9 @@ load_dotenv()
 
 APP_VERSION = "2.3.0"  # Mic icon fix, mobile composer lift, English hero + logo
 
-LOGO_SVG = """
-<svg xmlns="http://w3.org" viewBox="0 0 64 64" width="44" height="44">
-  <defs>
-    <linearGradient id="aiGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#3b82f6"/>
-      <stop offset="100%" stop-color="#8b5cf6"/>
-    </linearGradient>
-  </defs>
-  <rect x="4" y="4" width="56" height="56" rx="16" fill="url(#aiGrad)"/>
-  <path d="M32 15 C32 25, 39 32, 49 32 C39 32, 32 39, 32 49 C32 39, 25 32, 15 32 C25 32, 32 25, 32 15 Z" fill="#ffffff"/>
-  <circle cx="46" cy="18" r="3.2" fill="#93c5fd"/>
-</svg>
-""".strip()
-
-LOGO_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(LOGO_SVG.encode("utf-8")).decode("utf-8")
-
 st.set_page_config(
     page_title="Personal AI Studio",
-    page_icon=LOGO_DATA_URI,
+    page_icon="data:image/svg+xml;utf8,%3Csvg xmlns='http://w3.org' viewBox='0 0 64 64'%3E%3Crect x='2' y='2' width='60' height='60' rx='16' fill='%2318181b' stroke='%23d4af37' stroke-width='3'/%3E%3Cg fill='none' stroke='%23f5d061' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M32 13 C25 22, 25 32, 32 39 C39 32, 39 22, 32 13 Z'/%3E%3Cpath d='M26 23 C19 20, 15 26, 21 35 C25 38, 29 39, 32 39'/%3E%3Cpath d='M38 23 C45 20, 49 26, 43 35 C39 38, 35 39, 32 39'/%3E%3Cpath d='M18 30 C11 31, 10 38, 19 42 C25 44, 29 41, 32 39'/%3E%3Cpath d='M46 30 C53 31, 54 38, 45 42 C39 44, 35 41, 32 39'/%3E%3Cpath d='M32 39 C27 42, 27 47, 32 51 C37 47, 37 42, 32 39 Z'/%3E%3C/g%3E%3C/svg%3E",
     layout="wide",
     initial_sidebar_state="expanded",
 )
