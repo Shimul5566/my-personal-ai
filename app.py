@@ -143,16 +143,48 @@ st.markdown(
     ::selection { background:#315b91; color:#fff; }
     @media (max-width: 700px) { .block-container { padding:1rem .8rem 5rem !important; } [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { max-width:96%; } }
 
-    /* Accessible sidebar navigation controls */
-    [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarExpandButton"],
-    header button[kind="header"], header button[aria-label*="sidebar" i] {
+    /* Remove the empty Streamlit header strip; keep its action buttons floating. */
+    header[data-testid="stHeader"] {
+        height:0 !important; min-height:0 !important;
+        background:transparent !important; border:0 !important;
+        box-shadow:none !important; overflow:visible !important;
+    }
+    header[data-testid="stHeader"] [data-testid="stToolbar"] {
+        position:fixed !important; top:8px !important; right:12px !important;
+        z-index:1100 !important; background:transparent !important;
+    }
+    header[data-testid="stHeader"] [data-testid="stToolbar"] button {
         color:#f8fafc !important; background:#263449 !important;
         border:1px solid #64748b !important; border-radius:10px !important;
-        min-width:40px !important; min-height:40px !important;
         opacity:1 !important; box-shadow:0 2px 10px rgba(0,0,0,.28) !important;
     }
-    [data-testid="stSidebarCollapseButton"] svg, [data-testid="stSidebarExpandButton"] svg,
-    header button[kind="header"] svg { color:#fff !important; fill:#fff !important; stroke:#fff !important; opacity:1 !important; }
+    header[data-testid="stHeader"] [data-testid="stToolbar"] button svg,
+    header[data-testid="stHeader"] [data-testid="stToolbar"] button svg *,
+    header[data-testid="stHeader"] [data-testid="stToolbar"] button img {
+        color:#fff !important; fill:#fff !important; stroke:#fff !important;
+        opacity:1 !important; filter:brightness(0) invert(1) !important;
+    }
+
+    /* Center the sidebar chevron in a predictable touch target. */
+    [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarExpandButton"],
+    header button[aria-label*="sidebar" i] {
+        display:inline-flex !important; align-items:center !important;
+        justify-content:center !important; box-sizing:border-box !important;
+        padding:0 !important; line-height:1 !important;
+        width:44px !important; min-width:44px !important;
+        height:44px !important; min-height:44px !important;
+        color:#fff !important; background:#263449 !important;
+        border:1px solid #64748b !important; border-radius:11px !important;
+        opacity:1 !important; box-shadow:0 2px 10px rgba(0,0,0,.28) !important;
+    }
+    [data-testid="stSidebarCollapseButton"] svg,
+    [data-testid="stSidebarExpandButton"] svg,
+    header button[aria-label*="sidebar" i] svg {
+        display:block !important; margin:auto !important;
+        width:20px !important; height:20px !important;
+        color:#fff !important; fill:#none !important; stroke:#fff !important;
+        opacity:1 !important;
+    }
 
     /* Consistent, high-contrast export buttons */
     .stDownloadButton > button, .stDownloadButton > button:focus, .stDownloadButton > button:hover {
@@ -166,7 +198,7 @@ st.markdown(
 
     /* Compact microphone anchored inside the chat composer, before Send */
     [data-testid="stAudioInput"] {
-        position:fixed !important; z-index:1005 !important; bottom:24px !important;
+        position:fixed !important; z-index:1005 !important; bottom:94px !important;
         right:max(calc((100vw - 1040px)/2 + 76px), 76px) !important;
         width:44px !important; min-width:44px !important; max-width:44px !important;
         height:44px !important; overflow:hidden !important; display:flex !important;
@@ -189,7 +221,8 @@ st.markdown(
         [data-testid="stChatMessage"] { padding:10px 8px !important; overflow-wrap:anywhere !important; }
         [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { max-width:100% !important; }
         [data-testid="stChatInput"] { left:8px !important; right:8px !important; width:calc(100% - 16px) !important; bottom:8px !important; }
-        [data-testid="stAudioInput"] { right:68px !important; bottom:20px !important; }
+        /* Streamlit reserves a bottom gutter on mobile; align mic with composer center. */
+        [data-testid="stAudioInput"] { right:68px !important; bottom:118px !important; }
         [data-testid="stChatInput"] textarea { font-size:16px !important; padding-right:92px !important; }
         div[data-testid="stHorizontalBlock"]:has(.stDownloadButton) { flex-wrap:wrap !important; gap:.55rem !important; }
         div[data-testid="stHorizontalBlock"]:has(.stDownloadButton) > div[data-testid="column"] {
@@ -197,7 +230,17 @@ st.markdown(
         }
         .stDownloadButton > button { min-height:48px !important; font-size:15px !important; }
         [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarExpandButton"],
-        header button[kind="header"] { min-width:44px !important; min-height:44px !important; }
+        header button[aria-label*="sidebar" i] {
+            width:44px !important; min-width:44px !important;
+            height:44px !important; min-height:44px !important;
+            padding:0 !important;
+        }
+        header[data-testid="stHeader"] [data-testid="stToolbar"] {
+            top:4px !important; right:6px !important;
+        }
+        header[data-testid="stHeader"] [data-testid="stToolbar"] button {
+            min-width:38px !important; min-height:38px !important;
+        }
     }
     </style>
     """,
