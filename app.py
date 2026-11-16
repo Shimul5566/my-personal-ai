@@ -6,6 +6,7 @@ import uuid
 import base64
 import difflib
 import hashlib
+import hmac
 import itertools
 import sqlite3
 import socket
@@ -27,6 +28,8 @@ from pypdf import PdfReader
 from docx import Document
 
 load_dotenv()
+
+APP_VERSION = "2.0.0"  # Advanced Studio upgrade
 
 st.set_page_config(
     page_title="আমার পার্সোনাল AI",
@@ -117,8 +120,28 @@ st.markdown(
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header[data-testid="stHeader"] {
-        background-color: rgba(33, 33, 33, 0.85) !important;
+        background-color: rgba(20, 24, 32, 0.88) !important;
+        backdrop-filter: blur(14px);
     }
+    /* Advanced Studio UI */
+    :root { --studio-accent:#60a5fa; --studio-accent-2:#8b5cf6; --studio-panel:#171b24; }
+    .stApp { background: radial-gradient(ellipse at 50% -20%, #26354b 0%, #171b24 42%, #111318 100%) !important; }
+    .block-container { max-width: 1040px !important; padding-top: 2.2rem !important; }
+    [data-testid="stSidebar"] { background: linear-gradient(180deg,#151a23 0%,#101319 100%) !important; border-right:1px solid #293241 !important; }
+    [data-testid="stSidebar"] [data-testid="stExpander"] { border:1px solid #303b4c; border-radius:14px; background:#171d28; }
+    [data-testid="stChatMessage"] { border-radius:18px !important; }
+    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { background:linear-gradient(135deg,#263449,#202b3b) !important; border:1px solid #3c506b !important; box-shadow:0 8px 24px rgba(0,0,0,.12); }
+    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) { border-bottom:1px solid rgba(148,163,184,.12); }
+    .stButton > button, .stDownloadButton > button { transition:all .18s ease !important; border-radius:12px !important; min-height:2.45rem; }
+    .stButton > button:hover, .stDownloadButton > button:hover { border-color:var(--studio-accent) !important; transform:translateY(-1px); box-shadow:0 5px 18px rgba(59,130,246,.13); }
+    .stTextInput input, .stTextArea textarea, .stSelectbox [data-baseweb="select"], .stNumberInput input { border-radius:11px !important; }
+    [data-testid="stChatInput"] { border:1px solid #43536b !important; box-shadow:0 10px 35px rgba(0,0,0,.2); }
+    [data-testid="stChatInput"]:focus-within { border-color:var(--studio-accent) !important; box-shadow:0 0 0 2px rgba(96,165,250,.18); }
+    [data-testid="stMetric"] { background:#1a2230; border:1px solid #303b4c; padding:12px 14px; border-radius:14px; }
+    [data-testid="stAlert"] { border-radius:13px; }
+    a { color:#93c5fd !important; }
+    ::selection { background:#315b91; color:#fff; }
+    @media (max-width: 700px) { .block-container { padding:1rem .8rem 5rem !important; } [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { max-width:96%; } }
     </style>
     """,
     unsafe_allow_html=True,
@@ -140,7 +163,7 @@ if APP_PASSWORD and not st.session_state.get("auth"):
     st.markdown("<h2 style='text-align:center;'>🔒 আমার পার্সোনাল AI লগইন</h2>", unsafe_allow_html=True)
     pw = st.text_input("পাসওয়ার্ড দিন:", type="password")
     if pw:
-        if pw == APP_PASSWORD:
+        if hmac.compare_digest(pw, APP_PASSWORD):
             st.session_state.auth = True
             st.rerun()
         else:
@@ -275,9 +298,13 @@ def persona_prompt():
         extra = (st.session_state.get("persona_custom") or "").strip()[:1000]
     else:
         extra = PERSONAS.get(choice, "")
-    if not extra:
-        return CHAT_PROMPT
-    return CHAT_PROMPT + "\n\nROLE / PERSONA (follow this role in every answer):\n" + extra
+    custom = (st.session_state.get("custom_instructions") or "").strip()[:2000]
+    prompt = CHAT_PROMPT
+    if extra:
+        prompt += "\n\nROLE / PERSONA (follow this role in every answer):\n" + extra
+    if custom:
+        prompt += "\n\nUSER RESPONSE PREFERENCES (follow unless they conflict with the current task):\n" + custom
+    return prompt
 
 VISION_PROMPT = """You are a careful, expert teacher and tutor. The user attached one or more images. If there are several images, treat them as consecutive pages
 of the same document, in the order given, and answer the questions of ALL images one after another
@@ -2215,6 +2242,20 @@ with st.sidebar:
             0.05,
             key=f"temp_{app_mode}",
         )
+        response_detail = st.selectbox(
+            "উত্তরের বিস্তারিত মাত্রা:",
+            ["সংক্ষিপ্ত", "সাধারণ", "বিস্তারিত"],
+            index=1,
+            key="response_detail",
+            help="চ্যাটের উত্তরের দৈর্ঘ্য নিয়ন্ত্রণ করে। JSON/WordPress টুলের নিজস্ব সীমা অপরিবর্তিত থাকবে।",
+        )
+        st.text_area(
+            "নিজের স্থায়ী নির্দেশনা (ঐচ্ছিক):",
+            key="custom_instructions",
+            height=90,
+            max_chars=2000,
+            placeholder="যেমন: আমাকে বাংলায় বোঝাবে, কোড দিলে সম্পূর্ণ working code দেবে, অপ্রয়োজনীয় কথা বলবে না।",
+        )
 
         size_key = st.selectbox("ছবির সাইজ:", list(IMAGE_SIZES))
         image_quality = st.selectbox("ছবির কোয়ালিটি (OpenAI):", IMAGE_QUALITIES)
@@ -2242,10 +2283,15 @@ with st.sidebar:
     if is_image_mode:
         providers = []
         if OPENAI_API_KEY:
-            providers.append("OpenAI")
+            providers.append("OpenAI Image")
+        if GEMINI_API_KEY:
+            providers.append("Gemini Image")
         if HF_TOKEN:
-            providers.append("FLUX (HF)")
-        providers.append("Pollinations (ফ্রি)")
+            providers.append("FLUX Kontext (HF)")
+        if POLLINATIONS_API_KEY:
+            providers.append("Pollinations Kontext")
+        elif not providers:
+            providers.append("Pollinations (public fallback)")
         st.caption("ছবি তৈরি: " + " → ".join(providers))
         st.caption("ছবি দিলে বা আগের ছবির পর 'ব্যাকগ্রাউন্ড বদলাও' লিখলে এডিট হবে।" if HAS_EDIT
                    else "ছবি এডিট করতে OPENAI_API_KEY বা HF_TOKEN লাগবে।")
@@ -2324,6 +2370,21 @@ with st.sidebar:
             data=json.dumps(export, indent=2, ensure_ascii=False),
             file_name="chat-history.json",
             mime="application/json",
+        )
+        md_lines = [f"# {cur()['title']}\n"]
+        for item in cur()["messages"]:
+            role = "আপনি" if item.get("role") == "user" else "AI"
+            md_lines.append(f"## {role}\n\n{item.get('content', '')}\n")
+            if item.get("attachment"):
+                md_lines.append(f"_সংযুক্তি: {item['attachment']}_\n")
+            if item.get("images") or item.get("image"):
+                md_lines.append("_[এই মেসেজে ছবি সংযুক্ত ছিল]_\n")
+        st.download_button(
+            label="📝 Markdown হিসেবে এক্সপোর্ট",
+            data="\n".join(md_lines),
+            file_name=f"{re.sub(r'[^a-zA-Z0-9_-]+', '-', cur()['title']).strip('-') or 'chat'}.md",
+            mime="text/markdown",
+            key="export_chat_markdown",
         )
 
     if not APP_PASSWORD:
@@ -2729,7 +2790,9 @@ def stream_reply(model, messages, temp):
         model=model,
         messages=messages,
         temperature=temp,
-        max_tokens=GROQ_MAX_OUT,
+        max_tokens={"সংক্ষিপ্ত": 1200, "সাধারণ": GROQ_MAX_OUT, "বিস্তারিত": 4000}.get(
+            st.session_state.get("response_detail", "সাধারণ"), GROQ_MAX_OUT
+        ),
         stream=True,
     )
     for chunk in stream:
@@ -2849,6 +2912,15 @@ if hasattr(st, "audio_input"):
                     st.session_state["_speak_reply"] = True
             except Exception as e:
                 st.error(f"ভয়েস লেখায় রূপান্তর করা যায়নি: {friendly_error(e)}")
+
+st.markdown(
+    "<div style='display:flex;align-items:center;gap:12px;margin:0 0 1.1rem 0;'>"
+    "<div style='width:42px;height:42px;border-radius:13px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);"
+    "display:grid;place-items:center;font-size:22px;box-shadow:0 8px 24px rgba(59,130,246,.22)'>✦</div>"
+    "<div><div style='font-size:1.15rem;font-weight:750;letter-spacing:.1px'>Personal AI Studio</div>"
+    "<div style='font-size:.78rem;color:#9caec4'>Chat · Vision · Image Studio · WordPress</div></div></div>",
+    unsafe_allow_html=True,
+)
 
 user_input = st.chat_input(
     placeholder,
