@@ -3184,18 +3184,6 @@ if _new_mems:
     st.toast("🧠 মেমোরিতে সেভ হয়েছে: " + " | ".join(_new_mems), icon="🧠")
 
 if not messages and not st.session_state.pending:
-    st.markdown(
-        "<div class='empty-hero'>"
-        "<svg viewBox='0 0 64 64' xmlns='http://www.w3.org/2000/svg'>"
-        "<defs><linearGradient id='lg' x1='0' y1='0' x2='1' y2='1'>"
-        "<stop offset='0' stop-color='#3b82f6'/><stop offset='1' stop-color='#8b5cf6'/></linearGradient></defs>"
-        "<rect width='64' height='64' rx='19' fill='url(#lg)'/>"
-        "<path d='M32 12c1.6 10.4 7.6 16.4 20 20-12.4 3.6-18.4 9.6-20 20-1.6-10.4-7.6-16.4-20-20 12.4-3.6 18.4-9.6 20-20z' fill='#fff'/>"
-        "</svg>"
-        "<h2 class='empty-title'>How can I help you today?</h2>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
 
 last_idx = len(messages) - 1
 for idx, m in enumerate(messages):
