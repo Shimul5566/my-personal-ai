@@ -29,7 +29,7 @@ from docx import Document
 
 load_dotenv()
 
-APP_VERSION = "2.2.0"  # Header fix, unified background, new mic button, mobile polish
+APP_VERSION = "2.3.0"  # Mic icon fix, mobile composer lift, English hero + logo
 
 st.set_page_config(
     page_title="আমার পার্সোনাল AI",
@@ -237,9 +237,16 @@ st.markdown(
         display:flex !important; align-items:center !important; justify-content:center !important;
         color:#ffffff !important; opacity:1 !important;
     }
-    [data-testid="stAudioInput"] button svg, [data-testid="stAudioInput"] button svg * {
-        width:20px !important; height:20px !important;
-        color:#ffffff !important; fill:#ffffff !important; opacity:1 !important; display:block !important;
+    /* hide Streamlit's own svg (its transparent bounding-box path rendered as a white square) and draw our own icon */
+    [data-testid="stAudioInput"] button svg { display:none !important; }
+    [data-testid="stAudioInput"] button { position:relative !important; }
+    [data-testid="stAudioInput"] button::after {
+        content:""; position:absolute; inset:0; margin:auto; width:22px; height:22px;
+        background-repeat:no-repeat; background-position:center; background-size:contain;
+        background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='9' y='2' width='6' height='12' rx='3' fill='white'/%3E%3Cpath d='M5 11a7 7 0 0 0 14 0'/%3E%3Cpath d='M12 18v4'/%3E%3C/svg%3E");
+    }
+    [data-testid="stAudioInput"] button[aria-label*="top" i]::after {
+        width:16px; height:16px; border-radius:4px; background-color:#fff; background-image:none;
     }
     /* while recording: turn red + pulse */
     [data-testid="stAudioInput"]:has(button[aria-label*="top" i]) {
@@ -249,15 +256,24 @@ st.markdown(
     @keyframes micpulse { 0%{box-shadow:0 0 0 0 rgba(239,68,68,.55)} 70%{box-shadow:0 0 0 12px rgba(239,68,68,0)} 100%{box-shadow:0 0 0 0 rgba(239,68,68,0)} }
     iframe[height="0"] { display:none !important; }
 
+    /* empty-state hero: logo + soft translucent English title */
+    .empty-hero { display:flex; flex-direction:column; align-items:center; gap:14px; margin-top:16vh; text-align:center; }
+    .empty-hero svg { width:68px; height:68px; filter:drop-shadow(0 10px 26px rgba(99,102,241,.45)); }
+    .stApp .empty-hero h2.empty-title {
+        margin:0 !important; padding:0 .5rem; font-weight:600; letter-spacing:.2px;
+        color:rgba(236,240,247,.55) !important; -webkit-text-fill-color:rgba(236,240,247,.55) !important;
+    }
+
     /* 4) Mobile */
     @media (max-width:700px) {
-        .block-container { padding:3.9rem .75rem 8rem !important; max-width:100% !important; }
+        .block-container { padding:3.9rem .75rem 11rem !important; max-width:100% !important; }
         [data-testid="stChatMessage"] { padding:10px 6px !important; overflow-wrap:anywhere !important; }
         [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { max-width:100% !important; }
         [data-testid="stBottom"] { padding-bottom:max(env(safe-area-inset-bottom), 6px) !important; }
-        [data-testid="stBottomBlockContainer"] { padding:.4rem .6rem .5rem !important; }
+        /* lift the composer so the Streamlit badge + profile avatar (bottom-right) never cover Send */
+        [data-testid="stBottomBlockContainer"] { padding:.4rem .6rem 5.2rem !important; }
         [data-testid="stChatInput"] textarea { font-size:16px !important; padding-right:56px !important; }
-        .empty-title { font-size:1.45rem !important; line-height:1.45 !important; margin-top:14vh !important; padding:0 .5rem; }
+        .empty-title { font-size:1.5rem !important; line-height:1.45 !important; margin-top:14vh !important; padding:0 .5rem; }
         div[data-testid="stHorizontalBlock"]:has(.stDownloadButton) { flex-wrap:wrap !important; gap:.55rem !important; }
         div[data-testid="stHorizontalBlock"]:has(.stDownloadButton) > div[data-testid="column"] {
             flex:1 1 100% !important; min-width:100% !important; width:100% !important;
@@ -3168,7 +3184,15 @@ if _new_mems:
 
 if not messages and not st.session_state.pending:
     st.markdown(
-        "<h2 class='empty-title' style='text-align:center; margin-top:18vh;'>আজ কীভাবে সাহায্য করতে পারি?</h2>",
+        "<div class='empty-hero'>"
+        "<svg viewBox='0 0 64 64' xmlns='http://www.w3.org/2000/svg'>"
+        "<defs><linearGradient id='lg' x1='0' y1='0' x2='1' y2='1'>"
+        "<stop offset='0' stop-color='#3b82f6'/><stop offset='1' stop-color='#8b5cf6'/></linearGradient></defs>"
+        "<rect width='64' height='64' rx='19' fill='url(#lg)'/>"
+        "<path d='M32 12c1.6 10.4 7.6 16.4 20 20-12.4 3.6-18.4 9.6-20 20-1.6-10.4-7.6-16.4-20-20 12.4-3.6 18.4-9.6 20-20z' fill='#fff'/>"
+        "</svg>"
+        "<h2 class='empty-title'>How can I help you today?</h2>"
+        "</div>",
         unsafe_allow_html=True,
     )
 
