@@ -4,6 +4,8 @@ import re
 import json
 import uuid
 import base64
+import difflib
+import hashlib
 import itertools
 import sqlite3
 import socket
@@ -175,6 +177,18 @@ MAX_FILE_CHARS = 3_000_000 if GEMINI_API_KEY else GROQ_FILE_LIMIT
 MAX_IMAGE_BYTES = 2_500_000  # এর চেয়ে বড় ছবি অটো ছোট (compress) করা হবে
 MAX_CHATS = 30
 MAX_IMAGES_PER_MSG = 5     # একসাথে সর্বোচ্চ কয়টি ছবি (Groq Vision-এর সীমাও ৫)
+
+# ভয়েস চ্যাট (কথা → লেখা: Groq Whisper, লেখা → কথা: gTTS)
+STT_MODEL = get_secret("STT_MODEL") or "whisper-large-v3"
+STT_LANGS = {"🇧🇩 বাংলা": "bn", "🇬🇧 English": "en", "🌐 অটো (নিজে বুঝবে)": ""}
+TTS_MAX_CHARS = 1800       # একবারে এর বেশি অক্ষর পড়ে শোনানো হয় না
+
+# অটো-মেমোরি
+MEMORY_MIN_MSG = 12        # এর চেয়ে ছোট মেসেজে মেমোরি খোঁজা হয় না
+
+# কোড → ZIP এক্সপোর্ট
+CODE_MAX_FILES = 60
+CODE_MAX_BYTES = 5_000_000
 MAX_MEMORIES = 30        # সর্বোচ্চ কতগুলো মেমোরি রাখা যাবে
 MEMORY_FACT_MAX = 300    # একটি তথ্যের সর্বোচ্চ অক্ষর
 MEMORY_MAX_CHARS = 1500  # AI-কে মোট যত অক্ষরের মেমোরি পাঠানো হবে
@@ -1792,6 +1806,8 @@ if "pending" not in st.session_state:
     st.session_state.pending = False
 if "img_counter" not in st.session_state:
     st.session_state.img_counter = 0
+if "voice_counter" not in st.session_state:
+    st.session_state.voice_counter = 0
 
 
 def regen_cb():
@@ -1840,6 +1856,255 @@ def total_file_chars():
     return n
 
 
+# ---------- ১) ভয়েস চ্যাট: STT (Whisper) + TTS (gTTS) ----------
+def transcribe_audio(raw, lang_code=""):
+    """মাইকের রেকর্ডিং (WAV bytes) → লেখা (Groq Whisper)"""
+    kwargs = {"file": ("voice.wav", raw), "model": STT_MODEL, "temperature": 0}
+    if lang_code:
+        kwargs["language"] = lang_code
+    res = client.audio.transcriptions.create(**kwargs)
+    text = res if isinstance(res, str) else getattr(res, "text", "")
+    return (text or "").strip()
+
+
+def clean_for_speech(text):
+    """উত্তর থেকে কোড, লিংক, markdown চিহ্ন সরিয়ে শুধু পড়ার মতো লেখা রাখে"""
+    t = text or ""
+    t = t.split("**🌐 সূত্র:**")[0]
+    t = re.sub(r"```.*?```", " ", t, flags=re.S)
+    t = re.sub(r"```.*", " ", t, flags=re.S)  # অসম্পূর্ণ কোড ব্লক
+    t = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", t)
+    t = re.sub(r"https?://\S+", " ", t)
+    t = re.sub(r"`([^`]*)`", r"\1", t)
+    t = re.sub(r"^[ \t]*(#{1,6}|>|[-*+]|\d+[.)])[ \t]+", "", t, flags=re.M)
+    t = re.sub(r"[*_#|~]+", " ", t)
+    t = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]", " ", t)  # ইমোজি
+    t = re.sub(r"\s+", " ", t).strip()
+    if len(t) > TTS_MAX_CHARS:
+        cut = t[:TTS_MAX_CHARS]
+        k = max(cut.rfind("। "), cut.rfind(". "), cut.rfind("? "), cut.rfind("! "))
+        t = cut[: k + 1] if k > TTS_MAX_CHARS // 2 else cut
+    return t
+
+
+def detect_speech_lang(text):
+    """বাংলা অক্ষর বেশি থাকলে 'bn', নইলে 'en'"""
+    bn = len(re.findall(r"[\u0980-\u09FF]", text))
+    letters = len(re.findall(r"[A-Za-z\u0980-\u09FF]", text))
+    return "bn" if letters and bn / letters > 0.3 else "en"
+
+
+@st.cache_data(show_spinner="🔊 অডিও তৈরি হচ্ছে...", max_entries=20)
+def tts_audio(speech_text, lang):
+    from gtts import gTTS  # pip install gTTS
+
+    buf = io.BytesIO()
+    gTTS(text=speech_text, lang=lang).write_to_fp(buf)
+    return buf.getvalue()
+
+
+def play_tts(text, autoplay=False):
+    speech = clean_for_speech(text)
+    if not speech:
+        st.caption("🔇 শোনানোর মতো লেখা নেই (শুধু কোড/লিংক ছিল)।")
+        return
+    try:
+        audio = tts_audio(speech, detect_speech_lang(speech))
+    except ImportError:
+        st.warning("অডিওর জন্য gTTS লাগবে: requirements.txt-এ `gTTS` যোগ করো।")
+        return
+    except Exception as e:
+        st.warning(f"অডিও তৈরি করা যায়নি: {_short(e)}")
+        return
+    st.audio(audio, format="audio/mp3", autoplay=autoplay)
+
+
+# ---------- ২) স্মার্ট অটো-মেমোরি ----------
+_MEM_TRIGGER = re.compile(
+    r"(\bi\s*(am|'m|work|live|study|like|love|prefer|use|have|want|need|run|own)\b|\bmy\b|\bremember\b"
+    r"|আমি|আমার|আমাদের|মনে রাখ|মনে রেখ|ভুলো না|ভুলবে না)",
+    re.I,
+)
+_MEM_SENSITIVE = re.compile(
+    r"(password|passwd|পাসওয়ার্ড|api[\s_-]?key|secret|token|\botp\b|\bpin\b|credit|card number|কার্ড নম্বর"
+    r"|[A-Za-z0-9_\-]{28,}|\d{9,}|[\w.+-]+@[\w-]+\.[\w.]+)",
+    re.I,
+)
+_MEM_PUNCT = re.compile(r"[\s.,;:!?'\"()\[\]{}\-–—।]+")
+
+
+def _mem_norm(x):
+    return _MEM_PUNCT.sub(" ", (x or "").lower()).strip()
+
+
+def _mem_is_dup(fact, existing):
+    a = _mem_norm(fact)
+    for e in existing:
+        b = _mem_norm(e)
+        if not a or not b or a in b or b in a or difflib.SequenceMatcher(None, a, b).ratio() >= 0.82:
+            return True
+    return False
+
+
+def parse_memory_json(text):
+    """মডেলের উত্তর থেকে JSON তালিকা (strings) বের করে"""
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text or "").strip()
+    a, b = text.find("["), text.rfind("]")
+    if a == -1 or b <= a:
+        return []
+    try:
+        arr = json.loads(text[a : b + 1])
+    except Exception:
+        return []
+    return [x.strip() for x in arr if isinstance(x, str) and x.strip()]
+
+
+def auto_extract_memory(user_text):
+    """ইউজারের মেসেজ থেকে স্থায়ী ব্যক্তিগত তথ্য খুঁজে মেমোরিতে সেভ করে। নতুন সেভ হওয়া তথ্যের তালিকা ফেরত দেয়।"""
+    try:
+        text = (user_text or "").strip()
+        if len(text) < MEMORY_MIN_MSG or not _MEM_TRIGGER.search(text):
+            return []
+        existing = [f for _, f in (_db_safe(db_get_memories, default=[]) or [])]
+        room = MAX_MEMORIES - len(existing)
+        if room <= 0:
+            return []
+        res = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[
+                {"role": "system", "content": (
+                    "You extract LONG-TERM personal facts about the USER from their latest message, to remember "
+                    "for future chats. Keep ONLY stable facts: name, profession, skills, location, language, "
+                    "preferences, tools/tech they use, ongoing projects, goals. IGNORE one-off requests, questions, "
+                    "temporary context, opinions about the current task, and anything sensitive (passwords, keys, "
+                    "tokens, ID/card/phone numbers, emails, health, finances). Write each fact as a short sentence "
+                    "(max 120 characters) in the same language as the user. Do not repeat facts already known.\n"
+                    "Output ONLY a JSON array of strings, e.g. [\"আমি একজন Web Designer\"]. Output [] if nothing qualifies.\n\n"
+                    "ALREADY KNOWN:\n" + ("\n".join(f"- {f}" for f in existing)[:800] or "(none)")
+                )},
+                {"role": "user", "content": text[:1200]},
+            ],
+            temperature=0,
+            max_tokens=900,
+        )
+        facts = parse_memory_json(res.choices[0].message.content)
+    except Exception:
+        return []
+
+    saved = []
+    for fact in facts[:3]:
+        fact = fact[:MEMORY_FACT_MAX]
+        if len(fact) < 4 or _MEM_SENSITIVE.search(fact) or _mem_is_dup(fact, existing + saved):
+            continue
+        if len(saved) >= room:
+            break
+        _db_safe(db_add_memory, fact)
+        saved.append(fact)
+    return saved
+
+
+# ---------- ৩) কোড → প্রজেক্ট ZIP ----------
+_CODE_EXTS = (
+    "html|htm|css|scss|js|jsx|ts|tsx|json|py|php|md|txt|xml|sql|yml|yaml|sh|vue|svg|ini|env|toml|cfg"
+    "|java|cpp|cs|c|h|go|rs|rb|kt|swift|bat|csv"
+)
+_FILE_CORE = rf"(?:[\w.\-]+/)*(?:[\w\-]+\.(?:{_CODE_EXTS})|Dockerfile|Makefile|\.env|\.gitignore|\.htaccess)"
+_FILE_FULL = re.compile(_FILE_CORE + r"\Z", re.I)
+_FILE_FIND = re.compile(r"(?<![\w/.\-])(" + _FILE_CORE + r")(?![\w])", re.I)
+_CODE_FENCE = re.compile(r"^[ \t]*```([^\n`]*)\n(.*?)^[ \t]*```[ \t]*$", re.S | re.M)
+_LANG_DEFAULT = {
+    "html": "index.html", "htm": "index.html", "css": "style.css", "scss": "style.scss",
+    "js": "script.js", "javascript": "script.js", "jsx": "App.jsx", "ts": "index.ts", "typescript": "index.ts",
+    "tsx": "App.tsx", "py": "main.py", "python": "main.py", "php": "index.php", "sql": "database.sql",
+    "vue": "App.vue", "java": "Main.java", "c": "main.c", "cpp": "main.cpp", "go": "main.go",
+    "rs": "main.rs", "rust": "main.rs", "rb": "main.rb", "ruby": "main.rb", "kt": "Main.kt", "swift": "main.swift",
+}
+
+
+def _safe_path(p):
+    p = (p or "").replace("\\", "/").strip().lstrip("/")
+    parts = [x for x in p.split("/") if x not in ("", ".", "..")]
+    return "/".join(parts)[:150]
+
+
+def _name_from_label(line):
+    """কোড ব্লকের ঠিক আগের লাইন (যেমন '**index.html**', 'ফাইল: `style.css`') থেকে ফাইলের নাম"""
+    t = (line or "").strip()
+    if not t or len(t) > 120:
+        return None
+    t = re.sub(r"\(.*?\)", " ", t)
+    t = re.sub(r"[#*`>:]+", " ", t)
+    t = re.sub(r"^\s*(\d+[.)]|[-•])\s*", "", t)
+    words = t.split()
+    if not words or len(words) > 4:
+        return None
+    last = words[-1].rstrip(".,;)]\"'")
+    return last if _FILE_FULL.match(last) else None
+
+
+def _name_from_first_line(body):
+    fl = body.split("\n", 1)[0].strip()
+    if not fl.startswith(("#", "//", "/*", "<!--")) or len(fl) > 100:
+        return None
+    t = re.sub(r"^(#+|//+|/\*+|<!--)\s*", "", fl)
+    t = re.sub(r"\s*(\*+/|-->)\s*$", "", t)
+    t = re.sub(r"^(?:file\s*name|filename|file|path)\s*[:=\-]\s*", "", t, flags=re.I).strip()
+    return t if _FILE_FULL.match(t) else None
+
+
+def extract_code_files(text):
+    """উত্তরের কোড ব্লক থেকে [(ফাইলের নাম, কোড)] বানায়। নাম না থাকলে ভাষা দেখে আন্দাজ করে।"""
+    text = text or ""
+    files, used, total = [], set(), 0
+    for m in _CODE_FENCE.finditer(text):
+        info, body = m.group(1).strip(), m.group(2)
+        if not body.strip():
+            continue
+        lang = (info.split()[0].split(":")[0] if info else "").lower().lstrip(".")
+        explicit = None
+        mi = _FILE_FIND.search(info)
+        if mi:
+            explicit = mi.group(1)
+        if not explicit:
+            before = text[: m.start()].rstrip().rsplit("\n", 1)[-1]
+            explicit = _name_from_label(before)
+        if not explicit:
+            explicit = _name_from_first_line(body)
+
+        name = _safe_path(explicit) if explicit else ""
+        if not name:
+            default = _LANG_DEFAULT.get(lang)
+            if not default or body.count("\n") < 4:  # ছোট/অচেনা ব্লক (কমান্ড, নমুনা) ফাইল হবে না
+                continue
+            name = default
+        base, n = name, 2
+        while name.lower() in used:  # একই নাম বারবার এলে _2, _3 যোগ হবে
+            stem, dot, ext = base.rpartition(".")
+            name = f"{stem}_{n}.{ext}" if dot and stem else f"{base}_{n}"
+            n += 1
+        total += len(body.encode("utf-8"))
+        if len(files) >= CODE_MAX_FILES or total > CODE_MAX_BYTES:
+            break
+        used.add(name.lower())
+        files.append((name, body if body.endswith("\n") else body + "\n"))
+    return files
+
+
+def make_zip(files):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, code in files:
+            zf.writestr(name, code.encode("utf-8"))
+    return buf.getvalue()
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def code_project(content):
+    """(ফাইল তালিকা, ZIP bytes — ২টি+ ফাইল হলে) ফেরত দেয়"""
+    files = extract_code_files(content)
+    return files, (make_zip(files) if len(files) > 1 else None)
+
+
 # ---------- সাইডবার ----------
 with st.sidebar:
     st.markdown("## 🤖 আমার AI")
@@ -1873,6 +2138,10 @@ with st.sidebar:
         st.caption("কোনো চ্যাট পাওয়া যায়নি।")
 
     with st.expander("🧠 পার্সোনাল মেমোরি (AI মনে রাখবে)", expanded=False):
+        auto_memory = st.toggle(
+            "🤖 অটো-মেমোরি (AI নিজেই জরুরি তথ্য সেভ করবে)", value=True, key="auto_memory",
+            help="আপনার মেসেজে নাম, পেশা, পছন্দ বা প্রজেক্টের মতো স্থায়ী তথ্য থাকলে AI নিজে মেমোরিতে যোগ করবে। পাসওয়ার্ড/কী/নম্বর কখনো সেভ হয় না।",
+        )
         _mems = _db_safe(db_get_memories, default=[]) or []
         with st.form("mem_form", clear_on_submit=True):
             new_mem = st.text_input("নতুন তথ্য লিখুন:", placeholder="যেমন: আমি একজন Web Designer")
@@ -1889,6 +2158,11 @@ with st.sidebar:
             if col2.button("❌", key=f"del_mem_{mid}"):
                 _db_safe(db_delete_memory, mid)
                 st.rerun()
+
+    with st.expander("🎙️ ভয়েস সেটিংস", expanded=False):
+        voice_lang_label = st.selectbox("আমি যে ভাষায় বলব:", list(STT_LANGS), key="voice_lang")
+        voice_reply = st.toggle("🔊 ভয়েসে প্রশ্ন করলে উত্তরও অডিওতে শোনাও", value=True, key="voice_reply")
+        st.caption("মাইক চ্যাট বক্সের ওপরের '🎙️ ভয়েসে প্রশ্ন করুন' অংশে আছে। যেকোনো উত্তরের নিচে 🔊 বাটনে চাপলেও শোনা যায়।")
 
     st.divider()
     app_mode = st.radio(
@@ -2348,6 +2622,33 @@ def render_message(m, idx):
                 help="ফাইলটি ব্রাউজারে খুলে Print → Save as PDF করলে PDF হবে",
             )
 
+        _files, _zip = code_project(m["content"]) if not json_data else ([], None)
+        _can_speak = bool(not imgs and not json_data and len(clean_for_speech(m["content"])) > 3)
+        _want_tts = False
+        if _can_speak or _files:
+            c_tts, c_zip = st.columns(2)
+            if _can_speak:
+                _want_tts = c_tts.button("🔊 শুনুন", key=f"tts_{st.session_state.current}_{idx}")
+            if len(_files) > 1:
+                c_zip.download_button(
+                    label=f"📦 প্রজেক্ট ZIP ({len(_files)}টি ফাইল)",
+                    data=_zip,
+                    file_name=f"project-{idx}.zip",
+                    mime="application/zip",
+                    key=f"zip_{st.session_state.current}_{idx}",
+                    help=", ".join(n for n, _ in _files)[:300],
+                )
+            elif len(_files) == 1:
+                c_zip.download_button(
+                    label=f"📥 {_files[0][0].split('/')[-1][:24]}",
+                    data=_files[0][1].encode("utf-8"),
+                    file_name=_files[0][0].split("/")[-1],
+                    mime="text/plain",
+                    key=f"code1_{st.session_state.current}_{idx}",
+                )
+        if _want_tts:
+            play_tts(m["content"])
+
         preview_page = build_preview_html(m["content"])
         if preview_page:
             pk = f"{st.session_state.current}_{idx}"
@@ -2526,6 +2827,29 @@ elif is_image_mode:
 else:
     placeholder = "এখানে লিখুন, অথবা ক্লিপ আইকন থেকে ছবি ও ফাইল দিন..."
 
+voice_prompt = None
+if hasattr(st, "audio_input"):
+    with st.expander("🎙️ ভয়েসে প্রশ্ন করুন", expanded=False):
+        _voice_audio = st.audio_input(
+            "মাইকে চাপ দিয়ে বলুন, থামালেই পাঠিয়ে দেওয়া হবে",
+            key=f"voice_{st.session_state.voice_counter}",
+        )
+    if _voice_audio is not None:
+        _raw = _voice_audio.getvalue()
+        _vh = hashlib.md5(_raw).hexdigest()
+        if _vh != st.session_state.get("_voice_done"):  # একই রেকর্ডিং রিরানে দ্বিতীয়বার প্রসেস হবে না
+            st.session_state["_voice_done"] = _vh
+            st.session_state.voice_counter += 1  # পরের রানে রেকর্ডার খালি হবে
+            try:
+                with st.spinner("🎙️ আপনার কথা লেখা হচ্ছে..."):
+                    voice_prompt = transcribe_audio(_raw, STT_LANGS.get(voice_lang_label, "")) or None
+                if not voice_prompt:
+                    st.warning("কিছু শোনা যায়নি। আবার একটু জোরে বলুন।")
+                elif voice_reply:
+                    st.session_state["_speak_reply"] = True
+            except Exception as e:
+                st.error(f"ভয়েস লেখায় রূপান্তর করা যায়নি: {friendly_error(e)}")
+
 user_input = st.chat_input(
     placeholder,
     accept_file="multiple",
@@ -2533,13 +2857,13 @@ user_input = st.chat_input(
 )
 messages = cur()["messages"]
 
-if user_input:
-    force, prompt = parse_command((user_input.text or "").strip())
+if user_input or voice_prompt:
+    force, prompt = parse_command(((user_input.text if user_input else "") or voice_prompt or "").strip())
     inline_imgs = []
     attach_name = None
     can_use_image = not is_agent_mode
 
-    if user_input.files:
+    if user_input and user_input.files:
         for f in user_input.files:
             if f.type and f.type.startswith("image/"):
                 inline_imgs.append((f.getvalue(), f.type))
@@ -2611,6 +2935,10 @@ if user_input:
             st.session_state.pending = True
 
 # ---------- মেসেজ দেখানো ----------
+_new_mems = st.session_state.pop("_mem_toast", None)
+if _new_mems:
+    st.toast("🧠 মেমোরিতে সেভ হয়েছে: " + " | ".join(_new_mems), icon="🧠")
+
 if not messages and not st.session_state.pending:
     st.markdown(
         "<h2 style='text-align:center; margin-top:18vh;'>আজ কীভাবে সাহায্য করতে পারি?</h2>",
@@ -2621,6 +2949,8 @@ last_idx = len(messages) - 1
 for idx, m in enumerate(messages):
     with st.chat_message(m["role"]):
         render_message(m, idx)
+        if m["role"] == "assistant" and idx == last_idx and st.session_state.pop("_autoplay_last", False):
+            play_tts(m["content"], autoplay=True)  # ভয়েসে প্রশ্ন করলে উত্তর নিজে থেকে বাজবে
         if (
             m["role"] == "assistant"
             and idx == last_idx
@@ -2736,10 +3066,17 @@ if st.session_state.pending:
 
                 push_message(reply_msg)
                 success = True
+                if auto_memory and app_mode.startswith("💬") and intent in ("chat", "vision"):
+                    _saved = auto_extract_memory(last_user["content"])
+                    if _saved:
+                        st.session_state["_mem_toast"] = _saved
             except Exception as e:
                 pop_message()
                 st.error(friendly_error(e))
 
+        _speak = st.session_state.pop("_speak_reply", False)
+        if success and _speak and not reply_msg.get("image"):
+            st.session_state["_autoplay_last"] = True
         st.session_state.pending = False
         if success:
             st.rerun()
