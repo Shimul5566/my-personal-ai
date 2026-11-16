@@ -9,7 +9,10 @@ import hashlib
 import hmac
 import itertools
 import sqlite3
+import shutil
 import socket
+import subprocess
+import tempfile
 import ipaddress
 import time
 import urllib.parse
@@ -36,7 +39,7 @@ try:
 except Exception:
     _LOGO_PIL = "🤖"
 
-APP_VERSION = "2.4.0"  # Slack logo, centred mic, no empty hero, advanced mobile UI
+APP_VERSION = "2.5.0"  # + Video Studio (trim, speed, music, filters, resize)
 
 st.set_page_config(
     page_title="আমার পার্সোনাল AI",
@@ -2398,8 +2401,9 @@ with st.sidebar:
     st.divider()
     app_mode = st.radio(
         "কাজের ধরন (Mode):",
-        ["💬 সাধারণ চ্যাট", "📦 WordPress JSON তৈরি", "🔌 WordPress Agent", "🎨 ছবি তৈরি"],
+        ["💬 সাধারণ চ্যাট", "📦 WordPress JSON তৈরি", "🔌 WordPress Agent", "🎨 ছবি তৈরি", "🎬 Video Studio"],
     )
+    is_video_mode = app_mode.startswith("🎬")
     is_json_mode = app_mode.startswith("📦")
     is_agent_mode = app_mode.startswith("🔌")
     is_image_mode = app_mode.startswith("🎨")
@@ -3083,6 +3087,442 @@ def resolve_intent(last_user):
         intent = "vision"  # এডিটের কী না থাকলে সাধারণ ছবি-বিশ্লেষণ
     return intent
 
+
+# ---------- 🎬 Video Studio: ভিডিও এডিট (ffmpeg) ----------
+VIDEO_TYPES = ["mp4", "mov", "m4v", "webm", "mkv", "avi"]
+AUDIO_TYPES = ["mp3", "wav", "m4a", "aac", "ogg", "flac"]
+MAX_VIDEO_MB = 200
+VIDEO_TIMEOUT = 900  # সেকেন্ড
+
+VIDEO_SPEEDS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0]
+VIDEO_FILTERS = {
+    "🎞️ কোনো ফিল্টার নয়": "none",
+    "⚫ সাদা-কালো": "bw",
+    "🟤 সেপিয়া (পুরনো ছবির মতো)": "sepia",
+    "🌈 ভিভিড (রঙ উজ্জ্বল)": "vivid",
+    "❄️ কুল (নীলচে)": "cool",
+    "🔥 ওয়ার্ম (লালচে)": "warm",
+}
+VIDEO_FILTER_CHAIN = {
+    "none": [],
+    "bw": ["hue=s=0"],
+    "sepia": ["colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131:0"],
+    "vivid": ["eq=saturation=1.45:contrast=1.08:brightness=0.02"],
+    "cool": ["colorbalance=rs=-.08:bs=.12"],
+    "warm": ["colorbalance=rs=.12:bs=-.08"],
+}
+VIDEO_SIZES = {
+    "📺 মূল সাইজ (অপরিবর্তিত)": "original",
+    "▶️ YouTube 16:9 (1920×1080)": "youtube",
+    "📱 Reels / Shorts / TikTok 9:16 (1080×1920)": "reels",
+    "🟦 Instagram পোস্ট 1:1 (1080×1080)": "square",
+    "🖼️ Instagram পোর্ট্রেট 4:5 (1080×1350)": "portrait",
+}
+VIDEO_SIZE_PX = {
+    "original": None,
+    "youtube": (1920, 1080),
+    "reels": (1080, 1920),
+    "square": (1080, 1080),
+    "portrait": (1080, 1350),
+}
+VIDEO_FITS = {
+    "✂️ ক্রপ (পুরো ফ্রেম ভরবে)": "crop",
+    "⬛ কালো বর্ডার (কিছু কাটবে না)": "pad",
+    "🌫️ ঝাপসা ব্যাকগ্রাউন্ড (কিছু কাটবে না)": "blur",
+}
+VIDEO_AUDIO_MODES = {
+    "🔊 মূল সাউন্ড রাখো": "keep",
+    "🔇 পুরো মিউট": "mute",
+    "🎵 মূল সাউন্ড মিউট করে নতুন মিউজিক": "replace",
+    "🎚️ মূল সাউন্ড + মিউজিক মিক্স": "mix",
+}
+
+
+def _ffmpeg_bin():
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def _floor1(x):
+    return int(float(x) * 10) / 10.0
+
+
+def _fmt_t(sec):
+    sec = max(0.0, float(sec))
+    m, s = divmod(sec, 60)
+    return f"{int(m):02d}:{s:04.1f}"
+
+
+def video_probe(path):
+    """ffmpeg -i এর আউটপুট থেকে দৈর্ঘ্য, সাইজ ও অডিও আছে কি না বের করে"""
+    ff = _ffmpeg_bin()
+    r = subprocess.run([ff, "-hide_banner", "-i", path], capture_output=True, text=True,
+                       errors="replace", timeout=60)
+    info = r.stderr or ""
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", info)
+    dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else 0.0
+    vm = re.search(r"Video:.*?,\s*(\d{2,5})x(\d{2,5})", info)
+    return {
+        "duration": dur,
+        "width": int(vm.group(1)) if vm else 0,
+        "height": int(vm.group(2)) if vm else 0,
+        "has_video": bool(re.search(r"Stream #\d+:\d+.*?: Video:", info)),
+        "has_audio": bool(re.search(r"Stream #\d+:\d+.*?: Audio:", info)),
+    }
+
+
+def _atempo_chain(speed):
+    """atempo শুধু 0.5–2.0 নেয়, তাই দরকারে একাধিক ধাপে ভাঙি"""
+    parts, s = [], float(speed)
+    while s > 2.0:
+        parts.append("atempo=2.0")
+        s /= 2.0
+    while s < 0.5:
+        parts.append("atempo=0.5")
+        s /= 0.5
+    parts.append(f"atempo={s:.4f}")
+    return ",".join(parts)
+
+
+def build_video_cmd(src, out, meta, opt, music_path=None):
+    ff = _ffmpeg_bin()
+    start, end, speed = float(opt["start"]), float(opt["end"]), float(opt["speed"])
+    seg = max(0.1, end - start)
+    out_dur = seg / speed
+    mode = opt["audio_mode"]
+    use_music = mode in ("replace", "mix") and bool(music_path)
+
+    cmd = [ff, "-y", "-hide_banner", "-loglevel", "error",
+           "-ss", f"{start:.3f}", "-t", f"{seg:.3f}", "-i", src]
+    if use_music:
+        cmd += ["-stream_loop", "-1", "-i", music_path]  # ছোট মিউজিক লুপ হবে
+
+    # ---- ভিডিও: স্পিড → ফিল্টার → সাইজ ----
+    pre = []
+    if abs(speed - 1.0) > 1e-6:
+        pre.append(f"setpts=PTS/{speed:.4f}")
+    pre += VIDEO_FILTER_CHAIN.get(opt["filter"], [])
+    fg = ["[0:v]" + (",".join(pre) if pre else "null") + "[v0]"]
+
+    px = VIDEO_SIZE_PX.get(opt["size"])
+    if px is None:
+        fg.append("[v0]scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,format=yuv420p[vout]")
+    else:
+        W, H = px
+        if opt["fit"] == "pad":
+            fg.append(f"[v0]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+                      f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[vout]")
+        elif opt["fit"] == "blur":
+            fg.append(f"[v0]split=2[bgi][fgi];"
+                      f"[bgi]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},boxblur=30:6[bg];"
+                      f"[fgi]scale={W}:{H}:force_original_aspect_ratio=decrease[fg];"
+                      f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,format=yuv420p[vout]")
+        else:  # crop
+            fg.append(f"[v0]scale={W}:{H}:force_original_aspect_ratio=increase,"
+                      f"crop={W}:{H},setsar=1,format=yuv420p[vout]")
+
+    # ---- অডিও ----
+    has_a = bool(meta.get("has_audio"))
+    orig = None
+    if has_a and mode in ("keep", "mix"):
+        chain = ([_atempo_chain(speed)] if abs(speed - 1.0) > 1e-6 else []) + [f"volume={float(opt['orig_vol']):.2f}"]
+        orig = "[0:a]" + ",".join(chain) + "[a0]"
+    music = None
+    if use_music:
+        chain = [f"volume={float(opt['music_vol']):.2f}", f"atrim=0:{out_dur:.3f}", "asetpts=PTS-STARTPTS"]
+        if out_dur > 3:
+            chain.append(f"afade=t=out:st={max(0.0, out_dur - 1.5):.3f}:d=1.5")
+        music = "[1:a]" + ",".join(chain) + "[a1]"
+
+    audio_out = False
+    if mode == "keep" and orig:
+        fg.append(orig.replace("[a0]", "[aout]"))
+        audio_out = True
+    elif mode == "replace" and music:
+        fg.append(music.replace("[a1]", "[aout]"))
+        audio_out = True
+    elif mode == "mix":
+        if orig and music:
+            fg += [orig, music, "[a0][a1]amix=inputs=2:duration=first:dropout_transition=0,volume=2[aout]"]
+            audio_out = True
+        elif music:  # মূল ভিডিওতে সাউন্ড নেই
+            fg.append(music.replace("[a1]", "[aout]"))
+            audio_out = True
+        elif orig:
+            fg.append(orig.replace("[a0]", "[aout]"))
+            audio_out = True
+
+    cmd += ["-filter_complex", ";".join(fg), "-map", "[vout]"]
+    if audio_out:
+        cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "160k"]
+    else:
+        cmd += ["-an"]
+    cmd += ["-t", f"{out_dur:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-movflags", "+faststart", out]
+    return cmd
+
+
+def run_video_edit(src, meta, opt, music_path=None):
+    """এডিট চালিয়ে MP4 bytes ফেরত দেয়"""
+    out = os.path.join(os.path.dirname(src), f"out-{uuid.uuid4().hex[:8]}.mp4")
+    cmd = build_video_cmd(src, out, meta, opt, music_path)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=VIDEO_TIMEOUT)
+    if r.returncode != 0 or not os.path.exists(out):
+        raise RuntimeError((r.stderr or "ffmpeg ব্যর্থ হয়েছে").strip()[-700:])
+    try:
+        with open(out, "rb") as fh:
+            return fh.read()
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+
+
+def video_ai_plan(instruction, meta):
+    """সাধারণ ভাষার নির্দেশ থেকে JSON এডিট-প্ল্যান বানায় (Groq)"""
+    sys_text = (
+        "You turn a user's video editing request into a JSON edit plan. Reply with ONLY one JSON object, "
+        "no markdown, no explanation. Include a key only if the user asked for it. Keys: "
+        "start (number, seconds), end (number, seconds), speed (number 0.25-4), "
+        "filter (one of: none, bw, sepia, vivid, cool, warm), "
+        "size (one of: original, youtube, reels, square, portrait), "
+        "fit (one of: crop, pad, blur), audio (one of: keep, mute, replace, mix). "
+        f"The video is {meta['duration']:.1f} seconds long. "
+        "'cut the first N seconds' => start=N. 'cut the last N seconds' => end=duration-N. "
+        "'keep only the first N seconds' => start=0,end=N. 'slow motion' => speed 0.5. 'fast forward' => speed 2. "
+        "Black and white => bw. Reels/Shorts/TikTok/vertical => reels. YouTube/landscape => youtube. "
+        "'remove/mute original sound and add music' => replace. The user may write Bengali, Banglish or English."
+    )
+    res = client.chat.completions.create(
+        model="openai/gpt-oss-20b",
+        messages=[{"role": "system", "content": sys_text}, {"role": "user", "content": instruction}],
+        temperature=0.1,
+        max_tokens=800,
+    )
+    text = (res.choices[0].message.content or "").strip()
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        raise ValueError("AI থেকে বুঝতে পারা যায়নি")
+    plan = json.loads(m.group(0))
+    if not isinstance(plan, dict):
+        raise ValueError("AI থেকে বুঝতে পারা যায়নি")
+    return plan
+
+
+def _vs_cleanup(state):
+    if state and state.get("dir"):
+        shutil.rmtree(state["dir"], ignore_errors=True)
+
+
+def _vs_apply_plan(plan, vid_key, dur):
+    """AI-এর প্ল্যান সরাসরি নিচের স্লাইডার/সিলেক্টে বসিয়ে দেয়"""
+    ss = st.session_state
+    k = lambda n: f"vs_{n}_{vid_key}"
+    dmax = _floor1(dur)
+    notes = []
+
+    def num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    s, e = num(plan.get("start")), num(plan.get("end"))
+    if s is not None or e is not None:
+        cs, ce = ss.get(k("trim"), (0.0, dmax))
+        s = cs if s is None else min(max(s, 0.0), dmax)
+        e = ce if e is None else min(max(e, 0.0), dmax)
+        if e - s < 0.1:
+            s, e = 0.0, dmax
+        ss[k("trim")] = (round(s, 1), round(e, 1))
+        notes.append(f"✂️ {_fmt_t(s)} → {_fmt_t(e)}")
+    sp = num(plan.get("speed"))
+    if sp and sp > 0:
+        ss[k("speed")] = min(VIDEO_SPEEDS, key=lambda x: abs(x - sp))
+        notes.append(f"⚡ {ss[k('speed')]}x")
+    for key, table, name in (("filter", VIDEO_FILTERS, "filter"), ("size", VIDEO_SIZES, "size"),
+                             ("fit", VIDEO_FITS, "fit"), ("audio", VIDEO_AUDIO_MODES, "audio")):
+        code = str(plan.get(key, "")).strip().lower()
+        label = next((lb for lb, cd in table.items() if cd == code), None)
+        if label:
+            ss[k(name)] = label
+            notes.append(label)
+    return notes
+
+
+if is_video_mode:
+    st.markdown(
+        "<div class='app-bar'>"
+        f"<img class='app-logo' src='data:image/png;base64,{LOGO_B64}' alt='logo'/>"
+        "<div class='app-text'><div class='app-title'>🎬 Video Studio</div>"
+        "<div class='app-sub'>Trim · Speed · Music · Filter · Resize</div></div></div>",
+        unsafe_allow_html=True,
+    )
+    if not _ffmpeg_bin():
+        st.error(
+            "ভিডিও এডিটের জন্য ffmpeg দরকার। requirements.txt-এ `imageio-ffmpeg` লাইনটি যোগ করুন "
+            "(অথবা Streamlit Cloud-এ packages.txt ফাইলে `ffmpeg` লিখুন), তারপর অ্যাপ রিস্টার্ট দিন।"
+        )
+        st.stop()
+
+    _up = st.file_uploader("🎞️ ভিডিও আপলোড করুন:", type=VIDEO_TYPES, key="vs_upload")
+    if _up is None:
+        st.info(f"শুরু করতে একটি ভিডিও আপলোড করুন (সর্বোচ্চ ~{MAX_VIDEO_MB}MB)। তারপর নিজে সেটিংস বদলাতে পারবেন, "
+                "অথবা AI-কে লিখে বলতে পারবেন কী করতে হবে।")
+        st.stop()
+
+    _raw = _up.getvalue()
+    if len(_raw) > MAX_VIDEO_MB * 1024 * 1024:
+        st.error(f"ভিডিও {MAX_VIDEO_MB}MB-এর বেশি বড়। ছোট করে আবার দিন।")
+        st.stop()
+    vid_key = hashlib.md5(_raw[:1 << 20] + _raw[-(1 << 20):] + str(len(_raw)).encode()).hexdigest()[:10]
+    K = lambda n: f"vs_{n}_{vid_key}"
+
+    _state = st.session_state.get("vs_src")
+    if not _state or _state["key"] != vid_key or not os.path.exists(_state["path"]):
+        _vs_cleanup(_state)
+        _dir = tempfile.mkdtemp(prefix="vstudio_")
+        _ext = os.path.splitext(_up.name)[1].lower().lstrip(".")
+        _ext = _ext if _ext in VIDEO_TYPES else "mp4"
+        _path = os.path.join(_dir, f"input.{_ext}")
+        with open(_path, "wb") as _fh:
+            _fh.write(_raw)
+        try:
+            _meta = video_probe(_path)
+        except Exception as e:
+            shutil.rmtree(_dir, ignore_errors=True)
+            st.error(f"ভিডিও পড়া যায়নি: {_short(e)}")
+            st.stop()
+        _state = {"key": vid_key, "dir": _dir, "path": _path, "meta": _meta, "name": _up.name}
+        st.session_state["vs_src"] = _state
+        st.session_state.pop("vs_result", None)
+
+    meta = _state["meta"]
+    if not meta["has_video"] or meta["duration"] < 0.5:
+        st.error("এই ফাইলে ভিডিও পাওয়া যায়নি বা এটি খুব ছোট।")
+        st.stop()
+    dur = meta["duration"]
+    dmax = _floor1(dur)
+    st.caption(f"⏱️ {_fmt_t(dur)} · 📐 {meta['width']}×{meta['height']} · "
+               + ("🔊 সাউন্ড আছে" if meta["has_audio"] else "🔇 মূল ভিডিওতে সাউন্ড নেই"))
+
+    # ---------- AI দিয়ে এডিট ----------
+    with st.container(border=True):
+        st.markdown("**✨ AI-কে বলুন কী করতে হবে**")
+        _ai_text = st.text_input(
+            "নির্দেশ (বাংলা / English):",
+            key=K("ai"),
+            placeholder="যেমন: প্রথম ৫ সেকেন্ড কেটে দাও, ২x স্পিড করো, সাদা-কালো করো, Reels সাইজ দাও",
+        )
+        if st.button("✨ AI দিয়ে সেটিংস সাজাও", key=K("ai_btn"), disabled=not _ai_text.strip()):
+            try:
+                with st.spinner("🤖 AI আপনার নির্দেশ বুঝছে..."):
+                    _plan = video_ai_plan(_ai_text.strip(), meta)
+                _notes = _vs_apply_plan(_plan, vid_key, dur)
+                st.session_state["_vs_ai_msg"] = (
+                    "✅ সেটিংস সাজানো হয়েছে: " + " · ".join(_notes) + "\n\nনিচে দেখে নিয়ে 'ভিডিও তৈরি করো' চাপুন।"
+                    if _notes else "⚠️ নির্দেশ থেকে কোনো সেটিংস বোঝা যায়নি। একটু স্পষ্ট করে লিখুন।"
+                )
+            except Exception as e:
+                st.session_state["_vs_ai_msg"] = f"⚠️ AI প্ল্যান বানাতে পারেনি ({_short(e)})। নিচের সেটিংস হাতে বদলান।"
+            st.rerun()
+        _msg = st.session_state.pop("_vs_ai_msg", None)
+        if _msg:
+            (st.success if _msg.startswith("✅") else st.warning)(_msg)
+
+    # ---------- ম্যানুয়াল সেটিংস ----------
+    t_trim, t_speed, t_audio, t_look = st.tabs(["✂️ ট্রিম", "⚡ স্পিড", "🎵 অডিও/মিউজিক", "🎨 ফিল্টার ও সাইজ"])
+
+    with t_trim:
+        trim = st.slider("শুরু ও শেষ (সেকেন্ড) — টেনে ঠিক করুন:", 0.0, dmax, (0.0, dmax), step=0.1, key=K("trim"))
+        t_start = float(trim[0])
+        t_end = dur if trim[1] >= dmax - 1e-6 else float(trim[1])
+        if t_end - t_start < 0.2:
+            st.warning("শুরু ও শেষের মাঝে অন্তত ০.২ সেকেন্ড ফাঁক রাখুন।")
+        st.caption(f"রাখা হবে: {_fmt_t(t_start)} → {_fmt_t(t_end)} (মোট {_fmt_t(t_end - t_start)})")
+        try:
+            st.video(_raw, start_time=int(t_start), end_time=max(int(t_start) + 1, int(round(t_end))))
+        except TypeError:
+            st.video(_raw, start_time=int(t_start))
+
+    with t_speed:
+        speed = st.select_slider("🐢 স্লো-মোশন  ←  1x  →  ফাস্ট-ফরওয়ার্ড 🐇", options=VIDEO_SPEEDS, value=1.0,
+                                 format_func=lambda x: f"{x}x", key=K("speed"))
+        st.caption(f"ফলাফলের দৈর্ঘ্য: প্রায় {_fmt_t(max(0.1, t_end - t_start) / speed)}")
+
+    with t_audio:
+        a_label = st.selectbox("সাউন্ড:", list(VIDEO_AUDIO_MODES), key=K("audio"))
+        audio_mode = VIDEO_AUDIO_MODES[a_label]
+        orig_vol, music_vol, music_file = 1.0, 0.8, None
+        if audio_mode in ("keep", "mix"):
+            if meta["has_audio"]:
+                orig_vol = st.slider("মূল সাউন্ডের ভলিউম", 0.0, 2.0, 1.0, 0.05, key=K("ovol"))
+            else:
+                st.caption("এই ভিডিওতে মূল সাউন্ড নেই।")
+        if audio_mode in ("replace", "mix"):
+            music_file = st.file_uploader("🎵 ব্যাকগ্রাউন্ড মিউজিক (mp3, wav, m4a...):", type=AUDIO_TYPES, key=K("music"))
+            music_vol = st.slider("মিউজিকের ভলিউম", 0.0, 2.0, 0.8, 0.05, key=K("mvol"))
+            st.caption("মিউজিক ভিডিওর চেয়ে ছোট হলে নিজে থেকে লুপ হবে, বড় হলে ভিডিওর শেষে ফেড-আউট হয়ে থামবে।")
+            if music_file is None:
+                st.warning("মিউজিক ফাইল দিন।")
+
+    with t_look:
+        f_label = st.selectbox("🎨 ফিল্টার:", list(VIDEO_FILTERS), key=K("filter"))
+        s_label = st.selectbox("📐 সাইজ:", list(VIDEO_SIZES), key=K("size"))
+        size_code = VIDEO_SIZES[s_label]
+        fit_code = "crop"
+        if size_code != "original":
+            fit_code = VIDEO_FITS[st.selectbox("ফ্রেমে বসানোর ধরন:", list(VIDEO_FITS), key=K("fit"))]
+            st.caption("মূল ভিডিওর অনুপাত আলাদা হলে ক্রপ, কালো বর্ডার, বা ঝাপসা ব্যাকগ্রাউন্ড—যেটা পছন্দ বেছে নিন।")
+
+    need_music = audio_mode in ("replace", "mix") and music_file is None
+    can_run = (t_end - t_start >= 0.2) and not need_music
+
+    if st.button("🎬 ভিডিও তৈরি করো", type="primary", key=K("run"), disabled=not can_run, use_container_width=True):
+        _music_path = None
+        try:
+            if music_file is not None and audio_mode in ("replace", "mix"):
+                _mext = os.path.splitext(music_file.name)[1].lower().lstrip(".")
+                _mext = _mext if _mext in AUDIO_TYPES else "mp3"
+                _music_path = os.path.join(_state["dir"], f"music.{_mext}")
+                with open(_music_path, "wb") as _fh:
+                    _fh.write(music_file.getvalue())
+            _opt = {
+                "start": t_start, "end": t_end, "speed": speed, "filter": VIDEO_FILTERS[f_label],
+                "size": size_code, "fit": fit_code, "audio_mode": audio_mode,
+                "orig_vol": orig_vol, "music_vol": music_vol,
+            }
+            with st.spinner("🎬 ভিডিও এডিট হচ্ছে... বড় ভিডিওতে কয়েক মিনিট লাগতে পারে, পেজ বন্ধ করবেন না।"):
+                _data = run_video_edit(_state["path"], meta, _opt, _music_path)
+            st.session_state["vs_result"] = {
+                "key": vid_key,
+                "data": _data,
+                "name": "edited-" + (re.sub(r"[^A-Za-z0-9_-]+", "-", os.path.splitext(_state["name"])[0]).strip("-") or "video") + ".mp4",
+                "summary": f"{_fmt_t(t_start)}→{_fmt_t(t_end)} · {speed}x · {f_label} · {s_label} · {a_label}",
+            }
+        except subprocess.TimeoutExpired:
+            st.error("সময় শেষ হয়ে গেছে। ছোট অংশ ট্রিম করে বা ছোট ভিডিও দিয়ে আবার চেষ্টা করুন।")
+        except Exception as e:
+            st.error("ভিডিও এডিট করা যায়নি।")
+            with st.expander("টেকনিক্যাল বিবরণ"):
+                st.code(str(e))
+
+    _res = st.session_state.get("vs_result")
+    if _res and _res["key"] == vid_key:
+        st.divider()
+        st.subheader("✅ তৈরি ভিডিও")
+        st.video(_res["data"])
+        st.caption(f"{_res['summary']} · {len(_res['data']) / 1048576:.1f} MB")
+        st.download_button("⬇️ এডিট করা ভিডিও ডাউনলোড করুন", data=_res["data"], file_name=_res["name"],
+                           mime="video/mp4", key=K("dl"), use_container_width=True)
+    st.stop()
 
 # ---------- ইনপুট ----------
 if is_agent_mode:
