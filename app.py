@@ -31,12 +31,29 @@ load_dotenv()
 
 APP_VERSION = "2.3.0"  # Mic icon fix, mobile composer lift, English hero + logo
 
+LOGO_SVG = """
+<svg xmlns="http://w3.org" viewBox="0 0 64 64" width="44" height="44">
+  <defs>
+    <linearGradient id="aiGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="56" height="56" rx="16" fill="url(#aiGrad)"/>
+  <path d="M32 15 C32 25, 39 32, 49 32 C39 32, 32 39, 32 49 C32 39, 25 32, 15 32 C25 32, 32 25, 32 15 Z" fill="#ffffff"/>
+  <circle cx="46" cy="18" r="3.2" fill="#93c5fd"/>
+</svg>
+""".strip()
+
+LOGO_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(LOGO_SVG.encode("utf-8")).decode("utf-8")
+
 st.set_page_config(
-    page_title="আমার পার্সোনাল AI",
-    page_icon="🤖",
+    page_title="Personal AI Studio",
+    page_icon=LOGO_DATA_URI,
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
 
 # --- ChatGPT স্টাইল কাস্টম CSS (মোবাইল ও ডেস্কটপ ফিক্সড) ---
 st.markdown(
