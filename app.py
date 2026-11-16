@@ -380,6 +380,10 @@ if not api_key:
     st.stop()
 
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
+ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY")  # console.anthropic.com থেকে
+CLAUDE_MODEL = get_secret("CLAUDE_MODEL") or "claude-haiku-5-5"
+CLAUDE_FILE_LIMIT = 300_000  # Claude-কে পাঠানো ফাইল-টেক্সটের সর্বোচ্চ অক্ষর
+CLAUDE_OUT = {"সংক্ষিপ্ত": 1500, "সাধারণ": 4000, "বিস্তারিত": 8000}
 GEMINI_MODEL = get_secret("GEMINI_MODEL") or "gemini-3.8-flash"
 GEMINI_IMAGE_MODEL = get_secret("GEMINI_IMAGE_MODEL") or "gemini-nano-banana-2.1"
 GEMINI_IMAGE_FALLBACKS = ("gemini-3.1-flash-image", "gemini-2.5-flash-image")  # প্রথমটি না চললে এগুলো
@@ -468,6 +472,37 @@ If the user attaches a screenshot, rebuild that design as closely as possible in
 No text outside the code block."""
 
 CHAT_PROMPT = "You are a helpful AI assistant. Answer clearly in the language the user uses."
+
+APP_MAX_OUT = 6000  # অ্যাপ বিল্ডার মোডে Groq-এর আউটপুট সীমা (পুরো অ্যাপের কোডের জন্য বেশি দরকার)
+
+APP_BUILDER_PROMPT = """You are an expert mobile app builder (like Rork / Lovable). The user describes an app in plain language
+(Bengali or English). You build a COMPLETE, WORKING, mobile-first app as ONE self-contained HTML file.
+
+OUTPUT FORMAT (strict):
+1. One or two short lines in the user's language saying what you are building.
+2. EXACTLY ONE fenced ```html code block containing the full file (<!doctype html> ... </html>).
+   Never split CSS/JS into separate code blocks. Never use placeholders like "...rest of code".
+3. After the code: a very short bullet list (max 5 bullets) of the features, plus one line suggesting what the user can ask next.
+
+TECH RULES:
+- Single file. Inline <style> and <script>. Vanilla JS (or small libs from cdn.tailwindcss.com, cdn.jsdelivr.net, cdnjs.cloudflare.com, fonts.googleapis.com only).
+- Mobile-first for a 390px wide screen: <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">,
+  safe-area padding, large touch targets (min 44px), no horizontal scroll, 100dvh app shell.
+- Look like a real native app: bottom tab bar or top app bar, cards, rounded corners, bottom sheets/modals, smooth transitions, empty states,
+  tasteful colour palette with a dark-mode friendly design (use CSS variables, honour prefers-color-scheme).
+- Real functionality: working navigation between screens, add/edit/delete, forms with validation, filters/search, charts where useful.
+  Seed it with realistic sample data so the first screen is never empty.
+- Persist data with localStorage inside try/catch and fall back to in-memory state (the preview sandbox may block storage).
+- Do NOT use alert()/confirm()/prompt(); build small in-app modals/toasts instead.
+- No external images or API keys. Use emoji, inline SVG, CSS gradients for visuals. No network requests that need authentication.
+- UI text language = the language the user wrote in (Bengali UI if they wrote Bengali). Use a font stack with a Bengali-capable fallback.
+- Keep it compact (aim for under ~450 lines) but polished.
+
+ITERATING: if there is already an app earlier in the conversation and the user asks for a change, return the FULL UPDATED file
+(not a diff), keeping every existing feature unless told to remove it.
+If the user attached a screenshot/design, recreate that layout as closely as possible as a working app.
+If the request is too vague, make sensible assumptions and build it anyway — do not ask questions first.
+"""
 
 PERSONAS = {
     "🤖 সাধারণ সহকারী": "",
@@ -886,8 +921,82 @@ def _prime(gen):
     try:
         first = next(gen)
     except StopIteration:
-        raise RuntimeError("Gemini কোনো উত্তর দেয়নি")
+        raise RuntimeError("AI কোনো উত্তর দেয়নি")
     return itertools.chain([first], gen)
+
+
+CLAUDE_URL = "https://api.anthropic.com/v1/messages"
+
+
+def claude_messages(history, use_image):
+    """অ্যাপের চ্যাট-হিস্টরিকে Anthropic Messages ফরম্যাটে বদলায় (একই role পরপর এলে জুড়ে দেয়)"""
+    out = []
+    for m in history:
+        role = "user" if m["role"] == "user" else "assistant"
+        blocks = []
+        if use_image and role == "user":
+            for b64_data, mm in get_msg_images(m):
+                blocks.append({"type": "image", "source": {"type": "base64", "media_type": mm, "data": b64_data}})
+        blocks.append({"type": "text", "text": (m.get("content") or "").strip() or "."})
+        if out and out[-1]["role"] == role:
+            out[-1]["content"].extend(blocks)
+        else:
+            out.append({"role": role, "content": blocks})
+    while out and out[0]["role"] != "user":
+        out.pop(0)
+    return out
+
+
+def claude_stream(system_text, history, temp, use_image):
+    """Claude (Haiku) থেকে স্ট্রিম করে টেক্সট দেয়। ব্যর্থ হলে RuntimeError (কলার ফলব্যাক করে)"""
+    max_out = 8000 if is_app_mode else CLAUDE_OUT.get(st.session_state.get("response_detail", "সাধারণ"), 4000)
+    body = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": max_out,
+        "system": system_text,
+        "messages": claude_messages(history, use_image),
+        "temperature": min(max(float(temp), 0.0), 1.0),
+        "stream": True,
+    }
+    headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    r = None
+    for attempt in range(3):
+        r = requests.post(CLAUDE_URL, headers=headers, json=body, stream=True, timeout=(10, 180))
+        if r.status_code == 400 and "temperature" in body and "temperature" in r.text.lower():
+            body.pop("temperature")  # কোনো মডেল temperature না নিলে ছাড়াই চেষ্টা
+            r.close()
+            continue
+        if r.status_code in (429, 500, 502, 503, 529) and attempt < 2:
+            r.close()
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        break
+    if r.status_code != 200:
+        try:
+            msg = (r.json().get("error") or {}).get("message") or r.text[:200]
+        except Exception:
+            msg = r.text[:200]
+        raise RuntimeError(f"Claude API {r.status_code}: {msg}")
+    got = False
+    for line in r.iter_lines(decode_unicode=False):
+        if not line or not line.startswith(b"data:"):
+            continue
+        try:
+            ev = json.loads(line[5:].decode("utf-8").strip())
+        except Exception:
+            continue
+        kind = ev.get("type")
+        if kind == "content_block_delta":
+            d = ev.get("delta") or {}
+            if d.get("type") == "text_delta" and d.get("text"):
+                got = True
+                yield d["text"]
+        elif kind == "error":
+            raise RuntimeError(f"Claude: {(ev.get('error') or {}).get('message', 'unknown error')}")
+        elif kind == "message_stop":
+            break
+    if not got:
+        raise RuntimeError("Claude কোনো উত্তর দেয়নি")
 
 
 def _gemini_image_call(parts, image_config=None):
@@ -2398,11 +2507,12 @@ with st.sidebar:
     st.divider()
     app_mode = st.radio(
         "কাজের ধরন (Mode):",
-        ["💬 সাধারণ চ্যাট", "📦 WordPress JSON তৈরি", "🔌 WordPress Agent", "🎨 ছবি তৈরি"],
+        ["💬 সাধারণ চ্যাট", "📦 WordPress JSON তৈরি", "🔌 WordPress Agent", "📱 অ্যাপ বিল্ডার", "🎨 ছবি তৈরি"],
     )
     is_json_mode = app_mode.startswith("📦")
     is_agent_mode = app_mode.startswith("🔌")
     is_image_mode = app_mode.startswith("🎨")
+    is_app_mode = app_mode.startswith("📱")
 
     if app_mode.startswith("💬"):
         with st.expander("🎭 AI-এর ভূমিকা (Persona)", expanded=False):
@@ -2442,7 +2552,7 @@ with st.sidebar:
             "Creativity (temperature)",
             0.0,
             1.0,
-            0.4 if (is_json_mode or is_agent_mode) else 0.7,
+            0.4 if (is_json_mode or is_agent_mode) else (0.5 if is_app_mode else 0.7),
             0.05,
             key=f"temp_{app_mode}",
         )
@@ -2463,13 +2573,20 @@ with st.sidebar:
 
         size_key = st.selectbox("ছবির সাইজ:", list(IMAGE_SIZES))
         image_quality = st.selectbox("ছবির কোয়ালিটি (OpenAI):", IMAGE_QUALITIES)
+        _claude_label = f"Claude ({CLAUDE_MODEL})"
+        _engines = ["Groq (দ্রুত)"]
         if GEMINI_API_KEY:
+            _engines.append("Gemini (বড় ফাইল, ভালো ছবি-বোঝা)")
+        if ANTHROPIC_API_KEY:
+            _engines.append(_claude_label)
+        if len(_engines) > 1:
             engine_choice = st.selectbox(
-                "🧠 AI ইঞ্জিন (চ্যাট ও JSON):",
-                ["Groq (দ্রুত)", "Gemini (বড় ফাইল, ভালো ছবি-বোঝা)"],
+                "🧠 AI ইঞ্জিন (চ্যাট ও JSON):", _engines,
+                index=_engines.index(_claude_label) if ANTHROPIC_API_KEY else 0,
+                key="engine_choice_sel",
             )
         else:
-            engine_choice = "Groq (দ্রুত)"
+            engine_choice = _engines[0]
 
     use_search = False
     if app_mode.startswith("💬"):
@@ -2671,6 +2788,8 @@ def build_system_instruction(cap=None):
         base = AGENT_PROMPT
     elif is_json_mode:
         base = ELEMENTOR_PROMPT
+    elif is_app_mode:
+        base = APP_BUILDER_PROMPT
     elif last_msg_has_image():
         base = VISION_PROMPT
     else:
@@ -2678,7 +2797,7 @@ def build_system_instruction(cap=None):
 
     base = base + f"\n\nToday's date: {date.today().isoformat()}."
 
-    if not is_json_mode:  # JSON মোডে শুধু JSON আউটপুট দরকার, তাই মেমোরি বাদ
+    if not (is_json_mode or is_app_mode):  # JSON মোডে শুধু JSON আউটপুট দরকার, তাই মেমোরি বাদ
         mems = _db_safe(db_get_memories, default=[]) or []
         if mems:
             mem_lines = "\n".join(f"- {fact}" for _, fact in mems)[:MEMORY_MAX_CHARS]
@@ -2751,6 +2870,24 @@ def render_preview(page, height=520):
         '<iframe sandbox="allow-scripts allow-forms allow-modals allow-popups" '
         f'srcdoc="{inner}" style="width:100%;height:{height - 10}px;border:1px solid #444;'
         'border-radius:10px;background:#fff"></iframe>',
+        height=height,
+    )
+
+
+def render_app_preview(page, phone=True, height=800):
+    """জেনারেট করা অ্যাপ ফোনের ফ্রেমে (বা ডেস্কটপ সাইজে) চালায়; sandbox-এ, তাই অ্যাপের ডেটায় হাত দিতে পারে না"""
+    import html as _html
+    inner = _html.escape(page, quote=True)
+    if phone:
+        style = (f"width:390px;max-width:100%;height:{height - 40}px;border:10px solid #1c1c1e;"
+                 "border-radius:42px;background:#fff;box-shadow:0 12px 40px rgba(0,0,0,.35)")
+        wrap = "display:flex;justify-content:center;padding:6px 0"
+    else:
+        style = (f"width:100%;height:{height - 40}px;border:1px solid #444;border-radius:12px;background:#fff")
+        wrap = "padding:6px 0"
+    components.html(
+        f'<div style="{wrap}"><iframe sandbox="allow-scripts allow-forms allow-modals allow-popups" '
+        f'srcdoc="{inner}" style="{style}"></iframe></div>',
         height=height,
     )
 
@@ -2917,7 +3054,19 @@ def render_message(m, idx):
         preview_page = build_preview_html(m["content"])
         if preview_page:
             pk = f"{st.session_state.current}_{idx}"
-            if st.toggle("▶ লাইভ প্রিভিউ দেখুন", key=f"prev_{pk}"):
+            if is_app_mode and idx == len(cur()["messages"]) - 1:
+                _dev = st.radio("ডিভাইস", ["📱 মোবাইল", "💻 ডেস্কটপ"], horizontal=True,
+                                key=f"dev_{pk}", label_visibility="collapsed")
+                render_app_preview(preview_page, phone=_dev.startswith("📱"))
+                st.download_button(
+                    "⬇️ অ্যাপ ডাউনলোড (.html)",
+                    data=preview_page.encode("utf-8"),
+                    file_name=f"my-app-{idx}.html",
+                    mime="text/html",
+                    key=f"appdl_{pk}",
+                    help="ফাইলটি Netlify Drop / GitHub Pages-এ আপলোড করলেই অ্যাপ লাইভ হবে",
+                )
+            elif st.toggle("▶ লাইভ প্রিভিউ দেখুন", key=f"prev_{pk}"):
                 render_preview(preview_page)
                 st.download_button(
                     "⬇️ প্রিভিউ পেজ (.html)",
@@ -2929,8 +3078,14 @@ def render_message(m, idx):
 
 
 def pick_engine():
-    if not GEMINI_API_KEY or is_agent_mode:
+    if is_agent_mode:
         return "groq"
+    if ANTHROPIC_API_KEY and engine_choice.startswith("Claude"):
+        return "claude"
+    if not GEMINI_API_KEY:
+        return "groq"
+    if is_app_mode:
+        return "gemini"  # পুরো অ্যাপের কোড লম্বা, Gemini-তে সীমা বেশি
     msgs = cur().get("messages") or []
     history_chars = sum(len(m.get("content", "")) for m in msgs[-MAX_HISTORY:])
     if last_msg_has_image() or engine_choice.startswith("Gemini") or (total_file_chars() + history_chars) > 10000:
@@ -2994,7 +3149,7 @@ def stream_reply(model, messages, temp):
         model=model,
         messages=messages,
         temperature=temp,
-        max_tokens={"সংক্ষিপ্ত": 1200, "সাধারণ": GROQ_MAX_OUT, "বিস্তারিত": 4000}.get(
+        max_tokens=APP_MAX_OUT if is_app_mode else {"সংক্ষিপ্ত": 1200, "সাধারণ": GROQ_MAX_OUT, "বিস্তারিত": 4000}.get(
             st.session_state.get("response_detail", "সাধারণ"), GROQ_MAX_OUT
         ),
         stream=True,
@@ -3008,7 +3163,20 @@ def get_history():
     history = cur()["messages"][-MAX_HISTORY:]
     while history and history[0]["role"] != "user":
         history = history[1:]
+    if is_app_mode:
+        history = compact_app_history(history)
     return history
+
+
+def compact_app_history(history):
+    """অ্যাপ বিল্ডারে শুধু সর্বশেষ ভার্সনের কোড রাখে, আগের ভার্সনের কোড বাদ দেয় (টোকেন বাঁচাতে)"""
+    last_a = max((i for i, m in enumerate(history) if m["role"] == "assistant"), default=-1)
+    out = []
+    for i, m in enumerate(history):
+        if m["role"] == "assistant" and i != last_a:
+            m = dict(m, content=re.sub(r"```.*?```", "[আগের ভার্সনের কোড বাদ]", m.get("content", ""), flags=re.S))
+        out.append(m)
+    return out
 
 
 def build_api_messages(history, system_text, use_vision):
@@ -3064,6 +3232,9 @@ def resolve_intent(last_user):
     if force == "chat":
         return "vision" if has_image else "chat"
 
+    if is_app_mode:
+        return "vision" if has_image else "chat"
+
     followup = (
         not has_image
         and HAS_EDIT
@@ -3089,6 +3260,8 @@ if is_agent_mode:
     placeholder = "যেমন: একটি dark theme architecture Home page বানাও..."
 elif is_json_mode:
     placeholder = "যেমন: একটি মডার্ন Hero Section এর Elementor JSON তৈরি করো..."
+elif is_app_mode:
+    placeholder = "অ্যাপের আইডিয়া লিখুন — যেমন: বাজেট ট্র্যাকার অ্যাপ, ডার্ক থিম, চার্টসহ..."
 elif is_image_mode:
     placeholder = "ছবির বর্ণনা লিখুন, অথবা ছবি দিয়ে কী বদলাতে চান লিখুন..."
 else:
@@ -3167,7 +3340,7 @@ st.markdown(
     "<div class='app-bar'>"
     f"<img class='app-logo' src='data:image/png;base64,{LOGO_B64}' alt='logo'/>"
     "<div class='app-text'><div class='app-title'>Personal AI Studio</div>"
-    "<div class='app-sub'>Chat · Vision · Image Studio · WordPress</div></div>"
+    "<div class='app-sub'>Chat · Vision · Image Studio · App Builder · WordPress</div></div>"
     + _gh_html + "</div>",
     unsafe_allow_html=True,
 )
@@ -3355,7 +3528,17 @@ if st.session_state.pending:
                         search_block += links_block
 
                     stream = None
-                    if pick_engine() == "gemini" or (GEMINI_API_KEY and len(links_block) > 6000):
+                    claude_failed = False
+                    if pick_engine() == "claude":
+                        try:
+                            stream = _prime(claude_stream(
+                                build_system_instruction(CLAUDE_FILE_LIMIT) + search_block,
+                                history, temp_eff, use_vision,
+                            ))
+                        except Exception as e:
+                            claude_failed = True
+                            st.warning(f"⚠️ Claude ব্যর্থ ({_short(e)}), অন্য ইঞ্জিন দিয়ে উত্তর দেওয়া হচ্ছে।")
+                    if stream is None and (pick_engine() == "gemini" or (GEMINI_API_KEY and (claude_failed or len(links_block) > 6000))):
                         try:
                             stream = _prime(gemini_stream(
                                 build_system_instruction(MAX_FILE_CHARS) + search_block,
@@ -3366,7 +3549,7 @@ if st.session_state.pending:
 
                     if stream is None:
                         sys_text = build_system_instruction(GROQ_FILE_LIMIT) + search_block
-                        sys_text, g_history, g_trimmed = fit_for_groq(sys_text, history)
+                        sys_text, g_history, g_trimmed = fit_for_groq(sys_text, history, budget=9000 if is_app_mode else GROQ_INPUT_TOKENS)
                         if g_trimmed:
                             st.info("ℹ️ Groq-এর সীমার কারণে ফাইল/আগের চ্যাটের কিছু অংশ বাদ দেওয়া হয়েছে। পুরোটা পড়াতে Gemini ইঞ্জিন বেছে নাও।")
                         has_last_img = bool(g_history and get_msg_images(g_history[-1]))
