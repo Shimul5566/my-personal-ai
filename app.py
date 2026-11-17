@@ -36,7 +36,7 @@ try:
 except Exception:
     _LOGO_PIL = "🤖"
 
-APP_VERSION = "2.4.0"  # Slack logo, centred mic, no empty hero, advanced mobile UI
+APP_VERSION = "2.6.0"  # App Builder: Claude-first engine, truncation-proof preview, Continue button
 
 st.set_page_config(
     page_title="আমার পার্সোনাল AI",
@@ -381,9 +381,25 @@ if not api_key:
 
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY")  # console.anthropic.com থেকে
-CLAUDE_MODEL = get_secret("CLAUDE_MODEL") or "claude-haiku-5-5"
+CLAUDE_MODEL = get_secret("CLAUDE_MODEL") or "claude-fable-5-2"  # সবচেয়ে শক্তিশালী মডেল ডিফল্ট
+# সাইডবারে বেছে নেওয়ার মতো Claude মডেল (শক্তিশালী → দ্রুত)
+CLAUDE_MODELS = {
+    "Fable 5.2 (সবচেয়ে শক্তিশালী)": "claude-fable-5-2",
+    "Opus 5.5 (গভীর চিন্তা)": "claude-opus-5-5",
+    "Sonnet 5.5 (ব্যালান্সড)": "claude-sonnet-5-5",
+    "Haiku 5.5 (সবচেয়ে দ্রুত)": "claude-haiku-5-5",
+}
+# প্রথম মডেল না চললে (অ্যাক্সেস/ওভারলোড) এই ক্রমে পরেরগুলো চেষ্টা হবে
+CLAUDE_FALLBACKS = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
+
+
+def active_claude_model():
+    """সাইডবারের পছন্দ, না থাকলে CLAUDE_MODEL"""
+    return st.session_state.get("claude_model_value") or CLAUDE_MODEL
+
+
 CLAUDE_FILE_LIMIT = 300_000  # Claude-কে পাঠানো ফাইল-টেক্সটের সর্বোচ্চ অক্ষর
-CLAUDE_OUT = {"সংক্ষিপ্ত": 1500, "সাধারণ": 4000, "বিস্তারিত": 8000}
+CLAUDE_OUT = {"সংক্ষিপ্ত": 1500, "সাধারণ": 6000, "বিস্তারিত": 16000}
 GEMINI_MODEL = get_secret("GEMINI_MODEL") or "gemini-3.8-flash"
 GEMINI_IMAGE_MODEL = get_secret("GEMINI_IMAGE_MODEL") or "gemini-nano-banana-2.1"
 GEMINI_IMAGE_FALLBACKS = ("gemini-3.1-flash-image", "gemini-2.5-flash-image")  # প্রথমটি না চললে এগুলো
@@ -496,7 +512,13 @@ TECH RULES:
 - Do NOT use alert()/confirm()/prompt(); build small in-app modals/toasts instead.
 - No external images or API keys. Use emoji, inline SVG, CSS gradients for visuals. No network requests that need authentication.
 - UI text language = the language the user wrote in (Bengali UI if they wrote Bengali). Use a font stack with a Bengali-capable fallback.
-- Keep it compact (aim for under ~450 lines) but polished.
+- OUTPUT BUDGET: the whole reply must fit comfortably in about 9000 tokens. Write clean, compact code:
+  no HTML/CSS/JS comments (at most a few one-line section markers), no long explanations, short class names, CSS variables,
+  small helper functions, lists rendered from JS arrays/templates instead of repeated markup, 3-6 sample items only.
+  Aim for 250-400 lines. Polished, but never bloated.
+- ALWAYS FINISH THE FILE: the code block must end with </script></body></html> and then the closing ``` fence.
+  A complete, simpler app is always better than a bigger app that gets cut off. If the request is large,
+  build the core features first and suggest the rest as next steps.
 
 ITERATING: if there is already an app earlier in the conversation and the user asks for a change, return the FULL UPDATED file
 (not a diff), keeping every existing feature unless told to remove it.
@@ -825,7 +847,7 @@ def gemini_candidates():
 
 
 def _gemini_body(system_text, history, temp, use_image, thinking):
-    gen_cfg = {"temperature": temp, "maxOutputTokens": 8000}
+    gen_cfg = {"temperature": temp, "maxOutputTokens": 16000 if is_app_mode else 8000}
     if thinking:
         gen_cfg["thinkingConfig"] = {"thinkingBudget": 1024}
     return {
@@ -948,29 +970,42 @@ def claude_messages(history, use_image):
 
 
 def claude_stream(system_text, history, temp, use_image):
-    """Claude (Haiku) থেকে স্ট্রিম করে টেক্সট দেয়। ব্যর্থ হলে RuntimeError (কলার ফলব্যাক করে)"""
-    max_out = 8000 if is_app_mode else CLAUDE_OUT.get(st.session_state.get("response_detail", "সাধারণ"), 4000)
+    """Claude থেকে স্ট্রিম করে টেক্সট দেয়। মডেল না চললে নিজে পরের Claude মডেলে যায়; সব ব্যর্থ হলে RuntimeError"""
+    max_out = 16000 if is_app_mode else CLAUDE_OUT.get(st.session_state.get("response_detail", "সাধারণ"), 6000)
     body = {
-        "model": CLAUDE_MODEL,
+        "model": active_claude_model(),
         "max_tokens": max_out,
-        "system": system_text,
+        # প্রম্পট ক্যাশ: লম্বা সিস্টেম প্রম্পট/ফাইল বারবার পাঠালে দ্রুত ও সস্তা
+        "system": [{"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}],
         "messages": claude_messages(history, use_image),
         "temperature": min(max(float(temp), 0.0), 1.0),
         "stream": True,
     }
     headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    models = list(dict.fromkeys([body["model"], *CLAUDE_FALLBACKS]))
     r = None
-    for attempt in range(3):
-        r = requests.post(CLAUDE_URL, headers=headers, json=body, stream=True, timeout=(10, 180))
-        if r.status_code == 400 and "temperature" in body and "temperature" in r.text.lower():
-            body.pop("temperature")  # কোনো মডেল temperature না নিলে ছাড়াই চেষ্টা
+    for mi, model_name in enumerate(models):
+        body["model"] = model_name
+        last_model = mi == len(models) - 1
+        for attempt in range(3):
+            r = requests.post(CLAUDE_URL, headers=headers, json=body, stream=True, timeout=(10, 180))
+            if r.status_code == 400 and "temperature" in body and "temperature" in r.text.lower():
+                body.pop("temperature")  # কোনো মডেল temperature না নিলে ছাড়াই চেষ্টা
+                r.close()
+                continue
+            if r.status_code in (429, 500, 502, 503, 529) and attempt < 2:
+                r.close()
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            break
+        if r.status_code == 200:
+            break
+        # মডেল পাওয়া যাচ্ছে না / অ্যাক্সেস নেই / ওভারলোড → পরের মডেল
+        if not last_model and r.status_code in (400, 403, 404, 429, 500, 502, 503, 529):
             r.close()
-            continue
-        if r.status_code in (429, 500, 502, 503, 529) and attempt < 2:
-            r.close()
-            time.sleep(1.5 * (attempt + 1))
             continue
         break
+    st.session_state["_claude_used"] = body["model"]
     if r.status_code != 200:
         try:
             msg = (r.json().get("error") or {}).get("message") or r.text[:200]
@@ -2573,7 +2608,7 @@ with st.sidebar:
 
         size_key = st.selectbox("ছবির সাইজ:", list(IMAGE_SIZES))
         image_quality = st.selectbox("ছবির কোয়ালিটি (OpenAI):", IMAGE_QUALITIES)
-        _claude_label = f"Claude ({CLAUDE_MODEL})"
+        _claude_label = "Claude"
         _engines = ["Groq (দ্রুত)"]
         if GEMINI_API_KEY:
             _engines.append("Gemini (বড় ফাইল, ভালো ছবি-বোঝা)")
@@ -2587,6 +2622,14 @@ with st.sidebar:
             )
         else:
             engine_choice = _engines[0]
+        if ANTHROPIC_API_KEY and engine_choice.startswith("Claude"):
+            _names = list(CLAUDE_MODELS)
+            _def = next((k for k, v in CLAUDE_MODELS.items() if v == CLAUDE_MODEL), _names[0])
+            _pick = st.selectbox("🤖 Claude মডেল:", _names, index=_names.index(_def), key="claude_model_sel")
+            st.session_state["claude_model_value"] = CLAUDE_MODELS[_pick]
+            _used = st.session_state.get("_claude_used")
+            if _used and _used != CLAUDE_MODELS[_pick]:
+                st.caption(f"⚠️ শেষবার ফলব্যাক হয়েছে: {_used}")
 
     use_search = False
     if app_mode.startswith("💬"):
@@ -2834,21 +2877,130 @@ def extract_json(text):
     return json.dumps(parsed, indent=2, ensure_ascii=False)
 
 
+_FENCE_RE = re.compile(r"```([A-Za-z0-9+#]*)[ \t]*\r?\n(.*?)(?:```|\Z)", re.S)
+_HTML_HINT_RE = re.compile(r"<!doctype\s+html|<html[\s>]", re.I)
+
+
+def _html_blocks(text):
+    """(html_blocks, css_blocks, js_blocks) — শেষের ``` না থাকলেও (কেটে গেলেও) ব্লক ধরে;
+    ``` ছাড়া সরাসরি <!DOCTYPE html>/<html> থাকলে সেটাও ধরে"""
+    text = text or ""
+    html_b, css_b, js_b = [], [], []
+    for lang, c in _FENCE_RE.findall(text):
+        l = lang.lower()
+        if l in ("html", "htm") or (l == "" and _HTML_HINT_RE.search(c[:800])):
+            html_b.append(c)
+        elif l == "css":
+            css_b.append(c)
+        elif l in ("js", "javascript"):
+            js_b.append(c)
+    if not html_b:
+        m = re.search(r"^[ \t]*(?:<!doctype\s+html|<html[\s>])", text, re.I | re.M)
+        if m:
+            raw = text[m.start():]
+            ends = list(re.finditer(r"</html\s*>", raw, re.I))
+            html_b.append(raw[: ends[-1].end()] if ends else raw)
+    return html_b, css_b, js_b
+
+
+def app_html_incomplete(text):
+    """জেনারেট হওয়া HTML অসম্পূর্ণ (</html> নেই বা ```html ব্লক খোলা) কিনা"""
+    html_b, _, _ = _html_blocks(text)
+    if not html_b:
+        return False
+    page = "\n".join(html_b)
+    if _HTML_HINT_RE.search(page) and not re.search(r"</html\s*>", page, re.I):
+        return True
+    return bool(re.search(r"```[ \t]*html?[ \t]*\r?\n", text or "", re.I)) and (text or "").count("```") % 2 == 1
+
+
+def _close_js(js):
+    """কেটে যাওয়া JS-এর খোলা স্ট্রিং/কমেন্ট/ব্র্যাকেট বন্ধ করে (best effort)"""
+    pairs = {"{": "}", "(": ")", "[": "]"}
+    stack, quote, i, n = [], None, 0, len(js)
+    line_c = block_c = False
+    while i < n:
+        c, nx = js[i], js[i + 1] if i + 1 < n else ""
+        if line_c:
+            line_c = c != "\n"
+        elif block_c:
+            if c == "*" and nx == "/":
+                block_c = False
+                i += 1
+        elif quote:
+            if c == "\\":
+                i += 1
+            elif c == quote or (c == "\n" and quote != "`"):
+                quote = None
+        elif c in "'\"`":
+            quote = c
+        elif c == "/" and nx == "/":
+            line_c = True
+            i += 1
+        elif c == "/" and nx == "*":
+            block_c = True
+            i += 1
+        elif c in pairs:
+            stack.append(pairs[c])
+        elif c in ")]}" and stack and stack[-1] == c:
+            stack.pop()
+        i += 1
+    out = ""
+    if block_c:
+        out += "*/"
+    if quote:
+        out += quote
+    return out + "".join(reversed(stack))
+
+
+def _repair_truncated_html(code):
+    """কেটে যাওয়া HTML-এ অসমাপ্ত ট্যাগ বাদ দিয়ে </script>, </style>, </body>, </html> বসায়"""
+    try:
+        code = code.rstrip()
+        last = None
+        for tag in ("script", "style"):
+            opens = list(re.finditer(rf"<{tag}\b[^>]*>", code, re.I))
+            closes = len(re.findall(rf"</{tag}\s*>", code, re.I))
+            if opens and len(opens) > closes and (last is None or opens[-1].start() > last[1].start()):
+                last = (tag, opens[-1])
+        if last:
+            tag, mo = last
+            head, body = code[: mo.end()], code[mo.end():]
+            body = body[: body.rfind("\n")] if "\n" in body else ""  # শেষের অর্ধেক লাইন বাদ
+            fix = _close_js(body) if tag == "script" else "}" * max(body.count("{") - body.count("}"), 0)
+            code = f"{head}{body}\n{fix}\n</{tag}>"
+        else:
+            lt = code.rfind("<")
+            if lt > code.rfind(">"):
+                code = code[:lt]  # অসমাপ্ত ট্যাগ
+        if re.search(r"<head\b", code, re.I) and not re.search(r"</head\s*>", code, re.I):
+            code += "\n</head>"
+        if not re.search(r"<body\b", code, re.I):
+            code += "\n<body>"
+        if not re.search(r"</body\s*>", code, re.I):
+            code += "\n</body>"
+        if not re.search(r"</html\s*>", code, re.I):
+            code += "\n</html>"
+    except Exception:
+        pass
+    return code
+
+
 def build_preview_html(text):
-    """উত্তরের ```html / ```css / ```js কোড ব্লক জুড়ে একটি চলার মতো HTML পেজ বানায় (না থাকলে None)"""
-    blocks = re.findall(r"```([A-Za-z0-9+#]*)[ \t]*\n(.*?)```", text or "", re.S)
-    html_b = [c for lang, c in blocks if lang.lower() in ("html", "htm")]
-    css_b = [c for lang, c in blocks if lang.lower() == "css"]
-    js_b = [c for lang, c in blocks if lang.lower() in ("js", "javascript")]
+    """উত্তর থেকে চলার মতো HTML পেজ বানায়। ```html ব্লক বন্ধ না থাকলেও, ``` ছাড়া raw <!DOCTYPE html> থাকলেও,
+    এবং কোড মাঝপথে কেটে গেলেও (</script></body></html> নিজে বসিয়ে) কাজ করে। কিছু না পেলে None"""
+    html_b, css_b, js_b = _html_blocks(text)
     if not html_b:
         return None
     page = "\n".join(html_b)
-    if not re.search(r"<html|<!doctype", page, re.I):
+    if not _HTML_HINT_RE.search(page):
         page = (
             "<!doctype html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1'></head>"
             f"<body>{page}</body></html>"
         )
+    elif not re.search(r"</html\s*>", page, re.I):
+        page = _repair_truncated_html(page)
     css_new = [c for c in css_b if c.strip() and c.strip() not in page]
     js_new = [c for c in js_b if c.strip() and c.strip() not in page]
     if css_new:  # আলাদা style.css লিংক সরিয়ে কোড সরাসরি বসাই
@@ -2997,6 +3149,14 @@ def render_message(m, idx):
                 key=f"img_{st.session_state.current}_{idx}",
             )
     if m["role"] == "assistant":
+        if (
+            is_app_mode
+            and idx == len(cur()["messages"]) - 1
+            and not st.session_state.pending
+            and app_html_incomplete(m["content"])
+        ):
+            st.warning("⚠️ কোড অসম্পূর্ণ মনে হচ্ছে (আউটপুট লিমিটে কেটে গেছে)। নিচের প্রিভিউ আপাতত অটো-মেরামত করা; পুরোটার জন্য Continue চাপো।")
+            st.button("⏩ বাকি কোড সম্পূর্ণ করো (Continue)", key=f"cont_{st.session_state.current}_{idx}", on_click=continue_cb)
         json_data = extract_json(m["content"])
         if json_data:
             st.download_button(
@@ -3054,8 +3214,8 @@ def render_message(m, idx):
         preview_page = build_preview_html(m["content"])
         if preview_page:
             pk = f"{st.session_state.current}_{idx}"
-            if is_app_mode and idx == len(cur()["messages"]) - 1:
-                _dev = st.radio("ডিভাইস", ["📱 মোবাইল", "💻 ডেস্কটপ"], horizontal=True,
+            if is_app_mode:
+                _dev = st.radio("ডিভাইস", ["📱 মোবাইল (390px)", "💻 ডেস্কটপ"], horizontal=True,
                                 key=f"dev_{pk}", label_visibility="collapsed")
                 render_app_preview(preview_page, phone=_dev.startswith("📱"))
                 st.download_button(
@@ -3080,18 +3240,105 @@ def render_message(m, idx):
 def pick_engine():
     if is_agent_mode:
         return "groq"
+    if is_app_mode:  # পুরো অ্যাপের কোড লম্বা: Claude (16000) → Gemini (16000) → শেষে Groq
+        if ANTHROPIC_API_KEY:
+            return "claude"
+        return "gemini" if GEMINI_API_KEY else "groq"
     if ANTHROPIC_API_KEY and engine_choice.startswith("Claude"):
         return "claude"
     if not GEMINI_API_KEY:
         return "groq"
-    if is_app_mode:
-        return "gemini"  # পুরো অ্যাপের কোড লম্বা, Gemini-তে সীমা বেশি
     msgs = cur().get("messages") or []
     history_chars = sum(len(m.get("content", "")) for m in msgs[-MAX_HISTORY:])
     if last_msg_has_image() or engine_choice.startswith("Gemini") or (total_file_chars() + history_chars) > 10000:
         return "gemini"
     return "groq"
 
+
+
+APP_CONTINUE_PROMPT = (
+    "Your previous reply was cut off by the output limit. Continue the code EXACTLY where it stopped.\n"
+    "- Start by repeating the last complete line of the cut-off code, then continue from there.\n"
+    "- Do NOT restart the file, do NOT open a new ```html fence, no intro or explanation before the code.\n"
+    "- Keep the code compact (no comments) and finish with </script></body></html> followed by a closing ``` fence,\n"
+    "  then the short feature bullet list.\n"
+    "- If the file was already complete and only the closing ``` fence is missing, output just the closing ``` fence "
+    "and the short bullet list."
+)
+
+
+def merge_app_continuation(prev, cont):
+    """আগের কেটে যাওয়া উত্তর + নতুন অংশ জোড়া লাগায় (ডুপ্লিকেট লাইন/ফেন্স সামলে)"""
+    prev = prev or ""
+    cont = cont or ""
+    code_done = bool(re.search(r"</html\s*>", prev, re.I))
+    if not code_done:
+        cont = re.sub(r"^\s*```[A-Za-z]*[ \t]*\r?\n", "", cont)  # নতুন করে খোলা ফেন্স বাদ
+        if re.match(r"\s*(<!doctype\s+html|<html[\s>])", cont, re.I):  # AI পুরো ফাইল আবার লিখেছে
+            k = max(prev.lower().rfind("<!doctype"), prev.lower().rfind("<html"))
+            return (prev[:k] if k >= 0 else "") + cont.lstrip()
+        tail = prev[-600:]
+        for k in range(min(len(tail), len(cont), 600), 19, -1):  # ওভারল্যাপ বাদ
+            if cont.startswith(tail[-k:]):
+                cont = cont[k:]
+                break
+    if code_done and cont.lstrip().startswith("```") and not prev.endswith("\n"):
+        prev += "\n"
+    merged = prev + cont
+    if merged.count("```") % 2 == 1:  # ফেন্স বন্ধ হয়নি → </html>-এর পরে বন্ধ করি
+        ends = list(re.finditer(r"</html\s*>", merged, re.I))
+        if ends:
+            e = ends[-1].end()
+            merged = merged[:e] + "\n```" + merged[e:]
+    return merged
+
+
+def continue_cb():
+    st.session_state["_continue_app"] = True
+    st.session_state.pending = True
+
+
+def open_app_stream(history):
+    """Continue-এর জন্য ইঞ্জিন বাছাই: Claude → Gemini → Groq"""
+    temp = min(float(temperature), 0.5)
+    if ANTHROPIC_API_KEY:
+        try:
+            return _prime(claude_stream(build_system_instruction(CLAUDE_FILE_LIMIT), history, temp, False))
+        except Exception as e:
+            st.warning(f"⚠️ Claude ব্যর্থ ({_short(e)}), অন্য ইঞ্জিন দিয়ে চেষ্টা হচ্ছে।")
+    if GEMINI_API_KEY:
+        try:
+            return _prime(gemini_stream(build_system_instruction(MAX_FILE_CHARS), history, temp, False))
+        except Exception as e:
+            st.warning(f"⚠️ Gemini ব্যর্থ ({_short(e)}), Groq দিয়ে চেষ্টা হচ্ছে।")
+    sys_text, g_history, _ = fit_for_groq(build_system_instruction(GROQ_FILE_LIMIT), history, budget=9000)
+    if len(g_history) < 2:
+        raise RuntimeError("Groq-এর সীমায় আগের কোড ধরছে না। Continue-এর জন্য Claude বা Gemini key সেট করো।")
+    return stream_reply(selected_model, build_api_messages(g_history, sys_text, False), temp)
+
+
+def run_app_continue():
+    """সর্বশেষ কেটে যাওয়া অ্যাপ-কোডের বাকি অংশ লিখিয়ে একই মেসেজে জুড়ে দেয়"""
+    st.session_state.pop("_continue_app", None)
+    msgs = cur()["messages"]
+    prev = msgs[-1]["content"]
+    history = get_history() + [{"role": "user", "content": APP_CONTINUE_PROMPT}]
+    ok = False
+    with st.chat_message("assistant"):
+        try:
+            with st.spinner("⏩ বাকি কোড লেখা হচ্ছে..."):
+                cont = "".join(open_app_stream(history))
+            if not cont.strip():
+                raise RuntimeError("AI কোনো নতুন কোড দেয়নি, আবার চেষ্টা করো।")
+            merged = merge_app_continuation(prev, cont)
+            pop_message()
+            push_message({"role": "assistant", "content": merged})
+            ok = True
+        except Exception as e:
+            st.error(friendly_error(e))
+    st.session_state.pending = False
+    if ok:
+        st.rerun()
 
 
 def est_tokens(s):
@@ -3450,7 +3697,9 @@ for idx, m in enumerate(messages):
 
 # ---------- উত্তর তৈরি ----------
 if st.session_state.pending:
-    if not messages or messages[-1]["role"] != "user":
+    if st.session_state.get("_continue_app") and messages and messages[-1]["role"] == "assistant":
+        run_app_continue()
+    elif not messages or messages[-1]["role"] != "user":
         st.session_state.pending = False
     else:
         last_user = messages[-1]
