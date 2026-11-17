@@ -14,6 +14,9 @@ import ipaddress
 import time
 import urllib.parse
 import zipfile
+import shutil
+import subprocess
+import tempfile
 from contextlib import contextmanager
 from datetime import date
 from html.parser import HTMLParser
@@ -36,9 +39,24 @@ try:
 except Exception:
     _LOGO_PIL = "🤖"
 
-APP_VERSION = "2.7.0"  # Performance monitor, SVG branding, live editor, photo-ready builder
+# Crisp vector logo (blue → purple glow). LOGO_B64 stays only as the page_icon fallback.
+LOGO_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">'
+    '<defs>'
+    '<linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient>'
+    '<radialGradient id="bg" cx=".3" cy=".25" r="1"><stop offset="0" stop-color="#1e293b"/><stop offset="1" stop-color="#0b1020"/></radialGradient>'
+    '<filter id="glow" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="2.2" result="b"/>'
+    '<feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>'
+    '</defs>'
+    '<rect x="3" y="3" width="58" height="58" rx="16" fill="url(#bg)" stroke="url(#g)" stroke-width="2"/>'
+    '<g filter="url(#glow)">'
+    '<path d="M32 12C33.5 24 38 28.5 50 30C38 31.5 33.5 36 32 48C30.5 36 26 31.5 14 30C26 28.5 30.5 24 32 12Z" fill="url(#g)"/>'
+    '<path d="M47 41C47.6 45.4 49.1 46.9 53.5 47.5C49.1 48.1 47.6 49.6 47 54C46.4 49.6 44.9 48.1 40.5 47.5C44.9 46.9 46.4 45.4 47 41Z" fill="url(#g)" opacity=".9"/>'
+    '</g></svg>'
+)
+LOGO_SVG_URI = "data:image/svg+xml;base64," + base64.b64encode(LOGO_SVG.encode("utf-8")).decode()
 
-LOGO_SVG = """<svg class='app-logo' viewBox='0 0 64 64' role='img' aria-label='Personal AI Studio' xmlns='http://www.w3.org/2000/svg'><defs><linearGradient id='pas-g' x1='0' y1='0' x2='1' y2='1'><stop stop-color='#60a5fa'/><stop offset='1' stop-color='#8b5cf6'/></linearGradient><filter id='pas-glow' x='-60%' y='-60%' width='220%' height='220%'><feGaussianBlur stdDeviation='3' result='b'/><feMerge><feMergeNode in='b'/><feMergeNode in='SourceGraphic'/></feMerge></filter></defs><rect x='5' y='5' width='54' height='54' rx='17' fill='#172033' stroke='url(#pas-g)' stroke-width='2'/><path d='M20 42V22h11a8 8 0 0 1 0 16h-4' fill='none' stroke='url(#pas-g)' stroke-width='5' stroke-linecap='round' stroke-linejoin='round' filter='url(#pas-glow)'/><path d='M39 22v20m0-10h7' fill='none' stroke='#c4b5fd' stroke-width='4' stroke-linecap='round'/><circle cx='47' cy='17' r='3' fill='#60a5fa'/></svg>"""
+APP_VERSION = "2.7.0"  # Perf badge, SVG logo, live code editor, Unsplash photos, Video & Audio Studio
 
 st.set_page_config(
     page_title="আমার পার্সোনাল AI",
@@ -285,11 +303,10 @@ st.markdown(
 
     /* ===== v2.4: app bar, centred mic, advanced mobile ===== */
     .app-bar { display:flex; align-items:center; gap:12px; margin:0 0 1.1rem 0; }
-    .app-bar .app-logo { width:40px; height:40px; object-fit:contain; flex:none; filter:drop-shadow(0 0 12px rgba(96,165,250,.28)); }
-    .sidebar-brand { display:flex; align-items:center; gap:10px; font-weight:750; font-size:1.02rem; margin:0 0 1rem 0; }
-    .sidebar-brand .app-logo { width:36px; height:36px; filter:drop-shadow(0 0 10px rgba(139,92,246,.3)); }
+    .app-bar .app-logo { width:42px; height:42px; object-fit:contain; flex:none; filter:drop-shadow(0 0 10px rgba(96,165,250,.45)) drop-shadow(0 0 18px rgba(139,92,246,.35)); }
     .app-bar .app-text { min-width:0; flex:1; }
-    .app-bar .app-title { font-size:1.15rem; font-weight:750; letter-spacing:.1px; line-height:1.2; color:#ececec; }
+    .app-bar .app-title { font-size:1.15rem; font-weight:750; letter-spacing:.1px; line-height:1.2; color:#ececec;
+        background:linear-gradient(90deg,#60a5fa,#8b5cf6); -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; }
     .app-bar .app-sub { font-size:.78rem; color:#9caec4; margin-top:2px; }
     .app-bar .gh-fallback { display:none; flex:none; width:38px; height:38px; border-radius:11px; align-items:center; justify-content:center;
         background:rgba(38,52,73,.9); border:1px solid #3d4d66; }
@@ -297,6 +314,13 @@ st.markdown(
     /* mic stays hidden until the script has centred it inside the composer (safety net: shows after 1.4s anyway) */
     [data-testid="stAudioInput"] { opacity:0; animation:micshow .01s linear 1.4s forwards; }
     @keyframes micshow { to { opacity:1; } }
+    .side-brand { display:flex; align-items:center; gap:10px; margin:0 0 .7rem 0; }
+    .side-brand img { width:34px; height:34px; flex:none; filter:drop-shadow(0 0 8px rgba(96,165,250,.55)); }
+    .side-brand span { font-size:1.35rem; font-weight:750; background:linear-gradient(90deg,#60a5fa,#8b5cf6);
+        -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent !important; }
+    .perf-badge { display:inline-block; margin:.35rem 0 .15rem 0; padding:2px 11px; border-radius:999px; font-size:.74rem;
+        color:#8b9bb3 !important; background:rgba(96,165,250,.07); border:1px solid rgba(96,165,250,.18);
+        font-variant-numeric:tabular-nums; }
 
     @media (max-width:700px) {
         html, body, .stApp { overflow-x:hidden !important; -webkit-tap-highlight-color:transparent; }
@@ -514,8 +538,25 @@ TECH RULES:
   Seed it with realistic sample data so the first screen is never empty.
 - Persist data with localStorage inside try/catch and fall back to in-memory state (the preview sandbox may block storage).
 - Do NOT use alert()/confirm()/prompt(); build small in-app modals/toasts instead.
-- Use real, high-quality photography for restaurants, e-commerce, travel, food, products, hotels, and portfolios. Prefer direct, stable Unsplash image URLs in the form https://images.unsplash.com/photo-... with useful width/quality parameters (for example ?auto=format&fit=crop&w=1200&q=85). Never use images.unsplash.com/photo- without a real photo identifier; do not invent a URL if uncertain. Use multiple relevant photos, descriptive alt text, loading="lazy", and object-fit:cover. Every image MUST have an onerror handler that replaces it with a tasteful CSS gradient/emoji fallback (avoid infinite error loops by hiding the failed img and showing its sibling fallback). Keep inline SVG/CSS gradients/emoji as supporting visuals, not the only visuals when photography fits.
-- Images are optional enhancement: the app must remain attractive and fully usable if Unsplash is unavailable. Do not require API keys or authentication.
+- No API keys and no authenticated network requests.
+- REAL PHOTOS: for restaurant/food, e-commerce/shop, travel/hotel, real-estate, portfolio/agency, blog/news, fitness, music/events apps
+  use real high-quality Unsplash photos so the app looks like a production app, not an emoji demo. Use direct image URLs only:
+  https://images.unsplash.com/photo-<ID>?auto=format&fit=crop&w=600&q=70   (w=400-700 for cards/thumbs, w=1200 for hero banners).
+  Never use source.unsplash.com (shut down) and never invent other hosts. Prefer these known photo IDs (pick the ones that fit):
+  food: 1504674900247-0877df9cc836, 1546069901-ba9599a7e63c, 1565299624946-b28f40a0ae38, 1567620905732-2d1ec7ab7445, 1555939594-58d7cb561ad1,
+  1512621776951-a57141f2eefd, 1414235077428-338989a2e8c0, 1482049016688-2d3e1b311543; restaurant/cafe: 1517248135467-4c7edcad34c4, 1495474472287-4d71bcdd2085;
+  travel: 1507525428034-b723cf961d3e, 1476514525535-07fb3b4ae5f1, 1469854523086-cc02fe5d8800, 1502602898657-3e91760cbb34, 1506905925346-21bda4d32df4, 1500530855697-b586d89ba3ee;
+  shop/products: 1523275335684-37898b6baf30, 1505740420928-5e560c06d30e, 1542291026-7eec264c27ff, 1572635196237-14b3f281503f, 1526170375885-4d8ecf77b99f, 1441986300917-64674bd600d8;
+  portfolio/tech/people: 1498050108023-c5249f4df085, 1517694712202-14dd9538aa97, 1522202176988-66273c2fd55f, 1507003211169-0a1dd7228f2d, 1494790108377-be9c29b29330, 1438761681033-6461ffad8d80;
+  fitness: 1534438327276-14e5300c3a48, 1571019613454-1cb2f99b2d8b; real-estate: 1600585154340-be6161a56a0c, 1502672260266-1c1ef2d93688; events: 1493225457124-a3eb161ffa5f.
+  (Each ID is used after "photo-", e.g. https://images.unsplash.com/photo-1504674900247-0877df9cc836?auto=format&fit=crop&w=600&q=70.)
+  EVERY photo MUST have a fallback so a broken/blocked URL never shows a broken-image icon: wrap it as
+  <div class="ph" data-e="🍕"><img src="URL" alt="short alt" loading="lazy" onerror="this.remove()"></div> with CSS
+  .ph{position:relative;display:grid;place-items:center;overflow:hidden;background:linear-gradient(135deg,#60a5fa,#8b5cf6)}
+  .ph::before{content:attr(data-e);font-size:2.4rem}  .ph img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  (the gradient + emoji shows while loading or if the image fails). Give .ph a fixed aspect-ratio/height. Use the same markup inside JS templates.
+  Use 4-8 photos total, never as tiny repeated icons, and keep emoji/inline SVG for icons, tab bars and buttons.
+  For apps that do not need photos (trackers, calculators, to-do, games) keep using emoji, inline SVG and CSS gradients only.
 - UI text language = the language the user wrote in (Bengali UI if they wrote Bengali). Use a font stack with a Bengali-capable fallback.
 - OUTPUT BUDGET: the whole reply must fit comfortably in about 9000 tokens. Write clean, compact code:
   no HTML/CSS/JS comments (at most a few one-line section markers), no long explanations, short class names, CSS variables,
@@ -921,6 +962,7 @@ def gemini_stream(system_text, history, temp, use_image):
                                 for part in (cand.get("content") or {}).get("parts", []):
                                     if part.get("text") and not part.get("thought"):
                                         got_text = True
+                                        st.session_state["_gemini_used"] = m_name
                                         yield part["text"]
                     except requests.RequestException as e:
                         if got_text:  # অর্ধেক লেখার পর কাটলে আবার শুরু করলে লেখা দ্বিগুণ হবে
@@ -1930,8 +1972,8 @@ def init_db():
         mcols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
         if "images" not in mcols:
             conn.execute("ALTER TABLE messages ADD COLUMN images TEXT")
-        if "metadata" not in mcols:
-            conn.execute("ALTER TABLE messages ADD COLUMN metadata TEXT")
+        if "meta" not in mcols:  # স্পিড/টোকেন ব্যাজের তথ্য (JSON)
+            conn.execute("ALTER TABLE messages ADD COLUMN meta TEXT")
 
 
 def db_list_chats():
@@ -1943,13 +1985,24 @@ def db_list_chats():
 
 def db_load_messages(cid):
     with _db() as conn:
-        rows = conn.execute(
-            "SELECT role, content, attachment, image, mime, force, images, metadata FROM messages WHERE chat_id = ? ORDER BY id ASC",
-            (cid,),
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                "SELECT role, content, attachment, image, mime, force, images, meta FROM messages WHERE chat_id = ? ORDER BY id ASC",
+                (cid,),
+            ).fetchall()
+        except Exception:  # meta কলাম এখনো নেই: পুরনো কোয়েরি
+            rows = [tuple(r) + (None,) for r in conn.execute(
+                "SELECT role, content, attachment, image, mime, force, images FROM messages WHERE chat_id = ? ORDER BY id ASC",
+                (cid,),
+            ).fetchall()]
     out = []
-    for role, content, attachment, image, mime, force, images_json, metadata_json in rows:
+    for role, content, attachment, image, mime, force, images_json, meta_json in rows:
         m = {"role": role, "content": content}
+        if meta_json:
+            try:
+                m["meta"] = json.loads(meta_json)
+            except Exception:
+                pass
         if attachment:
             m["attachment"] = attachment
         if image:
@@ -1961,11 +2014,6 @@ def db_load_messages(cid):
         if images_json:
             try:
                 m["images"] = json.loads(images_json)
-            except Exception:
-                pass
-        if metadata_json:
-            try:
-                m.update(json.loads(metadata_json))
             except Exception:
                 pass
         out.append(m)
@@ -2009,6 +2057,16 @@ def _persist_file_text(text):
 
 
 def db_add_message(cid, chat, msg):
+    """meta সেভ ব্যর্থ হলে (পুরনো স্কিমা) meta ছাড়াই মেসেজ সেভ করে — চ্যাট কখনো হারায় না"""
+    try:
+        return _db_add_message_impl(cid, chat, msg, True)
+    except Exception:
+        if msg.get("meta"):
+            return _db_add_message_impl(cid, chat, msg, False)
+        raise
+
+
+def _db_add_message_impl(cid, chat, msg, with_meta):
     msg = _persist_msg(msg)
     ft = _persist_file_text(chat.get("file_text"))
     sigs = st.session_state.setdefault("_ft_sigs", {}) if USE_TURSO else {}
@@ -2042,14 +2100,20 @@ def db_add_message(cid, chat, msg):
             )
             if USE_TURSO:
                 sigs[cid] = sig
-        conn.execute(
-            "INSERT INTO messages (chat_id, role, content, attachment, image, mime, force, images, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                cid, msg["role"], msg["content"], msg.get("attachment"), msg.get("image"), msg.get("mime"),
-                msg.get("force"), json.dumps(msg["images"]) if msg.get("images") else None,
-                json.dumps({k: msg[k] for k in ("model_used", "generation_seconds", "approx_tokens") if k in msg}),
-            ),
+        _vals = (
+            cid, msg["role"], msg["content"], msg.get("attachment"), msg.get("image"), msg.get("mime"),
+            msg.get("force"), json.dumps(msg["images"]) if msg.get("images") else None,
         )
+        if with_meta:
+            conn.execute(
+                "INSERT INTO messages (chat_id, role, content, attachment, image, mime, force, images, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _vals + (json.dumps(msg["meta"]) if msg.get("meta") else None,),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO messages (chat_id, role, content, attachment, image, mime, force, images) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                _vals,
+            )
 
 
 def db_pop_last_message(cid):
@@ -2495,7 +2559,10 @@ def code_project(content):
 
 # ---------- সাইডবার ----------
 with st.sidebar:
-    st.markdown("<div class='sidebar-brand'>" + LOGO_SVG + "<span>Personal AI Studio</span></div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='side-brand'><img src='{LOGO_SVG_URI}' alt='logo'/><span>আমার AI</span></div>",
+        unsafe_allow_html=True,
+    )
     if st.button("➕ নতুন চ্যাট", key="new_chat_btn"):
         new_chat()
         st.rerun()
@@ -2555,12 +2622,13 @@ with st.sidebar:
     st.divider()
     app_mode = st.radio(
         "কাজের ধরন (Mode):",
-        ["💬 সাধারণ চ্যাট", "📦 WordPress JSON তৈরি", "🔌 WordPress Agent", "📱 অ্যাপ বিল্ডার", "🎨 ছবি তৈরি"],
+        ["💬 সাধারণ চ্যাট", "📦 WordPress JSON তৈরি", "🔌 WordPress Agent", "📱 অ্যাপ বিল্ডার", "🎨 ছবি তৈরি", "🎬 ভিডিও স্টুডিও"],
     )
     is_json_mode = app_mode.startswith("📦")
     is_agent_mode = app_mode.startswith("🔌")
     is_image_mode = app_mode.startswith("🎨")
     is_app_mode = app_mode.startswith("📱")
+    is_video_mode = app_mode.startswith("🎬")
 
     if app_mode.startswith("💬"):
         with st.expander("🎭 AI-এর ভূমিকা (Persona)", expanded=False):
@@ -3140,12 +3208,29 @@ def text_to_html(md_text, title="AI Answer"):
     ).encode("utf-8")
 
 
+def _reset_app_edit(pk, wk, original):
+    st.session_state[wk] = original
+    rec = st.session_state.get("_app_edits", {}).get(pk)
+    if rec:
+        rec["code"] = original
+
+
 def render_message(m, idx):
     if m.get("attachment"):
         st.caption(f"📎 {m['attachment']}")
     st.markdown(m["content"])
-    if m.get("role") == "assistant" and m.get("generation_seconds") is not None:
-        st.caption(f"⚡ {m.get('model_used', 'AI')} | ⏱️ {float(m.get('generation_seconds', 0)):.1f}s | 🪙 ~{int(m.get('approx_tokens', est_tokens(m.get('content', ''))))} tokens")
+    _meta = m.get("meta") if m["role"] == "assistant" else None
+    if _meta:
+        try:
+            import html as _h
+            st.markdown(
+                "<div class='perf-badge'>⚡ " + _h.escape(str(_meta.get("model", "?")))
+                + f" &nbsp;|&nbsp; ⏱️ {float(_meta.get('secs', 0)):.1f}s"
+                + f" &nbsp;|&nbsp; 🪙 ~{int(_meta.get('tokens', 0)):,} tokens</div>",
+                unsafe_allow_html=True,
+            )
+        except Exception:
+            pass
     imgs = get_msg_images(m)
     if imgs:
         if m["role"] == "user":
@@ -3230,29 +3315,43 @@ def render_message(m, idx):
         if preview_page:
             pk = f"{st.session_state.current}_{idx}"
             if is_app_mode:
-                _vcol, _ecol = st.columns([1.15, 1])
-                with _vcol:
-                    _dev = st.radio("ডিভাইস", ["📱 মোবাইল (390px)", "💻 ডেস্কটপ"], horizontal=True,
-                                    key=f"dev_{pk}", label_visibility="collapsed")
-                with _ecol:
-                    _edit_live = st.toggle("✏️ লাইভ কোড এডিট", key=f"liveedit_{pk}")
-                _edit_key = f"edited_html_{pk}"
-                if _edit_key not in st.session_state:
-                    st.session_state[_edit_key] = preview_page
-                _shown_page = preview_page
-                if _edit_live:
-                    st.caption("এখানে HTML/CSS/JavaScript বদলালেই নিচের প্রিভিউ আপডেট হবে — AI-কে আবার কল করা হবে না।")
-                    st.text_area("লাইভ HTML কোড", key=_edit_key, height=320, label_visibility="collapsed")
-                    _shown_page = st.session_state.get(_edit_key, preview_page)
-                render_app_preview(_shown_page, phone=_dev.startswith("📱"))
-                st.download_button(
-                    "⬇️ সম্পাদিত অ্যাপ ডাউনলোড (.html)" if _edit_live else "⬇️ অ্যাপ ডাউনলোড (.html)",
-                    data=_shown_page.encode("utf-8"),
-                    file_name=f"my-app-{idx}.html",
-                    mime="text/html",
-                    key=f"appdl_{pk}",
-                    help="ফাইলটি Netlify Drop / GitHub Pages-এ আপলোড করলেই অ্যাপ লাইভ হবে",
-                )
+                _edits = st.session_state.setdefault("_app_edits", {})
+                _sig = hashlib.md5(preview_page.encode("utf-8")).hexdigest()
+                _rec = _edits.get(pk)
+                _wk = f"edcode_{pk}"
+                if not _rec or _rec["src"] != _sig:  # নতুন/পুনরায় তৈরি করা কোড → এডিটর রিসেট
+                    _rec = {"src": _sig, "code": preview_page}
+                    _edits[pk] = _rec
+                    st.session_state.pop(_wk, None)
+                _dev = st.radio("ডিভাইস", ["📱 মোবাইল (390px)", "💻 ডেস্কটপ", "✏️ লাইভ কোড এডিট"], horizontal=True,
+                                key=f"dev_{pk}", label_visibility="collapsed")
+                if _dev.startswith("✏️"):
+                    if _wk not in st.session_state:
+                        st.session_state[_wk] = _rec["code"]
+                    st.caption("কোডে রং/লেখা/CSS বদলাও, তারপর বাইরে ক্লিক করো বা Ctrl+Enter চাপো — প্রিভিউ সাথে সাথে বদলে যাবে (AI-কে আবার ডাকতে হবে না)।")
+                    _rec["code"] = st.text_area("HTML কোড", key=_wk, height=380, label_visibility="collapsed")
+                    _ec1, _ec2 = st.columns([3, 2])
+                    _edev = _ec1.radio("প্রিভিউ সাইজ", ["📱 মোবাইল", "💻 ডেস্কটপ"], horizontal=True,
+                                       key=f"edev_{pk}", label_visibility="collapsed")
+                    _ec2.button("↩️ মূল কোডে ফিরো", key=f"edreset_{pk}", on_click=_reset_app_edit, args=(pk, _wk, preview_page))
+                    render_app_preview(_rec["code"], phone=_edev.startswith("📱"))
+                    st.download_button(
+                        "⬇️ এডিট করা HTML ডাউনলোড",
+                        data=_rec["code"].encode("utf-8"),
+                        file_name=f"my-app-{idx}-edited.html",
+                        mime="text/html",
+                        key=f"appdl_{pk}",
+                    )
+                else:
+                    render_app_preview(_rec["code"], phone=_dev.startswith("📱"))
+                    st.download_button(
+                        "⬇️ অ্যাপ ডাউনলোড (.html)",
+                        data=_rec["code"].encode("utf-8"),
+                        file_name=f"my-app-{idx}.html",
+                        mime="text/html",
+                        key=f"appdl_{pk}",
+                        help="ফাইলটি Netlify Drop / GitHub Pages-এ আপলোড করলেই অ্যাপ লাইভ হবে",
+                    )
             elif st.toggle("▶ লাইভ প্রিভিউ দেখুন", key=f"prev_{pk}"):
                 render_preview(preview_page)
                 st.download_button(
@@ -3349,22 +3448,23 @@ def run_app_continue():
     st.session_state.pop("_continue_app", None)
     msgs = cur()["messages"]
     prev = msgs[-1]["content"]
+    _pm = dict(msgs[-1].get("meta") or {})
     history = get_history() + [{"role": "user", "content": APP_CONTINUE_PROMPT}]
     ok = False
-    _continue_started = time.perf_counter()
     with st.chat_message("assistant"):
         try:
+            _t0 = time.perf_counter()
             with st.spinner("⏩ বাকি কোড লেখা হচ্ছে..."):
                 cont = "".join(open_app_stream(history))
+            _secs = time.perf_counter() - _t0
             if not cont.strip():
                 raise RuntimeError("AI কোনো নতুন কোড দেয়নি, আবার চেষ্টা করো।")
             merged = merge_app_continuation(prev, cont)
             pop_message()
-            _model = active_claude_model() if ANTHROPIC_API_KEY else (GEMINI_MODEL if GEMINI_API_KEY else selected_model)
-            _meta = {"role": "assistant", "content": merged, "model_used": _model,
-                     "generation_seconds": round(time.perf_counter() - _continue_started, 3),
-                     "approx_tokens": est_tokens(merged)}
-            push_message(_meta)
+            push_message({"role": "assistant", "content": merged, "meta": {
+                "model": st.session_state.get("_claude_used") or _pm.get("model") or "AI",
+                "secs": round(float(_pm.get("secs", 0)) + _secs, 1),
+                "tokens": est_tokens(merged)}})
             ok = True
         except Exception as e:
             st.error(friendly_error(e))
@@ -3534,6 +3634,334 @@ def resolve_intent(last_user):
     return intent
 
 
+# ---------- 🎬 ভিডিও ও অডিও স্টুডিও (ffmpeg: imageio-ffmpeg বা সিস্টেম ffmpeg) ----------
+# ===== VS-CORE-START =====
+VS_VIDEO_TYPES = ["mp4", "mov", "m4v", "webm", "mkv", "avi"]
+VS_MAX_IMAGES = 40
+
+
+def _ffmpeg_path():
+    """imageio-ffmpeg-এর বান্ডেল করা ffmpeg (Streamlit Cloud-এ চলে); না থাকলে সিস্টেমের ffmpeg"""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg")
+
+
+def _need_ffmpeg():
+    exe = _ffmpeg_path()
+    if not exe:
+        raise RuntimeError(
+            "ffmpeg পাওয়া যায়নি। requirements.txt-এ `imageio-ffmpeg` (এবং চাইলে `moviepy`) যোগ করে অ্যাপ রিবুট করো।"
+        )
+    return exe
+
+
+def _run_ffmpeg(args, timeout=900):
+    exe = _need_ffmpeg()
+    cmd = [exe, "-y", "-hide_banner", "-loglevel", "error", *[str(a) for a in args]]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("প্রসেস করতে বেশি সময় লাগছে (টাইমআউট)। ছোট ভিডিও/কম সময় বা কম সাইজ দিয়ে চেষ্টা করো।")
+    if p.returncode != 0:
+        tail = [x for x in (p.stderr or "").strip().splitlines() if x.strip()][-3:]
+        raise RuntimeError("ffmpeg ব্যর্থ: " + " | ".join(tail)[:350])
+
+
+def vs_probe(path):
+    """(সময় সেকেন্ডে বা None, অডিও আছে কি না, ভিডিও আছে কি না)"""
+    exe = _need_ffmpeg()
+    try:
+        p = subprocess.run([exe, "-hide_banner", "-i", path], capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None, True, True
+    txt = p.stderr or ""
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", txt)
+    dur = (int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))) if m else None
+    has_audio = bool(re.search(r"Stream #\d+:\d+.*Audio:", txt))
+    has_video = bool(re.search(r"Stream #\d+:\d+.*Video:", txt))
+    return dur, has_audio, has_video
+
+
+def vs_gif(path, workdir, start=0.0, length=5.0, fps=12, width=480, loop=True):
+    out = os.path.join(workdir, "out.gif")
+    vf = (
+        f"fps={int(fps)},scale='min({int(width)},iw)':-1:flags=lanczos,"
+        "split[s0][s1];[s0]palettegen=max_colors=256:stats_mode=diff[p];"
+        "[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle"
+    )
+    _run_ffmpeg(["-ss", f"{start:.2f}", "-t", f"{length:.2f}", "-i", path, "-an", "-vf", vf,
+                 "-loop", "0" if loop else "-1", out])
+    with open(out, "rb") as f:
+        return f.read()
+
+
+def vs_trim(path, workdir, start, end, fast=False):
+    out = os.path.join(workdir, "trimmed.mp4")
+    length = max(0.1, end - start)
+    if fast:  # রি-এনকোড ছাড়া: দ্রুত, তবে কাটার জায়গা কয়েক ফ্রেম এদিক-ওদিক হতে পারে
+        _run_ffmpeg(["-ss", f"{start:.2f}", "-i", path, "-t", f"{length:.2f}", "-c", "copy",
+                     "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", out])
+    else:
+        _run_ffmpeg(["-ss", f"{start:.2f}", "-i", path, "-t", f"{length:.2f}",
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+                     "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out])
+    with open(out, "rb") as f:
+        return f.read()
+
+
+def vs_audio(path, workdir, bitrate=192):
+    """(bytes, ফাইলের এক্সটেনশন, mime) — MP3 না পারলে M4A"""
+    out = os.path.join(workdir, "audio.mp3")
+    try:
+        _run_ffmpeg(["-i", path, "-vn", "-c:a", "libmp3lame", "-b:a", f"{int(bitrate)}k", out])
+        with open(out, "rb") as f:
+            return f.read(), "mp3", "audio/mpeg"
+    except RuntimeError:
+        out2 = os.path.join(workdir, "audio.m4a")
+        _run_ffmpeg(["-i", path, "-vn", "-c:a", "aac", "-b:a", f"{int(bitrate)}k", out2])
+        with open(out2, "rb") as f:
+            return f.read(), "m4a", "audio/mp4"
+
+
+VS_SIZES = {
+    "🖥️ ল্যান্ডস্কেপ 16:9 (1280×720)": (1280, 720),
+    "📱 পোর্ট্রেট 9:16 — Reels/Shorts (720×1280)": (720, 1280),
+    "⬛ স্কয়ার 1:1 (1000×1000)": (1000, 1000),
+}
+
+
+def vs_slideshow(images, workdir, seconds=3.0, size=(1280, 720), fit="pad", music=None, music_ext=".mp3"):
+    """images: [(name, bytes)]; music: bytes বা None। MP4 bytes ফেরত দেয়"""
+    W, H = size
+    frames = os.path.join(workdir, "frames")
+    os.makedirs(frames, exist_ok=True)
+    n = 0
+    for name, raw in images:
+        try:
+            im = Image.open(io.BytesIO(raw))
+            im = ImageOps.exif_transpose(im)
+            if im.mode in ("RGBA", "LA", "P"):
+                im = im.convert("RGBA")
+                bg = Image.new("RGB", im.size, (0, 0, 0))
+                bg.paste(im, mask=im.split()[-1])
+                im = bg
+            else:
+                im = im.convert("RGB")
+            if fit == "crop":
+                im = ImageOps.fit(im, (W, H), method=Image.LANCZOS)
+            else:
+                im = ImageOps.pad(im, (W, H), method=Image.LANCZOS, color=(0, 0, 0))
+            n += 1
+            im.save(os.path.join(frames, f"f{n:04d}.jpg"), "JPEG", quality=92)
+        except Exception:
+            continue  # নষ্ট ছবি বাদ
+    if n == 0:
+        raise RuntimeError("কোনো ছবি পড়া যায়নি। PNG/JPG/WEBP ছবি দাও।")
+    out = os.path.join(workdir, "slideshow.mp4")
+    args = ["-framerate", f"{1.0 / max(0.2, float(seconds)):.6f}", "-i", os.path.join(frames, "f%04d.jpg")]
+    if music:
+        mpath = os.path.join(workdir, "music" + (music_ext or ".mp3"))
+        with open(mpath, "wb") as f:
+            f.write(music)
+        args += ["-stream_loop", "-1", "-i", mpath]
+    args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", "-r", "30"]
+    if music:
+        args += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "160k", "-shortest"]
+    args += ["-movflags", "+faststart", out]
+    _run_ffmpeg(args)
+    with open(out, "rb") as f:
+        return f.read(), n
+# ===== VS-CORE-END =====
+
+
+def _vs_save_upload(up, workdir):
+    ext = os.path.splitext(up.name)[1].lower() or ".mp4"
+    path = os.path.join(workdir, "input" + ext)
+    with open(path, "wb") as f:
+        f.write(up.getbuffer())
+    return path
+
+
+def _vs_size_txt(n):
+    return f"{n / 1_000_000:.1f} MB" if n >= 1_000_000 else f"{n / 1000:.0f} KB"
+
+
+def _vs_result(key, sig, kind, base_name, ext, mime, label):
+    """সেভ করা ফলাফল (রিরানে হারায় না) দেখায় ও ডাউনলোড বাটন দেয়"""
+    out = st.session_state.get("_vs_out", {}).get(key)
+    if not out or out["sig"] != sig:
+        return
+    data = out["data"]
+    st.success(f"✅ তৈরি হয়েছে — {_vs_size_txt(len(data))}" + (f" · {out['note']}" if out.get("note") else ""))
+    if kind == "gif":
+        st.image(data)
+    elif kind == "video":
+        st.video(data)
+    elif kind == "audio":
+        st.audio(data, format=mime)
+    st.download_button(label, data=data, file_name=f"{base_name}.{ext}", mime=mime, key=f"vsdl_{key}")
+
+
+def _vs_store(key, sig, data, note=""):
+    st.session_state.setdefault("_vs_out", {})[key] = {"sig": sig, "data": data, "note": note}
+
+
+def _vs_video_input(key):
+    up = st.file_uploader(
+        "ভিডিও আপলোড (MP4 / MOV / WEBM / MKV):", type=VS_VIDEO_TYPES, key=f"vs_up_{key}",
+    )
+    if up is None:
+        return None, None, None, None
+    if up.size > 200 * 1024 * 1024:
+        st.error("ফাইল ২০০MB-এর বেশি। ছোট ভিডিও দাও।")
+        return None, None, None, None
+    return up, (up.name, up.size), None, None
+
+
+def render_video_studio():
+    st.markdown("### 🎬 ভিডিও ও অডিও স্টুডিও")
+    st.caption("সব কাজ সার্ভারে ffmpeg দিয়ে হয় — কোনো AI কী লাগে না। বড় ভিডিওতে একটু সময় লাগতে পারে (ভালো ফল পেতে ১০০MB-এর নিচে রাখো)।")
+    if not _ffmpeg_path():
+        st.error(
+            "⚠️ ffmpeg পাওয়া যায়নি। `requirements.txt`-এ **imageio-ffmpeg** (এবং চাইলে **moviepy**) লিখে অ্যাপ রিবুট করো। "
+            "অথবা `packages.txt`-এ `ffmpeg` লিখো।"
+        )
+        return
+
+    t_gif, t_trim, t_audio, t_show = st.tabs(["🎞️ ভিডিও → GIF", "✂️ ভিডিও ট্রিম", "🎵 অডিও (MP3)", "🖼️ ছবি → স্লাইডশো"])
+
+    # ---- Video → GIF ----
+    with t_gif:
+        up, sig, _, _ = _vs_video_input("gif")
+        if up:
+            with tempfile.TemporaryDirectory() as td:
+                dur, has_a, has_v = vs_probe(_vs_save_upload(up, td))
+            if not has_v:
+                st.error("এই ফাইলে ভিডিও পাওয়া যায়নি।")
+            else:
+                dur = dur or 10.0
+                st.caption(f"⏱️ ভিডিওর দৈর্ঘ্য: {dur:.1f} সেকেন্ড")
+                c1, c2 = st.columns(2)
+                fps = c1.slider("FPS (ফ্রেম/সেকেন্ড)", 5, 30, 12, key="gif_fps")
+                width = c2.select_slider("চওড়া (px)", options=[240, 320, 400, 480, 640, 720, 960], value=480, key="gif_w")
+                c3, c4 = st.columns(2)
+                start = c3.number_input("শুরু (সেকেন্ড)", 0.0, float(max(dur - 0.1, 0.0)), 0.0, 0.5, key="gif_s")
+                max_len = float(min(20.0, max(dur - start, 0.5)))
+                length = c4.number_input("কত সেকেন্ডের GIF", 0.5, max_len, float(min(5.0, max_len)), 0.5, key="gif_l")
+                loop = st.checkbox("🔁 অনন্তকাল লুপ", value=True, key="gif_loop")
+                if st.button("🎞️ GIF বানাও", key="gif_go", type="primary"):
+                    try:
+                        with st.spinner("GIF তৈরি হচ্ছে..."), tempfile.TemporaryDirectory() as td:
+                            path = _vs_save_upload(up, td)
+                            data = vs_gif(path, td, start, length, fps, width, loop)
+                        _vs_store("gif", sig, data, f"{fps} FPS · {width}px")
+                    except Exception as e:
+                        st.error(f"GIF বানানো যায়নি: {e}")
+                _vs_result("gif", sig, "gif", "my-video.gif".rsplit(".", 1)[0], "gif", "image/gif", "⬇️ GIF ডাউনলোড")
+
+    # ---- Trim ----
+    with t_trim:
+        up, sig, _, _ = _vs_video_input("trim")
+        if up:
+            with tempfile.TemporaryDirectory() as td:
+                dur, has_a, has_v = vs_probe(_vs_save_upload(up, td))
+            if not has_v:
+                st.error("এই ফাইলে ভিডিও পাওয়া যায়নি।")
+            else:
+                dur = dur or 10.0
+                st.caption(f"⏱️ ভিডিওর দৈর্ঘ্য: {dur:.1f} সেকেন্ড")
+                c1, c2 = st.columns(2)
+                t_start = c1.number_input("শুরু (সেকেন্ড)", 0.0, float(max(dur - 0.1, 0.0)), 0.0, 0.5, key="trim_s")
+                t_end = c2.number_input("শেষ (সেকেন্ড)", 0.1, float(dur), float(dur), 0.5, key="trim_e")
+                fast = st.checkbox("⚡ দ্রুত মোড (রি-এনকোড ছাড়া; কাটার জায়গা সামান্য এদিক-ওদিক হতে পারে)", value=False, key="trim_fast")
+                if t_end <= t_start:
+                    st.warning("শেষের সময় শুরুর চেয়ে বেশি হতে হবে।")
+                elif st.button("✂️ কেটে নাও", key="trim_go", type="primary"):
+                    try:
+                        with st.spinner("ভিডিও কাটা হচ্ছে..."), tempfile.TemporaryDirectory() as td:
+                            path = _vs_save_upload(up, td)
+                            data = vs_trim(path, td, t_start, t_end, fast)
+                        _vs_store("trim", sig, data, f"{t_end - t_start:.1f} সেকেন্ড")
+                    except Exception as e:
+                        st.error(f"ট্রিম করা যায়নি: {e}")
+                _vs_result("trim", sig, "video", "trimmed-video", "mp4", "video/mp4", "⬇️ ট্রিম করা ভিডিও (MP4)")
+
+    # ---- Extract audio ----
+    with t_audio:
+        up, sig, _, _ = _vs_video_input("audio")
+        if up:
+            with tempfile.TemporaryDirectory() as td:
+                dur, has_a, has_v = vs_probe(_vs_save_upload(up, td))
+            if not has_a:
+                st.error("এই ভিডিওতে কোনো অডিও ট্র্যাক নেই।")
+            else:
+                if dur:
+                    st.caption(f"⏱️ দৈর্ঘ্য: {dur:.1f} সেকেন্ড")
+                br = st.select_slider("MP3 কোয়ালিটি (kbps)", options=[96, 128, 192, 256, 320], value=192, key="aud_br")
+                if st.button("🎵 অডিও বের করো", key="aud_go", type="primary"):
+                    try:
+                        with st.spinner("অডিও বের করা হচ্ছে..."), tempfile.TemporaryDirectory() as td:
+                            path = _vs_save_upload(up, td)
+                            data, ext, mime = vs_audio(path, td, br)
+                        _vs_store("audio", sig, data, f"{ext.upper()} · {br} kbps")
+                        st.session_state["_vs_out"]["audio"].update(ext=ext, mime=mime)
+                    except Exception as e:
+                        st.error(f"অডিও বের করা যায়নি: {e}")
+                _o = st.session_state.get("_vs_out", {}).get("audio")
+                if _o and _o["sig"] == sig:
+                    _vs_result("audio", sig, "audio", "extracted-audio", _o.get("ext", "mp3"),
+                               _o.get("mime", "audio/mpeg"), f"⬇️ অডিও ডাউনলোড (.{_o.get('ext', 'mp3')})")
+
+    # ---- Images → slideshow ----
+    with t_show:
+        imgs = st.file_uploader(
+            f"ছবি আপলোড (সর্বোচ্চ {VS_MAX_IMAGES}টি; যে ক্রমে দেবে সেই ক্রমে চলবে):",
+            type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True, key="vs_up_show",
+        ) or []
+        if imgs:
+            if len(imgs) > VS_MAX_IMAGES:
+                st.info(f"প্রথম {VS_MAX_IMAGES}টি ছবি নেওয়া হবে।")
+                imgs = imgs[:VS_MAX_IMAGES]
+            cols = st.columns(min(len(imgs), 6))
+            for i, f in enumerate(imgs[:12]):
+                cols[i % len(cols)].image(f.getvalue(), width=70)
+            c1, c2 = st.columns(2)
+            per = c1.slider("প্রতিটি স্লাইড কত সেকেন্ড", 1.0, 10.0, 3.0, 0.5, key="show_sec")
+            size_label = c2.selectbox("ভিডিওর সাইজ", list(VS_SIZES), key="show_size")
+            fit_label = st.radio("ছবি বসানো", ["🖼️ পুরো ছবি দেখাও (পাশে কালো)", "✂️ ক্রপ করে পুরো ফ্রেম ভরাও"],
+                                 horizontal=True, key="show_fit")
+            music = st.file_uploader("🎵 ব্যাকগ্রাউন্ড মিউজিক (ঐচ্ছিক):", type=["mp3", "wav", "m4a"], key="vs_up_music")
+            sig = tuple((f.name, f.size) for f in imgs) + (per, size_label, fit_label, (music.name, music.size) if music else None)
+            if st.button("🖼️ স্লাইডশো ভিডিও বানাও", key="show_go", type="primary"):
+                try:
+                    with st.spinner("স্লাইডশো তৈরি হচ্ছে..."), tempfile.TemporaryDirectory() as td:
+                        data, n = vs_slideshow(
+                            [(f.name, f.getvalue()) for f in imgs], td, per, VS_SIZES[size_label],
+                            "crop" if fit_label.startswith("✂️") else "pad",
+                            music.getvalue() if music else None,
+                            os.path.splitext(music.name)[1].lower() if music else ".mp3",
+                        )
+                    _vs_store("show", sig, data, f"{n}টি স্লাইড · মোট {n * per:.0f} সেকেন্ড")
+                except Exception as e:
+                    st.error(f"স্লাইডশো বানানো যায়নি: {e}")
+            _vs_result("show", sig, "video", "slideshow", "mp4", "video/mp4", "⬇️ স্লাইডশো (MP4)")
+
+
+if is_video_mode:
+    st.markdown(
+        "<div class='app-bar'>"
+        f"<img class='app-logo' src='{LOGO_SVG_URI}' alt='logo'/>"
+        "<div class='app-text'><div class='app-title'>Personal AI Studio</div>"
+        "<div class='app-sub'>Chat · Vision · Image · App Builder · Video · WordPress</div></div></div>",
+        unsafe_allow_html=True,
+    )
+    render_video_studio()
+    st.stop()
+
+
 # ---------- ইনপুট ----------
 if is_agent_mode:
     placeholder = "যেমন: একটি dark theme architecture Home page বানাও..."
@@ -3615,14 +4043,18 @@ if _gh_url.startswith("http"):
         "<svg viewBox='0 0 16 16'><path d='M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z'/></svg></a>"
     )
 
-st.markdown(
-    "<div class='app-bar'>"
-    + LOGO_SVG +
-    "<div class='app-text'><div class='app-title'>Personal AI Studio</div>"
-    "<div class='app-sub'>Chat · Vision · Image Studio · App Builder · WordPress</div></div>"
-    + _gh_html + "</div>",
-    unsafe_allow_html=True,
-)
+def render_app_bar():
+    st.markdown(
+        "<div class='app-bar'>"
+        f"<img class='app-logo' src='{LOGO_SVG_URI}' alt='logo'/>"
+        "<div class='app-text'><div class='app-title'>Personal AI Studio</div>"
+        "<div class='app-sub'>Chat · Vision · Image · App Builder · Video · WordPress</div></div>"
+        + _gh_html + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+render_app_bar()
 
 user_input = st.chat_input(
     placeholder,
@@ -3737,8 +4169,6 @@ if st.session_state.pending:
         last_user = messages[-1]
         success = False
         with st.chat_message("assistant"):
-            _generation_started = time.perf_counter()
-            _model_used = "unknown"
             try:
                 intent = resolve_intent(last_user)
                 if intent in ("create", "edit"):
@@ -3761,7 +4191,6 @@ if st.session_state.pending:
                             else "⚠️ আসল ছবি এডিট করা যায়নি — স্টাইল দেখে নতুন ছবি তৈরি হয়েছে।"
                         )
                     note_text = f"\n\n⚠️ {' | '.join(img['notes'])}" if img.get("notes") else ""
-                    _model_used = "image-generation"
                     reply_msg = {
                         "role": "assistant",
                         "content": f"{label}\n\n**Prompt:** {img['prompt']}\n\n*Source: {img['source']}*{note_text}",
@@ -3770,14 +4199,16 @@ if st.session_state.pending:
                     }
                     render_message(reply_msg, len(messages))
                 elif intent == "agent":
-                    _model_used = selected_model
                     if not (WP_URL and WP_AUTH[0] and WP_AUTH[1]):
                         raise ValueError("WP_URL, WP_USER, WP_APP_PASSWORD সেট করা নেই।")
                     history = [{"role": m["role"], "content": m["content"]} for m in get_history()]
+                    _t0 = time.perf_counter()
                     with st.spinner("ভাবছি..."):
                         reply = run_agent(selected_model, build_system_instruction(GROQ_FILE_LIMIT), history, temperature)
+                    _secs = time.perf_counter() - _t0
                     st.markdown(reply)
-                    reply_msg = {"role": "assistant", "content": reply}
+                    reply_msg = {"role": "assistant", "content": reply,
+                                 "meta": {"model": selected_model, "secs": round(_secs, 1), "tokens": est_tokens(reply)}}
                 else:
                     history = get_history()
                     use_vision = last_msg_has_image()
@@ -3814,23 +4245,26 @@ if st.session_state.pending:
 
                     stream = None
                     claude_failed = False
+                    used_model = None
+                    st.session_state.pop("_gemini_used", None)
+                    _t0 = time.perf_counter()  # উত্তর তৈরির সময় এখান থেকে ধরা হয়
                     if pick_engine() == "claude":
                         try:
-                            _model_used = active_claude_model()
                             stream = _prime(claude_stream(
                                 build_system_instruction(CLAUDE_FILE_LIMIT) + search_block,
                                 history, temp_eff, use_vision,
                             ))
+                            used_model = st.session_state.get("_claude_used") or active_claude_model()
                         except Exception as e:
                             claude_failed = True
                             st.warning(f"⚠️ Claude ব্যর্থ ({_short(e)}), অন্য ইঞ্জিন দিয়ে উত্তর দেওয়া হচ্ছে।")
                     if stream is None and (pick_engine() == "gemini" or (GEMINI_API_KEY and (claude_failed or len(links_block) > 6000))):
                         try:
-                            _model_used = GEMINI_MODEL
                             stream = _prime(gemini_stream(
                                 build_system_instruction(MAX_FILE_CHARS) + search_block,
                                 history, temp_eff, use_vision,
                             ))
+                            used_model = st.session_state.get("_gemini_used") or GEMINI_MODEL
                         except Exception as e:
                             st.warning(f"⚠️ Gemini ব্যর্থ ({_short(e)}), Groq দিয়ে উত্তর দেওয়া হচ্ছে।")
 
@@ -3841,21 +4275,19 @@ if st.session_state.pending:
                             st.info("ℹ️ Groq-এর সীমার কারণে ফাইল/আগের চ্যাটের কিছু অংশ বাদ দেওয়া হয়েছে। পুরোটা পড়াতে Gemini ইঞ্জিন বেছে নাও।")
                         has_last_img = bool(g_history and get_msg_images(g_history[-1]))
                         model_to_use = VISION_MODEL if has_last_img else selected_model
-                        _model_used = model_to_use
                         api_messages = build_api_messages(g_history, sys_text, has_last_img)
                         stream = stream_reply(model_to_use, api_messages, temp_eff)
+                        used_model = model_to_use
 
                     reply = st.write_stream(stream)
+                    _secs = time.perf_counter() - _t0
+                    _toks = est_tokens(reply)
                     if sources_md:
                         st.markdown(sources_md)
                         reply += sources_md
-                    reply_msg = {"role": "assistant", "content": reply}
+                    reply_msg = {"role": "assistant", "content": reply,
+                                 "meta": {"model": used_model or "AI", "secs": round(_secs, 1), "tokens": _toks}}
 
-                _elapsed = max(0.0, time.perf_counter() - _generation_started)
-                reply_msg["model_used"] = _model_used
-                reply_msg["generation_seconds"] = round(_elapsed, 3)
-                reply_msg["approx_tokens"] = est_tokens(reply_msg.get("content", ""))
-                st.caption(f"⚡ {_model_used} | ⏱️ {_elapsed:.1f}s | 🪙 ~{reply_msg['approx_tokens']} tokens")
                 push_message(reply_msg)
                 success = True
                 if auto_memory and app_mode.startswith("💬") and intent in ("chat", "vision"):
