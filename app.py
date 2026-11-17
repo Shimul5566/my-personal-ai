@@ -36,7 +36,9 @@ try:
 except Exception:
     _LOGO_PIL = "🤖"
 
-APP_VERSION = "2.6.0"  # App Builder: Claude-first engine, truncation-proof preview, Continue button
+APP_VERSION = "2.7.0"  # Performance monitor, SVG branding, live editor, photo-ready builder
+
+LOGO_SVG = """<svg class='app-logo' viewBox='0 0 64 64' role='img' aria-label='Personal AI Studio' xmlns='http://www.w3.org/2000/svg'><defs><linearGradient id='pas-g' x1='0' y1='0' x2='1' y2='1'><stop stop-color='#60a5fa'/><stop offset='1' stop-color='#8b5cf6'/></linearGradient><filter id='pas-glow' x='-60%' y='-60%' width='220%' height='220%'><feGaussianBlur stdDeviation='3' result='b'/><feMerge><feMergeNode in='b'/><feMergeNode in='SourceGraphic'/></feMerge></filter></defs><rect x='5' y='5' width='54' height='54' rx='17' fill='#172033' stroke='url(#pas-g)' stroke-width='2'/><path d='M20 42V22h11a8 8 0 0 1 0 16h-4' fill='none' stroke='url(#pas-g)' stroke-width='5' stroke-linecap='round' stroke-linejoin='round' filter='url(#pas-glow)'/><path d='M39 22v20m0-10h7' fill='none' stroke='#c4b5fd' stroke-width='4' stroke-linecap='round'/><circle cx='47' cy='17' r='3' fill='#60a5fa'/></svg>"""
 
 st.set_page_config(
     page_title="আমার পার্সোনাল AI",
@@ -283,7 +285,9 @@ st.markdown(
 
     /* ===== v2.4: app bar, centred mic, advanced mobile ===== */
     .app-bar { display:flex; align-items:center; gap:12px; margin:0 0 1.1rem 0; }
-    .app-bar .app-logo { width:40px; height:40px; object-fit:contain; flex:none; filter:drop-shadow(0 6px 16px rgba(0,0,0,.35)); }
+    .app-bar .app-logo { width:40px; height:40px; object-fit:contain; flex:none; filter:drop-shadow(0 0 12px rgba(96,165,250,.28)); }
+    .sidebar-brand { display:flex; align-items:center; gap:10px; font-weight:750; font-size:1.02rem; margin:0 0 1rem 0; }
+    .sidebar-brand .app-logo { width:36px; height:36px; filter:drop-shadow(0 0 10px rgba(139,92,246,.3)); }
     .app-bar .app-text { min-width:0; flex:1; }
     .app-bar .app-title { font-size:1.15rem; font-weight:750; letter-spacing:.1px; line-height:1.2; color:#ececec; }
     .app-bar .app-sub { font-size:.78rem; color:#9caec4; margin-top:2px; }
@@ -510,7 +514,8 @@ TECH RULES:
   Seed it with realistic sample data so the first screen is never empty.
 - Persist data with localStorage inside try/catch and fall back to in-memory state (the preview sandbox may block storage).
 - Do NOT use alert()/confirm()/prompt(); build small in-app modals/toasts instead.
-- No external images or API keys. Use emoji, inline SVG, CSS gradients for visuals. No network requests that need authentication.
+- Use real, high-quality photography for restaurants, e-commerce, travel, food, products, hotels, and portfolios. Prefer direct, stable Unsplash image URLs in the form https://images.unsplash.com/photo-... with useful width/quality parameters (for example ?auto=format&fit=crop&w=1200&q=85). Never use images.unsplash.com/photo- without a real photo identifier; do not invent a URL if uncertain. Use multiple relevant photos, descriptive alt text, loading="lazy", and object-fit:cover. Every image MUST have an onerror handler that replaces it with a tasteful CSS gradient/emoji fallback (avoid infinite error loops by hiding the failed img and showing its sibling fallback). Keep inline SVG/CSS gradients/emoji as supporting visuals, not the only visuals when photography fits.
+- Images are optional enhancement: the app must remain attractive and fully usable if Unsplash is unavailable. Do not require API keys or authentication.
 - UI text language = the language the user wrote in (Bengali UI if they wrote Bengali). Use a font stack with a Bengali-capable fallback.
 - OUTPUT BUDGET: the whole reply must fit comfortably in about 9000 tokens. Write clean, compact code:
   no HTML/CSS/JS comments (at most a few one-line section markers), no long explanations, short class names, CSS variables,
@@ -1925,6 +1930,8 @@ def init_db():
         mcols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
         if "images" not in mcols:
             conn.execute("ALTER TABLE messages ADD COLUMN images TEXT")
+        if "metadata" not in mcols:
+            conn.execute("ALTER TABLE messages ADD COLUMN metadata TEXT")
 
 
 def db_list_chats():
@@ -1937,11 +1944,11 @@ def db_list_chats():
 def db_load_messages(cid):
     with _db() as conn:
         rows = conn.execute(
-            "SELECT role, content, attachment, image, mime, force, images FROM messages WHERE chat_id = ? ORDER BY id ASC",
+            "SELECT role, content, attachment, image, mime, force, images, metadata FROM messages WHERE chat_id = ? ORDER BY id ASC",
             (cid,),
         ).fetchall()
     out = []
-    for role, content, attachment, image, mime, force, images_json in rows:
+    for role, content, attachment, image, mime, force, images_json, metadata_json in rows:
         m = {"role": role, "content": content}
         if attachment:
             m["attachment"] = attachment
@@ -1954,6 +1961,11 @@ def db_load_messages(cid):
         if images_json:
             try:
                 m["images"] = json.loads(images_json)
+            except Exception:
+                pass
+        if metadata_json:
+            try:
+                m.update(json.loads(metadata_json))
             except Exception:
                 pass
         out.append(m)
@@ -2031,10 +2043,11 @@ def db_add_message(cid, chat, msg):
             if USE_TURSO:
                 sigs[cid] = sig
         conn.execute(
-            "INSERT INTO messages (chat_id, role, content, attachment, image, mime, force, images) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO messages (chat_id, role, content, attachment, image, mime, force, images, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 cid, msg["role"], msg["content"], msg.get("attachment"), msg.get("image"), msg.get("mime"),
                 msg.get("force"), json.dumps(msg["images"]) if msg.get("images") else None,
+                json.dumps({k: msg[k] for k in ("model_used", "generation_seconds", "approx_tokens") if k in msg}),
             ),
         )
 
@@ -2482,7 +2495,7 @@ def code_project(content):
 
 # ---------- সাইডবার ----------
 with st.sidebar:
-    st.markdown("## 🤖 আমার AI")
+    st.markdown("<div class='sidebar-brand'>" + LOGO_SVG + "<span>Personal AI Studio</span></div>", unsafe_allow_html=True)
     if st.button("➕ নতুন চ্যাট", key="new_chat_btn"):
         new_chat()
         st.rerun()
@@ -3131,6 +3144,8 @@ def render_message(m, idx):
     if m.get("attachment"):
         st.caption(f"📎 {m['attachment']}")
     st.markdown(m["content"])
+    if m.get("role") == "assistant" and m.get("generation_seconds") is not None:
+        st.caption(f"⚡ {m.get('model_used', 'AI')} | ⏱️ {float(m.get('generation_seconds', 0)):.1f}s | 🪙 ~{int(m.get('approx_tokens', est_tokens(m.get('content', ''))))} tokens")
     imgs = get_msg_images(m)
     if imgs:
         if m["role"] == "user":
@@ -3215,12 +3230,24 @@ def render_message(m, idx):
         if preview_page:
             pk = f"{st.session_state.current}_{idx}"
             if is_app_mode:
-                _dev = st.radio("ডিভাইস", ["📱 মোবাইল (390px)", "💻 ডেস্কটপ"], horizontal=True,
-                                key=f"dev_{pk}", label_visibility="collapsed")
-                render_app_preview(preview_page, phone=_dev.startswith("📱"))
+                _vcol, _ecol = st.columns([1.15, 1])
+                with _vcol:
+                    _dev = st.radio("ডিভাইস", ["📱 মোবাইল (390px)", "💻 ডেস্কটপ"], horizontal=True,
+                                    key=f"dev_{pk}", label_visibility="collapsed")
+                with _ecol:
+                    _edit_live = st.toggle("✏️ লাইভ কোড এডিট", key=f"liveedit_{pk}")
+                _edit_key = f"edited_html_{pk}"
+                if _edit_key not in st.session_state:
+                    st.session_state[_edit_key] = preview_page
+                _shown_page = preview_page
+                if _edit_live:
+                    st.caption("এখানে HTML/CSS/JavaScript বদলালেই নিচের প্রিভিউ আপডেট হবে — AI-কে আবার কল করা হবে না।")
+                    st.text_area("লাইভ HTML কোড", key=_edit_key, height=320, label_visibility="collapsed")
+                    _shown_page = st.session_state.get(_edit_key, preview_page)
+                render_app_preview(_shown_page, phone=_dev.startswith("📱"))
                 st.download_button(
-                    "⬇️ অ্যাপ ডাউনলোড (.html)",
-                    data=preview_page.encode("utf-8"),
+                    "⬇️ সম্পাদিত অ্যাপ ডাউনলোড (.html)" if _edit_live else "⬇️ অ্যাপ ডাউনলোড (.html)",
+                    data=_shown_page.encode("utf-8"),
                     file_name=f"my-app-{idx}.html",
                     mime="text/html",
                     key=f"appdl_{pk}",
@@ -3324,6 +3351,7 @@ def run_app_continue():
     prev = msgs[-1]["content"]
     history = get_history() + [{"role": "user", "content": APP_CONTINUE_PROMPT}]
     ok = False
+    _continue_started = time.perf_counter()
     with st.chat_message("assistant"):
         try:
             with st.spinner("⏩ বাকি কোড লেখা হচ্ছে..."):
@@ -3332,7 +3360,11 @@ def run_app_continue():
                 raise RuntimeError("AI কোনো নতুন কোড দেয়নি, আবার চেষ্টা করো।")
             merged = merge_app_continuation(prev, cont)
             pop_message()
-            push_message({"role": "assistant", "content": merged})
+            _model = active_claude_model() if ANTHROPIC_API_KEY else (GEMINI_MODEL if GEMINI_API_KEY else selected_model)
+            _meta = {"role": "assistant", "content": merged, "model_used": _model,
+                     "generation_seconds": round(time.perf_counter() - _continue_started, 3),
+                     "approx_tokens": est_tokens(merged)}
+            push_message(_meta)
             ok = True
         except Exception as e:
             st.error(friendly_error(e))
@@ -3585,7 +3617,7 @@ if _gh_url.startswith("http"):
 
 st.markdown(
     "<div class='app-bar'>"
-    f"<img class='app-logo' src='data:image/png;base64,{LOGO_B64}' alt='logo'/>"
+    + LOGO_SVG +
     "<div class='app-text'><div class='app-title'>Personal AI Studio</div>"
     "<div class='app-sub'>Chat · Vision · Image Studio · App Builder · WordPress</div></div>"
     + _gh_html + "</div>",
@@ -3705,6 +3737,8 @@ if st.session_state.pending:
         last_user = messages[-1]
         success = False
         with st.chat_message("assistant"):
+            _generation_started = time.perf_counter()
+            _model_used = "unknown"
             try:
                 intent = resolve_intent(last_user)
                 if intent in ("create", "edit"):
@@ -3727,6 +3761,7 @@ if st.session_state.pending:
                             else "⚠️ আসল ছবি এডিট করা যায়নি — স্টাইল দেখে নতুন ছবি তৈরি হয়েছে।"
                         )
                     note_text = f"\n\n⚠️ {' | '.join(img['notes'])}" if img.get("notes") else ""
+                    _model_used = "image-generation"
                     reply_msg = {
                         "role": "assistant",
                         "content": f"{label}\n\n**Prompt:** {img['prompt']}\n\n*Source: {img['source']}*{note_text}",
@@ -3735,6 +3770,7 @@ if st.session_state.pending:
                     }
                     render_message(reply_msg, len(messages))
                 elif intent == "agent":
+                    _model_used = selected_model
                     if not (WP_URL and WP_AUTH[0] and WP_AUTH[1]):
                         raise ValueError("WP_URL, WP_USER, WP_APP_PASSWORD সেট করা নেই।")
                     history = [{"role": m["role"], "content": m["content"]} for m in get_history()]
@@ -3780,6 +3816,7 @@ if st.session_state.pending:
                     claude_failed = False
                     if pick_engine() == "claude":
                         try:
+                            _model_used = active_claude_model()
                             stream = _prime(claude_stream(
                                 build_system_instruction(CLAUDE_FILE_LIMIT) + search_block,
                                 history, temp_eff, use_vision,
@@ -3789,6 +3826,7 @@ if st.session_state.pending:
                             st.warning(f"⚠️ Claude ব্যর্থ ({_short(e)}), অন্য ইঞ্জিন দিয়ে উত্তর দেওয়া হচ্ছে।")
                     if stream is None and (pick_engine() == "gemini" or (GEMINI_API_KEY and (claude_failed or len(links_block) > 6000))):
                         try:
+                            _model_used = GEMINI_MODEL
                             stream = _prime(gemini_stream(
                                 build_system_instruction(MAX_FILE_CHARS) + search_block,
                                 history, temp_eff, use_vision,
@@ -3803,6 +3841,7 @@ if st.session_state.pending:
                             st.info("ℹ️ Groq-এর সীমার কারণে ফাইল/আগের চ্যাটের কিছু অংশ বাদ দেওয়া হয়েছে। পুরোটা পড়াতে Gemini ইঞ্জিন বেছে নাও।")
                         has_last_img = bool(g_history and get_msg_images(g_history[-1]))
                         model_to_use = VISION_MODEL if has_last_img else selected_model
+                        _model_used = model_to_use
                         api_messages = build_api_messages(g_history, sys_text, has_last_img)
                         stream = stream_reply(model_to_use, api_messages, temp_eff)
 
@@ -3812,6 +3851,11 @@ if st.session_state.pending:
                         reply += sources_md
                     reply_msg = {"role": "assistant", "content": reply}
 
+                _elapsed = max(0.0, time.perf_counter() - _generation_started)
+                reply_msg["model_used"] = _model_used
+                reply_msg["generation_seconds"] = round(_elapsed, 3)
+                reply_msg["approx_tokens"] = est_tokens(reply_msg.get("content", ""))
+                st.caption(f"⚡ {_model_used} | ⏱️ {_elapsed:.1f}s | 🪙 ~{reply_msg['approx_tokens']} tokens")
                 push_message(reply_msg)
                 success = True
                 if auto_memory and app_mode.startswith("💬") and intent in ("chat", "vision"):
