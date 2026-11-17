@@ -536,7 +536,8 @@ TECH RULES:
   tasteful colour palette with a dark-mode friendly design (use CSS variables, honour prefers-color-scheme).
 - Real functionality: working navigation between screens, add/edit/delete, forms with validation, filters/search, charts where useful.
   Seed it with realistic sample data so the first screen is never empty.
-- Persist data with localStorage inside try/catch and fall back to in-memory state (the preview sandbox may block storage).
+- Persist data with localStorage inside try/catch and ALWAYS fall back to an in-memory object (the preview sandbox blocks storage).
+  Never touch localStorage/sessionStorage outside a try/catch, and never let a storage error stop the app from rendering.
 - Do NOT use alert()/confirm()/prompt(); build small in-app modals/toasts instead.
 - No API keys and no authenticated network requests.
 - REAL PHOTOS: for restaurant/food, e-commerce/shop, travel/hotel, real-estate, portfolio/agency, blog/news, fitness, music/events apps
@@ -562,6 +563,24 @@ TECH RULES:
   no HTML/CSS/JS comments (at most a few one-line section markers), no long explanations, short class names, CSS variables,
   small helper functions, lists rendered from JS arrays/templates instead of repeated markup, 3-6 sample items only.
   Aim for 250-400 lines. Polished, but never bloated.
+- 100% WORKING INTERACTIVITY (most important rule — a pretty app with dead buttons is a failed app):
+  * EVERY button, bottom-nav tab, filter pill/chip, toggle, card action, FAB, modal/sheet close icon and form submit MUST have real working JavaScript.
+    Before finishing, mentally check each clickable element: what happens on tap? If nothing, add the logic or remove the element.
+  * NEVER use dead links: no href="#", href="" or href="javascript:void(0)". Use <button type="button"> for actions and
+    <div role="button" tabindex="0"> only when needed. Use type="submit" only inside a <form> whose submit handler calls e.preventDefault().
+  * Wire events cleanly: preferably ONE delegated listener (document.addEventListener('click', e => { const b = e.target.closest('[data-act]'); ... }))
+    with data-act / data-id attributes, so dynamically re-rendered lists keep working. If you use inline onclick="fn()", define it globally as
+    window.fn = function(){...} (never inside a closure/IIFE/module). No type="module", no defer/async on the inline script.
+  * Put the single <script> immediately before </body> so every DOM element exists first. Build the UI in one render() function, call render() once at the end,
+    wrap storage access in try/catch, and make sure no top-level statement can throw before the listeners are attached (null-check every getElementById).
+  * IDs used in JS must exist exactly once in the HTML. Avoid duplicate ids and misspelled selectors.
+  * Nothing may block clicks: hidden overlays, modals, bottom sheets, toasts and backdrops must use display:none (or visibility:hidden;pointer-events:none)
+    when closed, decorative layers/gradients/pseudo-elements need pointer-events:none, z-index must be sane, and the app shell must stay scrollable
+    (overflow-y:auto on the content area, fixed bottom bar with padding for it).
+  * Show visible feedback on every action (active state, toast, screen change, counter update) so the user can see the button worked.
+- IMAGES ARE OPTIONAL DECORATION: layout and clicks must never depend on an image loading. Prefer crisp inline SVG, CSS gradients and emoji; use a photo only where
+  it clearly helps, always inside a fixed-size box (aspect-ratio/height) with the gradient+emoji fallback and onerror, and set pointer-events:none on <img>
+  so a photo can never swallow a tap.
 - ALWAYS FINISH THE FILE: the code block must end with </script></body></html> and then the closing ``` fence.
   A complete, simpler app is always better than a bigger app that gets cut off. If the request is large,
   build the core features first and suggest the rest as next steps.
@@ -3095,10 +3114,63 @@ def build_preview_html(text):
     return page
 
 
+# Runs first inside the sandboxed preview iframe (no allow-same-origin => storage access throws SecurityError).
+PREVIEW_SHIM = """<script>
+(function () {
+  function mem() {
+    var d = {};
+    return {
+      getItem: function (k) { return Object.prototype.hasOwnProperty.call(d, k) ? d[k] : null; },
+      setItem: function (k, v) { d[k] = String(v); },
+      removeItem: function (k) { delete d[k]; },
+      clear: function () { d = {}; },
+      key: function (i) { var ks = Object.keys(d); return i < ks.length ? ks[i] : null; },
+      get length() { return Object.keys(d).length; }
+    };
+  }
+  ['localStorage', 'sessionStorage'].forEach(function (n) {
+    var ok = true;
+    try { var st = window[n]; st.setItem('__t', '1'); st.removeItem('__t'); } catch (e) { ok = false; }
+    if (!ok) {
+      var fake = mem();
+      try { Object.defineProperty(window, n, { value: fake, configurable: true, writable: true }); }
+      catch (e1) { try { window[n] = fake; } catch (e2) {} }
+    }
+  });
+  document.addEventListener('click', function (e) {
+    var a = e.target && e.target.closest ? e.target.closest('a') : null;
+    if (!a) return;
+    var h = a.getAttribute('href');
+    if (h === null) return;
+    if (h === '' || h === '#' || h.toLowerCase().indexOf('javascript:') === 0) { e.preventDefault(); return; }
+    if (h.charAt(0) === '#') {
+      e.preventDefault();
+      var t = document.getElementById(h.slice(1));
+      if (t && t.scrollIntoView) { try { t.scrollIntoView({ behavior: 'smooth' }); } catch (x) { t.scrollIntoView(); } }
+    }
+  }, true);
+  document.addEventListener('submit', function (e) {
+    if (!e.defaultPrevented && !e.target.getAttribute('action')) e.preventDefault();
+  }, false);
+  window.addEventListener('error', function (e) { if (e && e.preventDefault) e.preventDefault(); return true; });
+  window.addEventListener('unhandledrejection', function (e) { if (e && e.preventDefault) e.preventDefault(); });
+})();
+</script>"""
+
+
+def inject_preview_shim(page):
+    """শুধু প্রিভিউয়ের কপিতে শিম বসায় (ডাউনলোড/এডিটরের কোড অপরিবর্তিত থাকে)"""
+    for pat in (r"<head[^>]*>", r"<html[^>]*>"):
+        m = re.search(pat, page, re.I)
+        if m:
+            return page[:m.end()] + PREVIEW_SHIM + page[m.end():]
+    return PREVIEW_SHIM + page
+
+
 def render_preview(page, height=520):
     """কোড আলাদা sandbox-এ চালায় (অ্যাপের পেজ/ডেটায় হাত দিতে পারে না)"""
     import html as _html
-    inner = _html.escape(page, quote=True)
+    inner = _html.escape(inject_preview_shim(page), quote=True)
     components.html(
         '<iframe sandbox="allow-scripts allow-forms allow-modals allow-popups" '
         f'srcdoc="{inner}" style="width:100%;height:{height - 10}px;border:1px solid #444;'
@@ -3110,7 +3182,7 @@ def render_preview(page, height=520):
 def render_app_preview(page, phone=True, height=800):
     """জেনারেট করা অ্যাপ ফোনের ফ্রেমে (বা ডেস্কটপ সাইজে) চালায়; sandbox-এ, তাই অ্যাপের ডেটায় হাত দিতে পারে না"""
     import html as _html
-    inner = _html.escape(page, quote=True)
+    inner = _html.escape(inject_preview_shim(page), quote=True)
     if phone:
         style = (f"width:390px;max-width:100%;height:{height - 40}px;border:10px solid #1c1c1e;"
                  "border-radius:42px;background:#fff;box-shadow:0 12px 40px rgba(0,0,0,.35)")
