@@ -8,4 +8,5 @@ Pillow
 python-docx
 youtube-transcript-api
 gTTS
-
+imageio-ffmpeg
+moviepy
