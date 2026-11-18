@@ -417,6 +417,298 @@ st.markdown(
         iframe { max-width:100% !important; }
         [data-testid="stSlider"] { padding:0 .45rem; }
     }
+
+    /* =====================================================================
+       v3.0 — OBSIDIAN SaaS THEME  (Linear · Raycast · Claude Web UI)
+       Pure visual layer. Loaded last so it overrides every earlier rule.
+       Rules: no transform / filter / backdrop-filter on any ancestor of the
+       fixed-position mic ([data-testid="stAudioInput"]), no size change on
+       the composer or its send button (the mic-placement script reads them).
+       ===================================================================== */
+    :root {
+        --obs-base:#090d16; --obs-panel:rgba(15,20,32,.85); --obs-line:rgba(255,255,255,.08);
+        --obs-line-2:rgba(148,163,184,.20); --obs-text:#e6ebf4; --obs-muted:#8793a8;
+        --obs-blue:#60a5fa; --obs-violet:#8b5cf6;
+        --studio-accent:#60a5fa; --studio-accent-2:#8b5cf6;
+        --obs-ease:cubic-bezier(.22,.61,.36,1);
+    }
+
+    /* ---------- 1) Background: obsidian base + aurora mesh + dot grid ---------- */
+    html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"],
+    [data-testid="stMainBlockContainer"] { background-color:#090d16 !important; }
+    .stApp {
+        background:
+            radial-gradient(1px 1px at 50% 50%, rgba(148,163,184,.13) 99%, transparent 100%) 0 0 / 24px 24px,
+            radial-gradient(ellipse 60% 42% at 22% -6%, rgba(56,189,248,.08) 0%, transparent 70%),
+            radial-gradient(ellipse 58% 40% at 80% -8%, rgba(139,92,246,.08) 0%, transparent 70%),
+            radial-gradient(ellipse 90% 60% at 50% 110%, rgba(59,130,246,.035) 0%, transparent 70%),
+            #090d16 !important;
+        background-attachment:fixed !important;
+        font-family:Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans Bengali", "Hind Siliguri", system-ui, sans-serif;
+        -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+        color:var(--obs-text) !important;
+    }
+    [data-testid="stAppViewContainer"], [data-testid="stMain"] { background:transparent !important; }
+    [data-testid="stBottom"], [data-testid="stBottom"] > div,
+    [data-testid="stBottomBlockContainer"], [data-testid="stChatInputContainer"] { background:transparent !important; box-shadow:none !important; }
+    .stApp hr, [data-testid="stSidebar"] hr { border-color:rgba(255,255,255,.07) !important; }
+    .stApp [data-testid="stCaptionContainer"], .stApp small { color:var(--obs-muted) !important; }
+    a { color:#93c5fd !important; text-decoration-color:rgba(147,197,253,.35); }
+    ::selection { background:rgba(96,165,250,.35); color:#fff; }
+
+    /* ---------- Top bar buttons (Share / menu / sidebar toggle) ---------- */
+    header[data-testid="stHeader"] [data-testid="stToolbar"] button,
+    header[data-testid="stHeader"] [data-testid="stToolbar"] a,
+    [data-testid="stSidebarCollapseButton"] button, [data-testid="stExpandSidebarButton"],
+    [data-testid="stSidebarCollapsedControl"] button {
+        background:linear-gradient(180deg, rgba(38,48,68,.80), rgba(24,31,46,.90)) !important;
+        border:1px solid var(--obs-line-2) !important;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.07), 0 3px 10px rgba(0,0,0,.25) !important;
+        transition:border-color .18s var(--obs-ease), box-shadow .18s var(--obs-ease) !important;
+    }
+    header[data-testid="stHeader"] [data-testid="stToolbar"] button:hover,
+    header[data-testid="stHeader"] [data-testid="stToolbar"] a:hover,
+    [data-testid="stSidebarCollapseButton"] button:hover, [data-testid="stExpandSidebarButton"]:hover,
+    [data-testid="stSidebarCollapsedControl"] button:hover {
+        border-color:var(--obs-blue) !important; box-shadow:0 0 0 3px rgba(96,165,250,.12), 0 4px 14px rgba(59,130,246,.20) !important;
+    }
+
+    /* ---------- 2) Glass sidebar ---------- */
+    [data-testid="stSidebar"] {
+        background:rgba(15,20,32,.85) !important;
+        -webkit-backdrop-filter:blur(20px) saturate(140%); backdrop-filter:blur(20px) saturate(140%);
+        border-right:1px solid rgba(255,255,255,.08) !important;
+        box-shadow:1px 0 0 rgba(96,165,250,.05), 8px 0 40px rgba(0,0,0,.35);
+    }
+    [data-testid="stSidebar"] > div:first-child, [data-testid="stSidebarContent"] { background:transparent !important; }
+    [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
+        font-size:.72rem !important; letter-spacing:.08em; text-transform:uppercase; margin:.35rem 0 .15rem .2rem;
+    }
+    [data-testid="stSidebar"] .stTextInput input {
+        background:rgba(255,255,255,.04) !important; border:1px solid rgba(255,255,255,.08) !important;
+        border-radius:12px !important;
+    }
+
+    /* Sidebar history buttons = interactive cards */
+    [data-testid="stSidebar"] .stButton > button {
+        width:100%; text-align:left; justify-content:flex-start !important;
+        padding:9px 14px !important; min-height:2.5rem;
+        background:rgba(255,255,255,.03) !important;
+        border:1px solid rgba(255,255,255,.06) !important; border-radius:12px !important;
+        box-shadow:none !important; position:relative; overflow:hidden;
+        transition:transform .2s var(--obs-ease), background .2s var(--obs-ease), border-color .2s var(--obs-ease), box-shadow .2s var(--obs-ease) !important;
+    }
+    [data-testid="stSidebar"] .stButton > button > div, [data-testid="stSidebar"] .stButton > button p { text-align:left; justify-content:flex-start; }
+    [data-testid="stSidebar"] .stButton > button:hover {
+        transform:translateX(3px) !important;
+        background:linear-gradient(90deg, rgba(96,165,250,.12), rgba(139,92,246,.05)) !important;
+        border-color:rgba(96,165,250,.35) !important;
+        box-shadow:0 0 0 1px rgba(96,165,250,.06), 0 6px 18px rgba(59,130,246,.12) !important;
+    }
+    [data-testid="stSidebar"] .stButton > button:active { transform:translateX(1px) scale(.985) !important; }
+
+    /* Signature "New chat" gradient pill */
+    .st-key-new_chat_btn button {
+        justify-content:center !important; text-align:center !important;
+        min-height:2.85rem !important; font-weight:650 !important; letter-spacing:.2px;
+        background:linear-gradient(135deg,#3b82f6,#8b5cf6) !important;
+        border:1px solid rgba(255,255,255,.22) !important; border-radius:14px !important;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.28), 0 6px 22px rgba(99,102,241,.35), 0 0 0 1px rgba(59,130,246,.15) !important;
+    }
+    [data-testid="stSidebar"] .st-key-new_chat_btn button,
+    [data-testid="stSidebar"] .st-key-new_chat_btn button *,
+    .st-key-new_chat_btn button p { color:#ffffff !important; text-align:center !important; justify-content:center !important; }
+    [data-testid="stSidebar"] .st-key-new_chat_btn button:hover {
+        transform:translateY(-1.5px) !important; filter:brightness(1.08);
+        background:linear-gradient(135deg,#4b8df8,#9b6cf8) !important; border-color:rgba(255,255,255,.35) !important;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.32), 0 10px 30px rgba(99,102,241,.50), 0 0 0 3px rgba(96,165,250,.14) !important;
+    }
+    [data-testid="stSidebar"] .st-key-new_chat_btn button:active { transform:scale(.98) !important; }
+
+    /* Mode / persona radio pills */
+    [data-testid="stSidebar"] [role="radiogroup"] { gap:6px !important; }
+    [data-testid="stSidebar"] [role="radiogroup"] label {
+        position:relative; width:100%; padding:9px 12px 9px 14px !important; margin:0 !important;
+        background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.06); border-radius:12px;
+        cursor:pointer; overflow:hidden;
+        transition:transform .2s var(--obs-ease), background .2s var(--obs-ease), border-color .2s var(--obs-ease), box-shadow .2s var(--obs-ease);
+    }
+    [data-testid="stSidebar"] [role="radiogroup"] label > div:first-child:not(:has([data-testid="stMarkdownContainer"])) { display:none !important; }
+    [data-testid="stSidebar"] [role="radiogroup"] label:hover {
+        transform:translateX(3px); background:linear-gradient(90deg, rgba(96,165,250,.10), rgba(139,92,246,.04));
+        border-color:rgba(96,165,250,.30); box-shadow:0 6px 18px rgba(59,130,246,.10);
+    }
+    [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {
+        background:rgba(96,165,250,.14); border-color:rgba(96,165,250,.38);
+        box-shadow:inset 3px 0 0 #60a5fa, 0 0 0 1px rgba(96,165,250,.05), 0 6px 20px rgba(59,130,246,.14);
+    }
+    [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) * { color:#f1f6ff !important; font-weight:600; }
+    [data-testid="stSidebar"] [role="radiogroup"] label:focus-within { outline:2px solid rgba(96,165,250,.45); outline-offset:1px; }
+
+    /* Sidebar expanders = glass cards */
+    [data-testid="stSidebar"] [data-testid="stExpander"], .stApp [data-testid="stExpander"] {
+        border-radius:14px !important; border:1px solid rgba(255,255,255,.07) !important;
+        background:rgba(255,255,255,.03) !important;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.04);
+        transition:border-color .2s var(--obs-ease), background .2s var(--obs-ease), box-shadow .2s var(--obs-ease);
+    }
+    [data-testid="stExpander"] details { border:0 !important; border-radius:14px !important; background:transparent !important; }
+    [data-testid="stExpander"]:hover { border-color:rgba(96,165,250,.28) !important; background:rgba(96,165,250,.05) !important; box-shadow:0 6px 20px rgba(0,0,0,.2); }
+    [data-testid="stExpander"] summary { border-radius:14px !important; transition:background .18s ease; }
+    [data-testid="stExpander"] summary:hover { background:rgba(255,255,255,.03) !important; }
+
+    /* ---------- 3) Premium buttons ---------- */
+    .stApp .stButton > button, .stApp .stDownloadButton > button,
+    .stApp [data-testid="stFormSubmitButton"] > button, .stApp button[kind="secondaryFormSubmit"] {
+        background:linear-gradient(180deg, rgba(38,48,68,.85), rgba(24,31,46,.92)) !important;
+        color:#e9eef7 !important;
+        border:1px solid rgba(148,163,184,.20) !important; border-radius:12px !important;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.08), 0 4px 12px rgba(0,0,0,.25) !important;
+        font-weight:550; letter-spacing:.1px;
+        transition:transform .18s var(--obs-ease), border-color .18s var(--obs-ease), box-shadow .18s var(--obs-ease), background .18s var(--obs-ease), filter .18s var(--obs-ease) !important;
+    }
+    .stApp .stButton > button:hover, .stApp .stDownloadButton > button:hover,
+    .stApp .stDownloadButton > button:focus:hover,
+    .stApp [data-testid="stFormSubmitButton"] > button:hover, .stApp button[kind="secondaryFormSubmit"]:hover {
+        background:linear-gradient(180deg, rgba(46,58,82,.92), rgba(28,36,54,.95)) !important;
+        border-color:#60a5fa !important; transform:translateY(-1.5px);
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.10), 0 8px 22px rgba(59,130,246,.18), 0 0 0 3px rgba(139,92,246,.10) !important;
+    }
+    .stApp .stButton > button:active, .stApp .stDownloadButton > button:active,
+    .stApp [data-testid="stFormSubmitButton"] > button:active { transform:scale(.98) !important; transition-duration:.06s !important; }
+    .stApp .stButton > button:focus-visible, .stApp .stDownloadButton > button:focus-visible,
+    .stApp [data-testid="stFormSubmitButton"] > button:focus-visible {
+        outline:none !important; box-shadow:0 0 0 3px rgba(96,165,250,.35), 0 4px 12px rgba(0,0,0,.25) !important;
+    }
+    .stApp .stDownloadButton > button, .stApp .stDownloadButton > button:focus { color:#f8fafc !important; border:1px solid rgba(148,163,184,.26) !important; }
+    .stApp .stButton > button:disabled, .stApp .stDownloadButton > button:disabled {
+        opacity:.42 !important; transform:none !important; cursor:not-allowed; filter:saturate(.6);
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.04) !important; border-color:rgba(148,163,184,.14) !important;
+    }
+
+    /* Primary action buttons: electric indigo */
+    .stApp button[kind="primary"], .stApp .stButton > button[kind="primary"],
+    .stApp button[data-testid="stBaseButton-primary"], .stApp [data-testid="stFormSubmitButton"] > button[kind="primaryFormSubmit"] {
+        background:linear-gradient(135deg,#2563eb,#7c3aed) !important; color:#fff !important;
+        border:1px solid rgba(255,255,255,.20) !important;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.25), 0 6px 20px rgba(79,70,229,.38) !important;
+    }
+    .stApp button[kind="primary"] *, .stApp button[data-testid="stBaseButton-primary"] * { color:#fff !important; }
+    .stApp button[kind="primary"]:hover, .stApp .stButton > button[kind="primary"]:hover,
+    .stApp button[data-testid="stBaseButton-primary"]:hover {
+        background:linear-gradient(135deg,#3b74f0,#8b52f5) !important; border-color:rgba(255,255,255,.34) !important;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.30), 0 10px 28px rgba(99,102,241,.52), 0 0 0 3px rgba(96,165,250,.14) !important;
+    }
+    .stApp button[kind="primary"]:disabled, .stApp button[data-testid="stBaseButton-primary"]:disabled {
+        background:linear-gradient(135deg,#2563eb,#7c3aed) !important; box-shadow:none !important;
+    }
+
+    /* ---------- Inputs, forms, tabs, metrics, alerts ---------- */
+    .stTextInput input, .stTextArea textarea, .stNumberInput input, [data-baseweb="select"] > div {
+        background-color:rgba(20,27,41,.85) !important; border:1px solid rgba(148,163,184,.18) !important;
+        border-radius:12px !important; color:var(--obs-text) !important;
+        transition:border-color .18s ease, box-shadow .18s ease, background-color .18s ease;
+    }
+    .stTextInput input:hover, .stTextArea textarea:hover, .stNumberInput input:hover { border-color:rgba(148,163,184,.32) !important; }
+    .stTextInput input:focus, .stTextArea textarea:focus, .stNumberInput input:focus {
+        border-color:#60a5fa !important; box-shadow:0 0 0 3px rgba(96,165,250,.16) !important; background-color:rgba(24,32,49,.95) !important;
+    }
+    [data-testid="stForm"] { border:1px solid rgba(255,255,255,.07) !important; border-radius:16px !important; background:rgba(255,255,255,.02); }
+    [data-testid="stMetric"] {
+        background:linear-gradient(180deg, rgba(30,39,58,.65), rgba(20,27,41,.75)) !important;
+        border:1px solid rgba(255,255,255,.07) !important; border-radius:14px !important;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.05);
+    }
+    [data-testid="stAlert"] { border-radius:14px !important; border:1px solid rgba(255,255,255,.07) !important; backdrop-filter:blur(8px); }
+    [data-testid="stStatus"] { background:rgba(255,255,255,.03) !important; border:1px solid rgba(255,255,255,.07) !important; }
+    button[role="tab"] { border-radius:10px 10px 0 0; transition:color .18s ease, background .18s ease; }
+    button[role="tab"]:hover { background:rgba(96,165,250,.07) !important; }
+    button[role="tab"][aria-selected="true"] { color:#bfdbfe !important; }
+    [data-baseweb="tab-highlight"] { background:linear-gradient(90deg,#3b82f6,#8b5cf6) !important; height:2px !important; }
+    [data-baseweb="tab-border"] { background:rgba(255,255,255,.07) !important; }
+    pre, [data-testid="stCode"] { background:rgba(10,14,24,.92) !important; border:1px solid rgba(255,255,255,.07); border-radius:14px !important; }
+    [data-testid="stMarkdownContainer"] :not(pre) > code {
+        background:rgba(96,165,250,.10) !important; border:1px solid rgba(96,165,250,.16); border-radius:6px; padding:1px 6px; color:#cfe3ff !important;
+    }
+    [data-testid="stImage"] img { border-radius:14px; box-shadow:0 8px 28px rgba(0,0,0,.35); }
+
+    /* ---------- 4) Chat bubbles ---------- */
+    [data-testid="stChatMessage"] { border-radius:18px !important; }
+    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
+        background:linear-gradient(135deg, rgba(59,130,246,.22), rgba(99,102,241,.13) 60%, rgba(139,92,246,.10)) !important;
+        border:1px solid rgba(96,165,250,.26) !important;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.07), 0 8px 26px rgba(2,8,23,.38) !important;
+        -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px);
+    }
+    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
+        background:transparent !important; border-bottom:1px solid rgba(255,255,255,.055) !important; border-radius:0 !important;
+    }
+    [data-testid="stChatMessageAvatarUser"] { background:linear-gradient(135deg,#3b82f6,#6366f1) !important; box-shadow:0 0 0 2px rgba(96,165,250,.20); }
+    [data-testid="stChatMessageAvatarAssistant"] { background:linear-gradient(135deg,#1e293b,#312e81) !important; box-shadow:0 0 0 2px rgba(139,92,246,.22); }
+
+    /* ---------- Floating glass composer (geometry untouched for the mic script) ---------- */
+    [data-testid="stChatInput"] {
+        background:rgba(24,31,46,.88) !important; background-color:rgba(24,31,46,.88) !important;
+        -webkit-backdrop-filter:blur(18px) saturate(150%); backdrop-filter:blur(18px) saturate(150%);
+        border:1px solid rgba(96,165,250,.28) !important; border-radius:26px !important;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.07), 0 14px 44px rgba(0,0,0,.45), 0 2px 10px rgba(0,0,0,.25) !important;
+        transition:border-color .25s var(--obs-ease), box-shadow .25s var(--obs-ease) !important;
+    }
+    [data-testid="stChatInput"] > div { background:transparent !important; background-color:transparent !important; border:0 !important; box-shadow:none !important; }
+    [data-testid="stChatInput"]:hover { border-color:rgba(96,165,250,.42) !important; }
+    [data-testid="stChatInput"]:focus-within {
+        border-color:rgba(96,165,250,.75) !important;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.08), 0 0 0 4px rgba(96,165,250,.14), 0 14px 48px rgba(59,130,246,.22) !important;
+        animation:composerRing 2.8s ease-in-out infinite;
+    }
+    @keyframes composerRing {
+        0%,100% { box-shadow:inset 0 1px 0 rgba(255,255,255,.08), 0 0 0 3px rgba(96,165,250,.14), 0 14px 44px rgba(59,130,246,.20); }
+        50%     { box-shadow:inset 0 1px 0 rgba(255,255,255,.08), 0 0 0 5px rgba(139,92,246,.16), 0 14px 52px rgba(139,92,246,.26); }
+    }
+    [data-testid="stChatInput"] textarea { color:#f4f7fc !important; caret-color:#60a5fa !important; }
+    [data-testid="stChatInput"] textarea::placeholder { color:#7d8aa1 !important; }
+    [data-testid="stChatInputSubmitButton"] {
+        background:linear-gradient(135deg,#3b82f6,#8b5cf6) !important; border-radius:12px !important;
+        box-shadow:0 4px 14px rgba(99,102,241,.40) !important; color:#fff !important;
+        transition:filter .18s ease, box-shadow .18s ease;
+    }
+    [data-testid="stChatInputSubmitButton"] svg { color:#fff !important; fill:#fff !important; }
+    [data-testid="stChatInputSubmitButton"]:hover:not(:disabled) { filter:brightness(1.12); box-shadow:0 6px 20px rgba(99,102,241,.55) !important; }
+    [data-testid="stChatInputSubmitButton"]:disabled { background:rgba(148,163,184,.14) !important; box-shadow:none !important; }
+    [data-testid="stChatInputSubmitButton"]:disabled svg { color:#7d8aa1 !important; fill:#7d8aa1 !important; }
+
+    /* ---------- Custom scrollbars ---------- */
+    * { scrollbar-width:thin; scrollbar-color:rgba(148,163,184,.28) transparent; }
+    ::-webkit-scrollbar { width:8px; height:8px; }
+    ::-webkit-scrollbar-track { background:transparent; }
+    ::-webkit-scrollbar-thumb { background:rgba(148,163,184,.22); border-radius:999px; border:2px solid transparent; background-clip:content-box; }
+    ::-webkit-scrollbar-thumb:hover { background:rgba(96,165,250,.55); background-clip:content-box; border:2px solid transparent; }
+    ::-webkit-scrollbar-corner { background:transparent; }
+    [data-baseweb="tab-list"] { scrollbar-width:none; }
+
+    /* ---------- Brand polish ---------- */
+    .app-bar .app-sub, .perf-badge { color:var(--obs-muted) !important; }
+    .perf-badge { background:rgba(96,165,250,.08); border:1px solid rgba(96,165,250,.20); }
+
+    /* ---------- Touch devices: no sticky hover lift ---------- */
+    @media (hover:none) {
+        .stApp .stButton > button:hover, .stApp .stDownloadButton > button:hover,
+        .stApp [data-testid="stFormSubmitButton"] > button:hover { transform:none !important; }
+        [data-testid="stSidebar"] .stButton > button:hover, [data-testid="stSidebar"] [role="radiogroup"] label:hover { transform:none !important; }
+        .stApp button[kind="primary"]:hover, .stApp .stButton > button[kind="primary"]:hover { transform:none !important; }
+        [data-testid="stSidebar"] .st-key-new_chat_btn button:hover { transform:none !important; filter:none; }
+    }
+    @media (max-width:700px) {
+        .stApp { background-size:22px 22px, auto, auto, auto, auto !important; }
+        [data-testid="stSidebar"] { -webkit-backdrop-filter:blur(16px); backdrop-filter:blur(16px); background:rgba(13,18,29,.92) !important; }
+        [data-testid="stChatInput"] { border-radius:28px !important; }
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { -webkit-backdrop-filter:none; backdrop-filter:none; }
+        ::-webkit-scrollbar { width:4px; height:4px; }
+    }
+    @media (prefers-reduced-motion:reduce) {
+        [data-testid="stChatInput"]:focus-within { animation:none !important; }
+        .stApp *, .stApp *::before, .stApp *::after { transition-duration:.01ms !important; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -5643,3 +5935,4 @@ if st.session_state.pending:
         st.session_state.pending = False
         if success:
             st.rerun()
+            
