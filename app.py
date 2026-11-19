@@ -2976,7 +2976,7 @@ with st.sidebar:
     st.divider()
     app_mode = st.radio(
         "কাজের ধরন (Mode):",
-        ["💬 সাধারণ চ্যাট", "📦 WordPress JSON তৈরি", "🔌 WordPress Agent", "📱 অ্যাপ বিল্ডার", "🎨 ছবি তৈরি", "🎬 ভিডিও স্টুডিও", "🚀 WP অটোমেশন"],
+        ["💬 সাধারণ চ্যাট", "📦 WordPress JSON তৈরি", "🔌 WordPress Agent", "📱 অ্যাপ বিল্ডার", "🎨 ছবি তৈরি", "🎬 ভিডিও স্টুডিও", "🚀 WP অটোমেশন", "🌊 Webflow"],
     )
     is_json_mode = app_mode.startswith("📦")
     is_agent_mode = app_mode.startswith("🔌")
@@ -2984,6 +2984,7 @@ with st.sidebar:
     is_app_mode = app_mode.startswith("📱")
     is_video_mode = app_mode.startswith("🎬")
     is_wpauto_mode = app_mode.startswith("🚀")
+    is_webflow_mode = app_mode.startswith("🌊")
 
     if app_mode.startswith("💬"):
         with st.expander("🎭 AI-এর ভূমিকা (Persona)", expanded=False):
@@ -5574,6 +5575,836 @@ if is_wpauto_mode:
     st.stop()
 
 
+# ---------- Webflow (Data API v2 — শুধু requests দিয়ে, আলাদা SDK লাগে না) ----------
+WEBFLOW_API = "https://api.webflow.com/v2"
+WEBFLOW_TOKEN = ""
+for _wf_k in ("WEBFLOW_API_TOKEN", "WEBFLOW_API_KEY", "WEBFLOW_TOKEN", "WEBFLOW_ACCESS_TOKEN"):
+    WEBFLOW_TOKEN = str(get_secret(_wf_k) or "").strip()
+    if WEBFLOW_TOKEN:
+        break
+WEBFLOW_SITE_ID = str(get_secret("WEBFLOW_SITE_ID") or "").strip()
+WF_MAX_RESULTS = 20
+
+
+def wf_token():
+    return (st.session_state.get("wf_token_input") or WEBFLOW_TOKEN or "").strip()
+
+
+def _wf_msg(e):
+    return str(e).replace("\n", " ")[:400]
+
+
+def _wf_err(r):
+    try:
+        j = r.json()
+        msg = str(j.get("message") or j.get("err") or r.text[:200])[:140]
+        if j.get("details"):
+            msg += " — " + json.dumps(j["details"], ensure_ascii=False)[:120]
+    except Exception:
+        msg = r.text[:140]
+    hint = {
+        401: " (API token ভুল বা মেয়াদ শেষ — Webflow থেকে নতুন টোকেন বানাও)",
+        403: " (টোকেনে পারমিশন নেই — Sites, CMS ও Pages-এর Read/Write scope দিয়ে টোকেন বানাও)",
+        404: " (আইডি ভুল, অথবা টোকেনটি এই সাইটে অনুমোদিত নয়)",
+        429: " (খুব দ্রুত রিকোয়েস্ট হয়েছে — ১ মিনিট পর আবার চেষ্টা করো)",
+    }.get(r.status_code, "")
+    return f"Webflow {r.status_code}: {msg}{hint}"
+
+
+def wf_request(method, path, payload=None, params=None):
+    headers = {"Authorization": f"Bearer {wf_token()}", "accept": "application/json"}
+    r = None
+    for attempt in range(2):
+        r = requests.request(method, WEBFLOW_API + path, headers=headers, json=payload, params=params, timeout=30)
+        if r.status_code == 429 and attempt == 0:
+            try:
+                wait = min(int(r.headers.get("Retry-After", "5")), 20)
+            except ValueError:
+                wait = 5
+            time.sleep(wait)
+            continue
+        break
+    if not r.ok:
+        raise RuntimeError(_wf_err(r))
+    try:
+        return r.json()
+    except ValueError:
+        return {}
+
+
+def wf_sites():
+    out = []
+    for s in wf_request("GET", "/sites").get("sites", []):
+        out.append({"id": s["id"], "name": s.get("displayName") or s.get("shortName") or s["id"],
+                    "short": s.get("shortName", ""), "last": s.get("lastPublished") or ""})
+    return out
+
+
+def wf_collections(site_id):
+    out = []
+    for c in wf_request("GET", f"/sites/{site_id}/collections").get("collections", []):
+        out.append({"id": c["id"], "name": c.get("displayName") or c.get("slug") or c["id"], "slug": c.get("slug", "")})
+    return out
+
+
+def wf_schema(cid):
+    return wf_request("GET", f"/collections/{cid}")
+
+
+def wf_items(cid, limit=25):
+    return wf_request("GET", f"/collections/{cid}/items", params={"limit": limit}).get("items", [])
+
+
+def wf_create_item(cid, field_data):
+    return wf_request("POST", f"/collections/{cid}/items",
+                      {"isArchived": False, "isDraft": False, "fieldData": field_data})
+
+
+def wf_publish_items(cid, ids):
+    return wf_request("POST", f"/collections/{cid}/items/publish", {"itemIds": list(ids)})
+
+
+def wf_pages(site_id):
+    return wf_request("GET", f"/sites/{site_id}/pages", params={"limit": 50}).get("pages", [])
+
+
+def wf_domains(site_id):
+    return wf_request("GET", f"/sites/{site_id}/custom_domains").get("customDomains", [])
+
+
+def wf_publish_site(site_id, domain_ids):
+    body = {"publishToWebflowSubdomain": True}
+    if domain_ids:
+        body["customDomains"] = list(domain_ids)
+    return wf_request("POST", f"/sites/{site_id}/publish", body)
+
+
+def _wf_cached(key, loader):
+    if key not in st.session_state:
+        st.session_state[key] = loader()
+    return st.session_state[key]
+
+
+def _wf_clear_cache():
+    for k in [k for k in st.session_state if str(k).startswith("_wf_c::")]:
+        del st.session_state[k]
+
+
+def _wf_slug(s, fallback):
+    s = re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")[:60].strip("-")
+    return s or fallback
+
+
+def _wf_push(res):
+    lst = st.session_state.setdefault("_wf_results", [])
+    if res.get("content"):
+        res["content"] = res["content"][:20000]
+    lst.insert(0, res)
+    del lst[WF_MAX_RESULTS:]
+
+
+def wf_article_one(topic, o, say):
+    r = {"topic": topic, "warns": []}
+    say("✍️ AI আর্টিকেল লিখছে...")
+    d = ai_blog(topic, o["kw"], o["tone"], o["lang"], o["words"])
+    title = (d["title"] or topic)[:90]
+    base = _wf_slug(d["slug"], "post-" + uuid.uuid4().hex[:6])
+    fm = o["map"]
+    data = {"name": title, "slug": base}
+    if fm.get("body"):
+        data[fm["body"]] = d["content"]
+    if fm.get("summary"):
+        data[fm["summary"]] = (d["excerpt"] or "")[:250]
+    say("📤 Webflow CMS-এ পাঠানো হচ্ছে...")
+    try:
+        item = wf_create_item(o["cid"], data)
+    except RuntimeError as e:
+        low = str(e).lower()
+        if "slug" in low or "unique" in low:  # একই slug আগে থেকে থাকলে ছোট সাফিক্স দিয়ে আবার
+            data["slug"] = f"{base}-{uuid.uuid4().hex[:4]}"
+            item = wf_create_item(o["cid"], data)
+        else:
+            raise
+    iid = item.get("id")
+    r.update(title=title, id=iid, cid=o["cid"], status="staged", content=d["content"],
+             slug=(item.get("fieldData") or {}).get("slug", data["slug"]))
+    if o["publish"] and iid:
+        say("🌍 লাইভ পাবলিশ হচ্ছে...")
+        try:
+            wf_publish_items(o["cid"], [iid])
+            r["status"] = "live"
+        except Exception as e:
+            r["warns"].append(f"পাবলিশ হয়নি (CMS-এ সেভ আছে): {_wf_msg(e)}")
+    return r
+
+
+def _wf_show_results():
+    res = st.session_state.get("_wf_results") or []
+    if not res:
+        return
+    st.divider()
+    st.markdown("#### 📋 সাম্প্রতিক ফলাফল")
+    for i, r in enumerate(res):
+        title = (r.get("title") or r.get("topic") or "").replace("[", "(").replace("]", ")")
+        badge = "🌍 লাইভ" if r.get("status") == "live" else "📝 CMS-এ সেভ (লাইভ নয়)"
+        st.markdown(f"📰 **{title}** — {badge} · slug: `{r.get('slug', '')}`")
+        for w in r.get("warns", []):
+            st.caption("⚠️ " + w)
+        if r.get("status") != "live" and r.get("id"):
+            if st.button("🌍 এখনই পাবলিশ করো", key=f"wf_pub_{i}_{r['id']}"):
+                try:
+                    wf_publish_items(r["cid"], [r["id"]])
+                    r["status"] = "live"
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"পাবলিশ হয়নি: {_wf_msg(e)}")
+        if r.get("content"):
+            with st.expander("প্রিভিউ", expanded=False):
+                st.markdown(r["content"], unsafe_allow_html=True)
+
+
+# ---------- Webflow: AI ওয়েবসাইট বিল্ডার (পেজ কনটেন্ট/SEO আপডেট + কাস্টম পেজ জেনারেটর) ----------
+WF_SEO_TITLE_MAX = 60
+WF_SEO_DESC_MAX = 155
+WF_MAX_NODES_FOR_AI = 150
+_WF_NODE_RE = re.compile(r"^\s*<([a-zA-Z][\w-]*)([^>]*)>([\s\S]*)</\1\s*>\s*$")
+_WF_NESTED_RE = re.compile(r"<(ul|ol|li|div|table|section|a|img|button|form)\b", re.I)
+
+
+def _wf_json(text):
+    """AI-এর উত্তর থেকে প্রথম JSON অবজেক্টটি বের করে"""
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text or "").strip()
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if m:
+        text = m.group(1)
+    a, b = text.find("{"), text.rfind("}")
+    if a < 0 or b <= a:
+        raise RuntimeError("AI সঠিক JSON ফরম্যাটে উত্তর দেয়নি। আবার চেষ্টা করো।")
+    try:
+        data = json.loads(text[a:b + 1])
+    except ValueError:
+        raise RuntimeError("AI-এর উত্তর পড়া যায়নি (JSON ভাঙা)। আবার চেষ্টা করো।")
+    if not isinstance(data, dict):
+        raise RuntimeError("AI সঠিক JSON ফরম্যাটে উত্তর দেয়নি। আবার চেষ্টা করো।")
+    return data
+
+
+def wf_site_locales(site_id):
+    j = wf_request("GET", f"/sites/{site_id}")
+    loc = j.get("locales") or {}
+
+    def one(x):
+        return {"id": x.get("id") or "", "tag": x.get("tag") or "",
+                "name": x.get("displayName") or x.get("tag") or x.get("id") or ""}
+
+    return {"primary": one(loc["primary"]) if loc.get("primary") else None,
+            "secondary": [one(x) for x in (loc.get("secondary") or []) if x.get("id")]}
+
+
+def wf_page_meta(pid, locale_id=None):
+    return wf_request("GET", f"/pages/{pid}", params={"localeId": locale_id} if locale_id else None)
+
+
+def wf_page_dom(pid, locale_id=None):
+    nodes, offset = [], 0
+    for _ in range(10):  # সর্বোচ্চ ১০০০ নোড
+        params = {"limit": 100, "offset": offset}
+        if locale_id:
+            params["localeId"] = locale_id
+        j = wf_request("GET", f"/pages/{pid}/dom", params=params)
+        got = j.get("nodes") or []
+        nodes += got
+        total = (j.get("pagination") or {}).get("total", len(nodes))
+        offset += 100
+        if not got or offset >= total:
+            break
+    return nodes
+
+
+def wf_update_dom(pid, locale_id, nodes):
+    """স্ট্যাটিক টেক্সট আপডেট — Webflow API শুধু সেকেন্ডারি লোকেলে এটি অনুমোদন করে"""
+    for i in range(0, len(nodes), 1000):
+        wf_request("POST", f"/pages/{pid}/dom", {"nodes": nodes[i:i + 1000]}, params={"localeId": locale_id})
+
+
+def wf_update_seo(pid, title, desc, locale_id=None):
+    body = {"seo": {"title": (title or "")[:WF_SEO_TITLE_MAX], "description": (desc or "")[:WF_SEO_DESC_MAX]}}
+    return wf_request("PUT", f"/pages/{pid}", body, params={"localeId": locale_id} if locale_id else None)
+
+
+def _wf_plain(h):
+    import html as _h
+    t = re.sub(r"<br\s*/?>", " ", h or "", flags=re.I)
+    t = re.sub(r"<[^>]+>", "", t)
+    return re.sub(r"\s+", " ", _h.unescape(t)).strip()
+
+
+def _wf_node_tag(h):
+    m = _WF_NODE_RE.match(h or "")
+    return m.group(1).lower() if m else "text"
+
+
+def _wf_node_html(orig, new_text):
+    """আগের নোডের ট্যাগ ও data-w-id অক্ষত রেখে ভেতরের লেখা বদলায়। জটিল নোড হলে None"""
+    import html as _h
+    new_text = (new_text or "").strip()
+    if not new_text:
+        return None
+    m = _WF_NODE_RE.match(orig or "")
+    if not m:
+        return _h.escape(new_text)
+    tag, attrs, inner = m.group(1), m.group(2), m.group(3)
+    if _WF_NESTED_RE.search(inner):
+        return None
+    paras = [p.strip() for p in re.split(r"\n\s*\n", new_text) if p.strip()]
+    if re.search(r"<p\b", inner, re.I):
+        body = "".join(f"<p>{_h.escape(p)}</p>" for p in paras)
+    else:
+        body = " ".join(_h.escape(p) for p in paras)
+    return f"<{tag}{attrs}>{body}</{tag}>"
+
+
+def wf_text_rows(nodes):
+    """পেজের বদলানোর যোগ্য টেক্সট নোডগুলো"""
+    rows = []
+    for n in nodes:
+        if n.get("type") != "text":
+            continue
+        t = n.get("text") or {}
+        h = t.get("html") or ""
+        plain = _wf_plain(h) or _wf_plain(t.get("text") or "")
+        if not n.get("id") or not h or not plain or _wf_node_html(h, "x") is None:
+            continue
+        rows.append({"id": n["id"], "tag": _wf_node_tag(h), "old": plain, "html": h})
+    return rows
+
+
+def wf_build_copy(brief, lang, tone, page_title, samples):
+    sysp = (
+        "You are a senior conversion copywriter and SEO specialist for websites.\n"
+        "Return ONLY one valid JSON object (no markdown fences, no commentary) with exactly these keys:\n"
+        '{"hero_headline": "", "hero_subheadline": "", "hero_cta": "", '
+        '"features": [{"title": "", "text": ""}], '
+        '"sections": [{"heading": "", "body": ""}], '
+        '"cta_headline": "", "cta_text": "", "cta_button": "", '
+        '"seo_title": "", "meta_description": ""}\n'
+        "features: 3-6 items. sections: 0-3 items (e.g. about, how it works) without fabricated facts.\n"
+        f"Language of ALL copy: {lang}. Tone: {tone}.\n"
+        f"Rules: benefit-led and conversion-focused; hero_headline max 12 words; button labels 2-4 words; "
+        f"seo_title max {WF_SEO_TITLE_MAX} characters; meta_description max {WF_SEO_DESC_MAX} characters, with a clear call to action. "
+        "Never invent statistics, testimonials, prices, awards, client names or contact details. Plain text only (no HTML, no markdown)."
+    )
+    user = f"Business / page brief:\n{brief}\n\nPage title: {page_title}\n"
+    if samples:
+        user += "Existing text on the page (only to understand the layout/structure, do not copy):\n" + \
+                "\n".join(f"- {s[:100]}" for s in samples[:25])
+    d = _wf_json(auto_llm(sysp, user, 0.7))
+    s = lambda k: str(d.get(k) or "").strip()
+    return {
+        "hero_headline": s("hero_headline"), "hero_subheadline": s("hero_subheadline"), "hero_cta": s("hero_cta"),
+        "features": [{"title": str(f.get("title") or "").strip(), "text": str(f.get("text") or "").strip()}
+                     for f in (d.get("features") or []) if isinstance(f, dict)][:6],
+        "sections": [{"heading": str(f.get("heading") or "").strip(), "body": str(f.get("body") or "").strip()}
+                     for f in (d.get("sections") or []) if isinstance(f, dict)][:3],
+        "cta_headline": s("cta_headline"), "cta_text": s("cta_text"), "cta_button": s("cta_button"),
+        "seo_title": s("seo_title")[:WF_SEO_TITLE_MAX], "meta_description": s("meta_description")[:WF_SEO_DESC_MAX],
+    }
+
+
+def wf_map_copy(copy, rows):
+    """AI দিয়ে জেনারেট করা কপি পেজের টেক্সট নোডে বসানোর ম্যাপ ({node_id: নতুন লেখা})"""
+    sysp = (
+        "You place new website copy into the existing text elements of a Webflow page.\n"
+        "Input: (1) the generated copy as JSON, (2) the page's text nodes as a JSON list of {id, tag, text}.\n"
+        'Return ONLY one JSON object: {"map": {"<node id>": "<new plain text>"}}\n'
+        "Rules: include only nodes you replace and only ids from the list. h1 = hero headline; the paragraph right after it "
+        "= hero subheadline; h2/h3 followed by a p = feature or section title and its text, in reading order; "
+        "replace a link/button label only if it is clearly a call-to-action (e.g. 'Get started', 'Contact us'). "
+        "Leave navigation, footer, legal, cookie notices, form labels and anything you are unsure about untouched. "
+        "New text must be plain text (no HTML/markdown), similar in length to the original (up to 1.5x for paragraphs), "
+        "in the language of the copy. Never reuse the same copy twice."
+    )
+    nodes = [{"id": r["id"], "tag": r["tag"], "text": r["old"][:140]} for r in rows[:WF_MAX_NODES_FOR_AI]]
+    user = "COPY:\n" + json.dumps(copy, ensure_ascii=False) + "\n\nNODES:\n" + json.dumps(nodes, ensure_ascii=False)
+    raw = _wf_json(auto_llm(sysp, user, 0.3)).get("map")
+    if not isinstance(raw, dict):
+        raise RuntimeError("AI কপি বসানোর ম্যাপ দেয়নি। আবার চেষ্টা করো।")
+    known = {r["id"] for r in rows}
+    out = {}
+    for k, v in raw.items():
+        v = re.sub(r"<[^>]+>", "", str(v or "")).strip()
+        if k in known and v:
+            out[k] = v[:600]
+    return out
+
+
+def wf_gen_page(desc, kind, lang, style, prev_code="", change=""):
+    """সম্পূর্ণ ল্যান্ডিং পেজ বা Webflow Embed সেকশনের HTML/CSS/JS তৈরি"""
+    base = (
+        "You are a senior front-end engineer and UI designer. Build clean, modern, conversion-focused, fully responsive "
+        "(mobile-first) web UI with semantic HTML5, modern CSS (flexbox/grid, CSS variables, clamp()) and small vanilla JS only "
+        "where useful (mobile menu, FAQ accordion, smooth scroll, tabs). No frameworks, no external JS libraries, no remote images "
+        "(use CSS gradients, inline SVG or emoji). Google Fonts via <link> is allowed. Forms must not need a backend "
+        "(prevent default and show a thank-you message). Accessible: labels, alt text, good contrast, visible focus. "
+        "Never invent statistics, real-person testimonials, prices, awards or contact details; use clearly generic placeholders.\n"
+    )
+    if kind == "page":
+        fmt = ("Output ONE complete standalone HTML document (<!DOCTYPE html> ... </html>) with a viewport meta tag, all CSS in one "
+               "<style> and all JS in one <script>. Include the sections the brief needs (e.g. sticky header, hero, features, "
+               "how it works, social-proof placeholder, offer/pricing, FAQ, final CTA, footer).")
+    else:
+        fmt = ("Output ONLY an HTML fragment for a Webflow Embed element: NO <html>, <head> or <body>. Use one root "
+               "<div class=\"wfx-root\">; prefix every class with wfx- and scope every CSS rule under .wfx-root; put <style> first "
+               "and an optional <script> (wrapped in an IIFE) last. Keep it compact (ideally under 9,000 characters).")
+    sysp = base + fmt + f"\nLanguage of all visible text: {lang}.\nReturn exactly one ```html code block and nothing else."
+    user = f"Brief:\n{desc}\n" + (f"Visual style / colors: {style}\n" if style else "")
+    if prev_code and change:
+        user += f"\nCurrent code:\n```html\n{prev_code[:60000]}\n```\nChange request: {change}\nReturn the FULL updated code."
+    text = auto_llm(sysp, user, 0.7)
+    page = build_preview_html(text)
+    if not page:
+        raise RuntimeError("AI থেকে ব্যবহারযোগ্য HTML পাওয়া যায়নি। আবার চেষ্টা করো।")
+    html_b, _, _ = _html_blocks(text)
+    return {"page": page, "raw": "\n".join(html_b) or page, "kind": kind, "incomplete": app_html_incomplete(text)}
+
+
+def _wf_page_updater(sid):
+    st.markdown("##### 📝 পেজের কনটেন্ট ও SEO আপডেট (AI)")
+    st.caption("Webflow-এর একটি পেজ বেছে নাও → বিবরণ দাও → AI পুরো পেজের কপি (Hero, ফিচার, CTA, SEO) লিখবে → রিভিউ করে Webflow-এ পাঠাও।")
+
+    pk = f"_wf_c::bpages::{sid}"
+    if pk not in st.session_state:
+        try:
+            with st.spinner("পেজের তালিকা আনা হচ্ছে..."):
+                st.session_state[pk] = {"pages": wf_pages(sid)}
+        except Exception as e:
+            st.session_state[pk] = {"error": _wf_msg(e)}
+    got = st.session_state[pk]
+    if got.get("error"):
+        st.error(f"পেজ লোড হয়নি: {got['error']}")
+        return
+    pages = [p for p in got["pages"] if p.get("id") and not p.get("collectionId") and not p.get("archived")]
+    if not pages:
+        st.info("কোনো স্ট্যাটিক পেজ পাওয়া যায়নি (CMS টেমপ্লেট পেজের টেক্সট এই পদ্ধতিতে বদলানো যায় না)।")
+        return
+    by_pid = {p["id"]: p for p in pages}
+    label = lambda i: f"{str(by_pid[i].get('title') or by_pid[i].get('slug') or i)} — /{by_pid[i].get('slug', '')}" + \
+        (" · ✏️ ড্রাফট" if by_pid[i].get("draft") else "")
+    pid = st.selectbox("📄 পেজ বেছে নাও:", list(by_pid), format_func=label, key=f"wf_bpage_{sid}")
+
+    lk = f"_wf_c::locales::{sid}"
+    if lk not in st.session_state:
+        try:
+            st.session_state[lk] = wf_site_locales(sid)
+        except Exception:
+            st.session_state[lk] = {"primary": None, "secondary": []}
+    sec = st.session_state[lk].get("secondary") or []
+    loc = ""
+    if sec:
+        names = {"": "প্রাইমারি লোকেল (ডিফল্ট)"}
+        names.update({l["id"]: f"{l['name']} ({l['tag']})" if l["tag"] else l["name"] for l in sec})
+        loc = st.selectbox("🌍 লোকেল:", list(names), format_func=lambda i: names[i], key=f"wf_bloc_{sid}")
+
+    if st.button("📥 পেজের তথ্য ও টেক্সট লোড করো", key="wf_bload"):
+        try:
+            with st.spinner("পেজ লোড হচ্ছে..."):
+                meta = wf_page_meta(pid, loc or None)
+                nodes = wf_page_dom(pid, loc or None)
+            st.session_state["_wf_bpage"] = {"pid": pid, "loc": loc, "meta": meta, "nodes": nodes}
+            st.session_state.pop("_wf_bres", None)
+        except Exception as e:
+            st.error(f"পেজ লোড হয়নি: {_wf_msg(e)}")
+
+    bp = st.session_state.get("_wf_bpage")
+    if not bp or bp.get("pid") != pid or bp.get("loc") != loc:
+        st.caption("উপরের বাটনে চাপ দিলে পেজের বর্তমান SEO ও টেক্সট লোড হবে।")
+        return
+
+    meta = bp["meta"] or {}
+    seo = meta.get("seo") or {}
+    rows = wf_text_rows(bp["nodes"])
+    st.markdown(f"**{str(meta.get('title') or '').replace('[', '(').replace(']', ')')}** · `/{meta.get('slug', '')}`")
+    st.caption(f"বর্তমান SEO Title: {seo.get('title') or '—'}  |  Meta Description: {seo.get('description') or '—'}")
+    st.caption(f"📑 {len(rows)}টি বদলানোর যোগ্য টেক্সট নোড পাওয়া গেছে।")
+    if rows:
+        with st.expander("পেজের বর্তমান টেক্সট", expanded=False):
+            for r in rows[:80]:
+                st.markdown(f"• `{r['tag']}` — " + r["old"][:140].replace("[", "(").replace("]", ")"))
+    if not loc:
+        st.info("ℹ️ Webflow API শুধু **সেকেন্ডারি লোকেলের** পেজের টেক্সট নোড আপডেট করতে দেয়। প্রাইমারি লোকেলে শুধু **SEO Title ও Meta Description** "
+                "আপডেট হবে; জেনারেট করা কপি ডাউনলোড করে Webflow Designer-এ বসাতে পারো।")
+
+    brief = st.text_area("🧠 ওয়েবসাইট/পেজের বিবরণ (ব্যবসার ধরন, টার্গেট অডিয়েন্স, টোন, ভাষা):", key=f"wf_bbrief_{pid}", height=130,
+                         placeholder="যেমন: ঢাকার একটি ডিজিটাল মার্কেটিং এজেন্সি। টার্গেট: ছোট ব্যবসার মালিক। সেবা: SEO, ফেসবুক অ্যাড, ওয়েবসাইট। টোন: বিশ্বাসযোগ্য ও উৎসাহী।")
+    c1, c2 = st.columns(2)
+    lang = c1.selectbox("ভাষা", ["বাংলা", "English"], key="wf_blang")
+    tone = c2.selectbox("টোন", ["প্রফেশনাল", "বন্ধুত্বপূর্ণ", "বিক্রয়মুখী", "প্রিমিয়াম"], key="wf_btone")
+    if not ANTHROPIC_API_KEY and not GEMINI_API_KEY:
+        st.caption("ℹ️ শুধু Groq থাকলে ফলাফল ছোট বা কম নিখুঁত হতে পারে; ভালো ফলের জন্য Claude/Gemini key দাও।")
+
+    if st.button("✨ AI দিয়ে কপি লিখে পেজে বসানোর প্রিভিউ বানাও", key="wf_bgen", type="primary"):
+        if not brief.strip():
+            st.warning("আগে ওয়েবসাইট/পেজের বিবরণ লেখো।")
+        else:
+            with st.status("✨ কপি তৈরি হচ্ছে...", expanded=True) as stt:
+                try:
+                    stt.write("✍️ কনটেন্ট কপি লেখা হচ্ছে...")
+                    lang_en = "Bengali (বাংলা)" if lang == "বাংলা" else "English"
+                    copy = wf_build_copy(brief.strip(), lang_en, tone, str(meta.get("title") or ""), [r["old"] for r in rows])
+                    mapping = {}
+                    if rows:
+                        stt.write("🧩 পেজের টেক্সট নোডে বসানো হচ্ছে...")
+                        mapping = wf_map_copy(copy, rows)
+                    st.session_state["_wf_bres"] = {"pid": pid, "loc": loc, "gid": uuid.uuid4().hex[:8],
+                                                    "copy": copy, "map": mapping}
+                    stt.update(label="✅ কপি তৈরি — নিচে রিভিউ করো", state="complete", expanded=False)
+                except Exception as e:
+                    stt.update(label="❌ তৈরি হয়নি", state="error")
+                    st.error(friendly_error(e))
+
+    res = st.session_state.get("_wf_bres")
+    if not res or res.get("pid") != pid or res.get("loc") != loc:
+        return
+    gid, copy, mapping = res["gid"], res["copy"], res["map"]
+    st.divider()
+    st.markdown("###### 🔍 রিভিউ ও সম্পাদনা")
+    with st.expander("📄 জেনারেটেড কপি", expanded=False):
+        st.json(copy)
+    st.download_button("⬇️ কপি JSON ডাউনলোড", data=json.dumps(copy, ensure_ascii=False, indent=2).encode("utf-8"),
+                       file_name="webflow-copy.json", mime="application/json", key=f"wf_bcopydl_{gid}")
+
+    by_row = {r["id"]: r for r in rows}
+    edited = None
+    mapped_ids = [i for i in mapping if i in by_row]
+    if mapped_ids:
+        import pandas as pd
+        df = pd.DataFrame([{"প্রয়োগ": True, "id": i, "ট্যাগ": by_row[i]["tag"], "বর্তমান লেখা": by_row[i]["old"][:200],
+                            "নতুন লেখা": mapping[i]} for i in mapped_ids])
+        st.caption("টিক তুলে দিলে ওই নোড বাদ যাবে। \"নতুন লেখা\" ঘরে ক্লিক করে নিজেও এডিট করতে পারো।")
+        edited = st.data_editor(df, key=f"wf_bed_{gid}", hide_index=True, use_container_width=True,
+                                disabled=["id", "ট্যাগ", "বর্তমান লেখা"],
+                                column_config={"id": None, "প্রয়োগ": st.column_config.CheckboxColumn("প্রয়োগ", width="small")})
+    elif rows:
+        st.warning("AI কোনো নোডে কপি বসাতে পারেনি। আবার চেষ্টা করো, বা বিবরণ আরও স্পষ্ট করো।")
+
+    seo_t = st.text_input(f"SEO Title (সর্বোচ্চ {WF_SEO_TITLE_MAX} অক্ষর):", value=copy.get("seo_title", ""), key=f"wf_bseot_{gid}")
+    seo_d = st.text_area(f"Meta Description (সর্বোচ্চ {WF_SEO_DESC_MAX} অক্ষর):", value=copy.get("meta_description", ""),
+                         key=f"wf_bseod_{gid}", height=80)
+    st.caption(f"Title: {len(seo_t)}/{WF_SEO_TITLE_MAX} · Description: {len(seo_d)}/{WF_SEO_DESC_MAX}")
+
+    o1, o2, o3 = st.columns(3)
+    do_seo = o1.checkbox("🔎 SEO আপডেট", value=True, key=f"wf_bdoseo_{gid}")
+    do_dom = o2.checkbox("🧩 টেক্সট নোড আপডেট", value=bool(loc and mapped_ids), disabled=not (loc and mapped_ids), key=f"wf_bdodom_{gid}")
+    do_pub = o3.checkbox("🌍 সাথে সাইট পাবলিশ", value=False, key=f"wf_bdopub_{gid}")
+    st.caption("পাবলিশ শুধু Webflow সাবডোমেইনে হবে (কাস্টম ডোমেইনের জন্য \"সাইট ও পেজ\" ট্যাব)। সাইট পাবলিশ প্রতি মিনিটে সর্বোচ্চ ১ বার।")
+
+    if st.button("✅ Webflow-এ আপডেট করো", key=f"wf_bapply_{gid}", type="primary", disabled=not (do_seo or do_dom)):
+        ok = 0
+        if do_seo:
+            try:
+                wf_update_seo(pid, seo_t.strip(), seo_d.strip(), loc or None)
+                st.success("✅ SEO Title ও Meta Description আপডেট হয়েছে।")
+                ok += 1
+            except Exception as e:
+                st.error(f"SEO আপডেট হয়নি: {_wf_msg(e)}")
+        if do_dom and loc and edited is not None:
+            payload = []
+            for r in edited.to_dict("records"):
+                if r.get("প্রয়োগ") and r["id"] in by_row:
+                    h = _wf_node_html(by_row[r["id"]]["html"], str(r.get("নতুন লেখা") or ""))
+                    if h:
+                        payload.append({"nodeId": r["id"], "text": h})
+            if not payload:
+                st.warning("আপডেটের জন্য কোনো টেক্সট নোড নির্বাচিত নেই।")
+            else:
+                try:
+                    with st.spinner("টেক্সট নোড আপডেট হচ্ছে..."):
+                        wf_update_dom(pid, loc, payload)
+                    st.success(f"✅ {len(payload)}টি টেক্সট নোড আপডেট হয়েছে।")
+                    ok += 1
+                except Exception as e:
+                    st.error(f"টেক্সট আপডেট হয়নি: {_wf_msg(e)}")
+        if do_pub:
+            if not ok:
+                st.warning("কোনো আপডেট সফল হয়নি, তাই পাবলিশ করা হয়নি।")
+            else:
+                try:
+                    with st.spinner("সাইট পাবলিশ হচ্ছে..."):
+                        wf_publish_site(sid, [])
+                    st.success("🌍 সাইট পাবলিশের অনুরোধ পাঠানো হয়েছে।")
+                except Exception as e:
+                    st.error(f"পাবলিশ হয়নি (আপডেট Webflow-এ সেভ আছে): {_wf_msg(e)}")
+        if ok:
+            st.caption("নতুন টেক্সট দেখতে উপরের \"পেজের তথ্য ও টেক্সট লোড করো\" আবার চাপো।")
+
+
+def _wf_page_generator():
+    st.markdown("##### 🎨 কাস্টম পেজ / সেকশন জেনারেটর (লাইভ প্রিভিউ)")
+    st.caption("পুরো ল্যান্ডিং পেজ বা একটি সেকশনের বিবরণ দাও → AI রেসপন্সিভ HTML/CSS/JS বানাবে → প্রিভিউ দেখো → `.html` ডাউনলোড করো "
+               "বা Webflow-এর **Embed** এলিমেন্টে পেস্ট করো। (Webflow Data API দিয়ে কাস্টম কোডসহ নতুন পেজ সরাসরি তৈরি করা যায় না।)")
+    desc = st.text_area("📝 পেজ/সেকশনের বিবরণ:", key="wf_gdesc", height=130,
+                        placeholder="যেমন: একটি অনলাইন কোচিং সেন্টারের ল্যান্ডিং পেজ — হিরো, কোর্স লিস্ট, কেন আমরা, ধাপে ধাপে প্রক্রিয়া, FAQ, রেজিস্ট্রেশন ফর্ম ও ফুটার।")
+    g1, g2, g3 = st.columns(3)
+    kind = g1.radio("ধরন", ["page", "embed"], key="wf_gkind", horizontal=True,
+                    format_func=lambda k: "📄 পুরো পেজ" if k == "page" else "🧩 Embed সেকশন")
+    glang = g2.selectbox("ভাষা", ["বাংলা", "English"], key="wf_glang")
+    style = g3.text_input("স্টাইল/রং (ঐচ্ছিক):", key="wf_gstyle", placeholder="যেমন: ডার্ক, নীল-বেগুনি গ্রেডিয়েন্ট")
+
+    def run(prev="", change=""):
+        try:
+            with st.spinner("🎨 কোড তৈরি হচ্ছে... (বড় পেজে কয়েক মিনিট লাগতে পারে)"):
+                st.session_state["_wf_gen"] = wf_gen_page(desc.strip(), kind, "Bengali (বাংলা)" if glang == "বাংলা" else "English",
+                                                          style.strip(), prev, change)
+            return True
+        except Exception as e:
+            st.error(friendly_error(e))
+            return False
+
+    if st.button("🚀 কোড জেনারেট করো", key="wf_ggen", type="primary"):
+        if not desc.strip():
+            st.warning("আগে পেজ/সেকশনের বিবরণ লেখো।")
+        else:
+            run()
+
+    g = st.session_state.get("_wf_gen")
+    if not g:
+        return
+    if g.get("incomplete"):
+        st.warning("⚠️ AI-এর কোড মাঝপথে কেটে গিয়েছিল; স্বয়ংক্রিয়ভাবে বন্ধ করে দেওয়া হয়েছে। শেষের অংশ অসম্পূর্ণ থাকতে পারে — ছোট বিবরণ দিয়ে বা Claude/Gemini দিয়ে আবার চেষ্টা করো।")
+    view = st.radio("প্রিভিউ", ["🖥️ ডেস্কটপ", "📱 ফোন"], horizontal=True, key="wf_gview")
+    render_app_preview(g["page"], phone=view.startswith("📱"), height=800)
+    fname = "webflow-page.html" if g["kind"] == "page" else "webflow-embed-section.html"
+    st.download_button("⬇️ .html ডাউনলোড", data=g["page"].encode("utf-8"), file_name=fname, mime="text/html", key="wf_gdl")
+    code = g["raw"] if g["kind"] == "embed" else g["page"]
+    if g["kind"] == "embed":
+        n = len(code)
+        st.caption(f"📏 Embed কোডের দৈর্ঘ্য: {n:,} অক্ষর" + (" — ⚠️ Webflow Embed-এর সীমা সাধারণত ১০,০০০ অক্ষর; বড় হলে একাধিক Embed-এ ভাগ করো।" if n > 10000 else ""))
+    with st.expander("</> কোড দেখো / কপি করো", expanded=False):
+        st.code(code, language="html")
+    chg = st.text_input("✏️ পরিবর্তন চাও? (যেমন: হিরো সেকশনে রং বদলে সবুজ করো)", key="wf_gchg")
+    if st.button("🔁 পরিবর্তন প্রয়োগ করো", key="wf_gchg_btn"):
+        if not chg.strip():
+            st.warning("কী পরিবর্তন চাও তা লেখো।")
+        else:
+            if run(g["raw"], chg.strip()):
+                st.rerun()
+
+
+def render_wf_builder(sid, site):
+    _wf_page_updater(sid)
+    st.divider()
+    _wf_page_generator()
+
+
+def render_webflow():
+    st.markdown("### 🌊 Webflow অটোমেশন ও AI ওয়েবসাইট বিল্ডার")
+    st.caption("AI দিয়ে পেজের কনটেন্ট ও SEO আপডেট · কাস্টম ল্যান্ডিং পেজ জেনারেট ও প্রিভিউ · CMS আর্টিকেল পাঠানো · আইটেম ও সাইট পাবলিশ।")
+
+    with st.expander("🔑 API Token", expanded=not wf_token()):
+        if WEBFLOW_TOKEN:
+            st.success("✅ Secrets-এ Webflow টোকেন পাওয়া গেছে।")
+        st.text_input("API Token (ঐচ্ছিক — শুধু এই সেশনে কাজ করবে):", type="password", key="wf_token_input")
+        st.caption("স্থায়ী করতে Streamlit Secrets-এ দাও: `WEBFLOW_API_TOKEN = \"...\"` "
+                   "(ঐচ্ছিক: `WEBFLOW_SITE_ID = \"...\"`)। টোকেনে Sites, CMS ও Pages-এর Read + Write scope লাগবে।")
+
+    if not wf_token():
+        st.info("শুরু করতে উপরে API Token দাও, অথবা Secrets-এ `WEBFLOW_API_TOKEN` সেট করো।")
+        return
+
+    tok_id = hashlib.md5(wf_token().encode()).hexdigest()[:10]
+    if st.session_state.get("_wf_tok") != tok_id:
+        _wf_clear_cache()
+        st.session_state["_wf_tok"] = tok_id
+
+    top1, top2 = st.columns([4, 1])
+    if top2.button("🔄 রিফ্রেশ", key="wf_refresh", use_container_width=True):
+        _wf_clear_cache()
+
+    try:
+        with st.spinner("Webflow-এ সংযোগ হচ্ছে..."):
+            sites = _wf_cached("_wf_c::sites", wf_sites)
+    except Exception as e:
+        if WEBFLOW_SITE_ID:
+            sites = [{"id": WEBFLOW_SITE_ID, "name": "আমার সাইট (WEBFLOW_SITE_ID)", "short": "", "last": ""}]
+            st.caption("ℹ️ সাইটের তালিকা পাওয়া যায়নি (টোকেনে `sites:read` নেই?), তাই WEBFLOW_SITE_ID ব্যবহার হচ্ছে।")
+        else:
+            st.error(f"Webflow-এ সংযোগ হয়নি: {_wf_msg(e)}")
+            return
+    if not sites:
+        st.warning("এই টোকেনে কোনো সাইট পাওয়া যায়নি। টোকেন বানানোর সময় সাইটটি অনুমোদন দিয়েছ কি?")
+        return
+
+    by_id = {s["id"]: s for s in sites}
+    ids = list(by_id)
+    default_idx = ids.index(WEBFLOW_SITE_ID) if WEBFLOW_SITE_ID in by_id else 0
+    sid = top1.selectbox("🌐 সাইট:", ids, index=default_idx, format_func=lambda i: by_id[i]["name"], key="wf_site")
+    site = by_id[sid]
+
+    try:
+        cols = _wf_cached(f"_wf_c::cols::{sid}", lambda: wf_collections(sid))
+    except Exception as e:
+        cols = []
+        st.error(f"কালেকশন লোড হয়নি: {_wf_msg(e)}")
+    col_by_id = {c["id"]: c for c in cols}
+    cid = None
+    schema = {}
+    fields = []
+    if cols:
+        cid = st.selectbox("📚 CMS কালেকশন:", list(col_by_id), format_func=lambda i: col_by_id[i]["name"],
+                           key=f"wf_col_{sid}")
+        try:
+            schema = _wf_cached(f"_wf_c::schema::{cid}", lambda: wf_schema(cid))
+            fields = schema.get("fields") or []
+        except Exception as e:
+            st.error(f"কালেকশনের ফিল্ড লোড হয়নি: {_wf_msg(e)}")
+    else:
+        st.info("এই সাইটে কোনো CMS কালেকশন নেই (বা দেখার পারমিশন নেই)। Webflow-এ আগে একটি Collection (যেমন Blog Posts) বানাও।")
+
+    t_build, t_ai, t_items, t_site = st.tabs(["🏗️ AI ওয়েবসাইট বিল্ডার", "✍️ AI আর্টিকেল", "📚 আইটেম", "🌐 সাইট ও পেজ"])
+
+    with t_build:
+        render_wf_builder(sid, site)
+
+    with t_ai:
+        if not cid:
+            st.info("আগে একটি কালেকশন বেছে নাও।")
+        else:
+            rich = [f for f in fields if f.get("type") == "RichText"]
+            plain = [f for f in fields if f.get("type") == "PlainText" and f.get("slug") not in ("name", "slug")]
+            fmt = lambda s: "— বাদ —" if not s else next(
+                (f"{(f.get('displayName') or s)} ({s})" for f in fields if f.get("slug") == s), s)
+            body_opts = [None] + [f["slug"] for f in rich if f.get("slug")]
+            sum_opts = [None] + [f["slug"] for f in plain if f.get("slug")]
+            sum_default = next((i for i, s in enumerate(sum_opts)
+                                if s and re.search(r"summary|excerpt|description|short|intro", s, re.I)), 0)
+            m1, m2 = st.columns(2)
+            body_f = m1.selectbox("আর্টিকেলের বডি কোন ফিল্ডে যাবে:", body_opts, index=1 if len(body_opts) > 1 else 0,
+                                  format_func=fmt, key=f"wf_body_{cid}")
+            sum_f = m2.selectbox("সারসংক্ষেপ কোন ফিল্ডে যাবে:", sum_opts, index=sum_default,
+                                 format_func=fmt, key=f"wf_sum_{cid}")
+            if not rich:
+                st.warning("এই কালেকশনে কোনো Rich Text ফিল্ড নেই, তাই আর্টিকেলের বডি পাঠানো যাবে না — শুধু নাম/slug যাবে।")
+            filled = {"name", "slug", body_f, sum_f}
+            missing = [f.get("displayName") or f.get("slug") for f in fields
+                       if f.get("isRequired") and f.get("slug") not in filled]
+            if missing:
+                st.warning("এই required ফিল্ডগুলো AI পূরণ করবে না, তাই Webflow এরর দিতে পারে: " + ", ".join(map(str, missing))
+                           + "। এগুলো Webflow-এ Optional করে নাও।")
+
+            topics_txt = st.text_area(
+                f"আর্টিকেলের বিষয় (প্রতি লাইনে একটি, সর্বোচ্চ {WPA_MAX_TOPICS}টি):", key="wf_topics", height=110,
+                placeholder="যেমন:\nঘরে বসে ফ্রিল্যান্সিং শুরু করার গাইড\nসেরা ৫টি বাজেট স্মার্টফোন")
+            kw = st.text_input("কিওয়ার্ড (ঐচ্ছিক, কমা দিয়ে):", key="wf_kw")
+            c1, c2 = st.columns(2)
+            lang = c1.selectbox("ভাষা", ["বাংলা", "English"], key="wf_lang")
+            tone = c2.selectbox("টোন", ["বন্ধুত্বপূর্ণ", "প্রফেশনাল", "তথ্যবহুল গাইড", "বিক্রয়মুখী"], key="wf_tone")
+            c3, c4 = st.columns(2)
+            words = c3.select_slider("দৈর্ঘ্য (শব্দ)", options=[500, 800, 1200, 1800], value=800, key="wf_words")
+            mode = c4.radio("পাঠানোর পর", ["save", "publish"], key="wf_publish_mode", horizontal=True,
+                            format_func=lambda s: "📝 শুধু CMS-এ সেভ" if s == "save" else "🌍 লাইভ পাবলিশ")
+            if not ANTHROPIC_API_KEY and not GEMINI_API_KEY:
+                st.caption("ℹ️ শুধু Groq থাকলে লেখা কিছুটা ছোট হতে পারে; লম্বা আর্টিকেলের জন্য Claude/Gemini key ভালো।")
+            if st.button("🚀 AI দিয়ে লিখে Webflow-এ পাঠাও", key="wf_go", type="primary"):
+                topics = [t.strip() for t in topics_txt.splitlines() if t.strip()][:WPA_MAX_TOPICS]
+                if not topics:
+                    st.warning("অন্তত একটি বিষয় লেখো।")
+                else:
+                    o = {"kw": kw.strip(), "tone": tone, "lang": lang, "words": words, "cid": cid,
+                         "publish": mode == "publish", "map": {"body": body_f, "summary": sum_f}}
+                    for t in topics:
+                        with st.status(f"✍️ {t[:40]}", expanded=True) as stt:
+                            try:
+                                res = wf_article_one(t, o, lambda msg: stt.write(msg))
+                                _wf_push(res)
+                                stt.update(label=f"✅ {res['title'][:40]}", state="complete", expanded=False)
+                            except Exception as e:
+                                stt.update(label=f"❌ {t[:40]}", state="error")
+                                st.error(f"পাঠানো যায়নি: {_wf_msg(e)}")
+        _wf_show_results()
+
+    with t_items:
+        if not cid:
+            st.info("আগে একটি কালেকশন বেছে নাও।")
+        else:
+            if st.button("🔄 আইটেম লোড করো", key="wf_load_items"):
+                try:
+                    st.session_state[f"_wf_items::{cid}"] = wf_items(cid)
+                except Exception as e:
+                    st.error(f"আইটেম লোড হয়নি: {_wf_msg(e)}")
+            items = st.session_state.get(f"_wf_items::{cid}")
+            if items is None:
+                st.caption("উপরের বাটনে চাপ দিলে এই কালেকশনের সর্বশেষ আইটেম দেখাবে।")
+            elif not items:
+                st.info("এই কালেকশনে কোনো আইটেম নেই।")
+            else:
+                label = {}
+                for it in items:
+                    fd = it.get("fieldData") or {}
+                    state = "🌍 লাইভ" if it.get("lastPublished") else "📝 স্টেজড"
+                    if it.get("isDraft"):
+                        state = "✏️ ড্রাফট"
+                    if it.get("isArchived"):
+                        state = "🗄️ আর্কাইভ"
+                    label[it["id"]] = f"{fd.get('name') or '(নামহীন)'} — {state} · /{fd.get('slug', '')}"
+                for iid, txt in label.items():
+                    st.markdown("• " + txt.replace("[", "(").replace("]", ")"))
+                pick = st.multiselect("পাবলিশ করতে আইটেম বেছে নাও:", list(label), format_func=lambda i: label[i],
+                                      key=f"wf_pick_{cid}")
+                if st.button("🌍 নির্বাচিতগুলো পাবলিশ করো", key="wf_pub_sel", disabled=not pick):
+                    try:
+                        wf_publish_items(cid, pick)
+                        st.success(f"✅ {len(pick)}টি আইটেম পাবলিশ হয়েছে।")
+                        st.session_state.pop(f"_wf_items::{cid}", None)
+                    except Exception as e:
+                        st.error(f"পাবলিশ হয়নি: {_wf_msg(e)}")
+
+    with t_site:
+        st.markdown(f"**{site['name']}**" + (f" · `{site['short']}.webflow.io`" if site.get("short") else ""))
+        if site.get("last"):
+            st.caption(f"সর্বশেষ পাবলিশ: {site['last']}")
+        if st.button("📄 পেজের তালিকা দেখাও", key="wf_load_pages"):
+            try:
+                st.session_state[f"_wf_pages::{sid}"] = wf_pages(sid)
+            except Exception as e:
+                st.error(f"পেজ লোড হয়নি: {_wf_msg(e)}")
+        pages = st.session_state.get(f"_wf_pages::{sid}")
+        if pages:
+            for p in pages:
+                st.markdown(f"• **{str(p.get('title') or p.get('slug') or '').replace('[', '(').replace(']', ')')}** "
+                            f"— `/{p.get('slug', '')}`" + (" · ✏️ ড্রাফট" if p.get("draft") else ""))
+        elif pages is not None:
+            st.caption("কোনো পেজ পাওয়া যায়নি।")
+        st.divider()
+        st.markdown("##### 🚀 পুরো সাইট পাবলিশ")
+        dom_by_id = {}
+        try:
+            dom_by_id = {d["id"]: d.get("url", d["id"]) for d in _wf_cached(f"_wf_c::dom::{sid}", lambda: wf_domains(sid))}
+        except Exception:
+            pass
+        dom_sel = st.multiselect("কাস্টম ডোমেইন (ঐচ্ছিক):", list(dom_by_id), format_func=lambda i: dom_by_id[i],
+                                 key=f"wf_dom_{sid}") if dom_by_id else []
+        st.caption("Webflow সাবডোমেইনে সবসময় পাবলিশ হবে। সাইট পাবলিশ প্রতি মিনিটে সর্বোচ্চ ১ বার করা যায়।")
+        if st.button("🚀 সাইট পাবলিশ করো", key="wf_pub_site"):
+            try:
+                with st.spinner("পাবলিশ হচ্ছে..."):
+                    wf_publish_site(sid, dom_sel)
+                st.success("✅ সাইট পাবলিশের অনুরোধ পাঠানো হয়েছে।")
+            except Exception as e:
+                st.error(f"পাবলিশ হয়নি: {_wf_msg(e)}")
+
+
+if is_webflow_mode:
+    st.markdown(
+        "<div class='app-bar'>"
+        f"<img class='app-logo' src='{LOGO_SVG_URI}' alt='logo'/>"
+        "<div class='app-text'><div class='app-title'>Personal AI Studio</div>"
+        "<div class='app-sub'>Webflow · AI ওয়েবসাইট বিল্ডার · CMS · পাবলিশ</div></div></div>",
+        unsafe_allow_html=True,
+    )
+    render_webflow()
+    st.stop()
+
+
 if is_video_mode:
     st.markdown(
         "<div class='app-bar'>"
@@ -5935,4 +6766,3 @@ if st.session_state.pending:
         st.session_state.pending = False
         if success:
             st.rerun()
-            
