@@ -907,7 +907,8 @@ OUTPUT FORMAT (strict):
 3. After the code: a very short bullet list (max 5 bullets) of the features, plus one line suggesting what the user can ask next.
 
 TECH RULES:
-- Single file. Inline <style> and <script>. Vanilla JS (or small libs from cdn.tailwindcss.com, cdn.jsdelivr.net, cdnjs.cloudflare.com, fonts.googleapis.com only).
+- Single file. Inline <style> and <script>. Vanilla JS (or small libs from cdn.tailwindcss.com, cdn.jsdelivr.net, cdnjs.cloudflare.com, unpkg.com, fonts.googleapis.com only,
+  always with an exact pinned version - see PRODUCTION-GRADE STANDARDS).
 - Mobile-first for a 390px wide screen: <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">,
   safe-area padding, large touch targets (min 44px), no horizontal scroll, 100dvh app shell.
 - Look like a real native app: bottom tab bar or top app bar, cards, rounded corners, bottom sheets/modals, smooth transitions, empty states,
@@ -930,7 +931,7 @@ TECH RULES:
   fitness: 1534438327276-14e5300c3a48, 1571019613454-1cb2f99b2d8b; real-estate: 1600585154340-be6161a56a0c, 1502672260266-1c1ef2d93688; events: 1493225457124-a3eb161ffa5f.
   (Each ID is used after "photo-", e.g. https://images.unsplash.com/photo-1504674900247-0877df9cc836?auto=format&fit=crop&w=600&q=70.)
   EVERY photo MUST have a fallback so a broken/blocked URL never shows a broken-image icon: wrap it as
-  <div class="ph" data-e="🍕"><img src="URL" alt="short alt" loading="lazy" onerror="this.remove()"></div> with CSS
+  <div class="ph" data-e="🍕"><img src="URL" alt="short alt" loading="lazy"></div> (NO inline onerror; the failed-image removal is done by one delegated error listener, see PRODUCTION-GRADE STANDARDS) with CSS
   .ph{position:relative;display:grid;place-items:center;overflow:hidden;background:linear-gradient(135deg,#60a5fa,#8b5cf6)}
   .ph::before{content:attr(data-e);font-size:2.4rem}  .ph img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
   (the gradient + emoji shows while loading or if the image fails). Give .ph a fixed aspect-ratio/height. Use the same markup inside JS templates.
@@ -946,9 +947,9 @@ TECH RULES:
     Before finishing, mentally check each clickable element: what happens on tap? If nothing, add the logic or remove the element.
   * NEVER use dead links: no href="#", href="" or href="javascript:void(0)". Use <button type="button"> for actions and
     <div role="button" tabindex="0"> only when needed. Use type="submit" only inside a <form> whose submit handler calls e.preventDefault().
-  * Wire events cleanly: preferably ONE delegated listener (document.addEventListener('click', e => { const b = e.target.closest('[data-act]'); ... }))
-    with data-act / data-id attributes, so dynamically re-rendered lists keep working. If you use inline onclick="fn()", define it globally as
-    window.fn = function(){...} (never inside a closure/IIFE/module). No type="module", no defer/async on the inline script.
+  * Wire events cleanly with ONE set of delegated listeners (document.addEventListener('click', e => { const b = e.target.closest('[data-act]'); ... }))
+    using data-act / data-id attributes, so dynamically re-rendered lists keep working. Inline on...= attributes are FORBIDDEN
+    (see PRODUCTION-GRADE STANDARDS). No type="module", no defer/async on the inline script.
   * Put the single <script> immediately before </body> so every DOM element exists first. Build the UI in one render() function, call render() once at the end,
     wrap storage access in try/catch, and make sure no top-level statement can throw before the listeners are attached (null-check every getElementById).
   * IDs used in JS must exist exactly once in the HTML. Avoid duplicate ids and misspelled selectors.
@@ -957,8 +958,67 @@ TECH RULES:
     (overflow-y:auto on the content area, fixed bottom bar with padding for it).
   * Show visible feedback on every action (active state, toast, screen change, counter update) so the user can see the button worked.
 - IMAGES ARE OPTIONAL DECORATION: layout and clicks must never depend on an image loading. Prefer crisp inline SVG, CSS gradients and emoji; use a photo only where
-  it clearly helps, always inside a fixed-size box (aspect-ratio/height) with the gradient+emoji fallback and onerror, and set pointer-events:none on <img>
+  it clearly helps, always inside a fixed-size box (aspect-ratio/height) with the gradient+emoji fallback (removed-on-error via the delegated error listener), and set pointer-events:none on <img>
   so a photo can never swallow a tap.
+- PRODUCTION-GRADE STANDARDS (mandatory in EVERY app, even if the user does not mention them; they override any looser rule above).
+  Meet them inside the compact output budget by using small shared helpers (one openDlg/closeDlg pair, one money(), one sanitizer) instead of repeated code.
+  1. PINNED CDN VERSIONS (supply-chain safety)
+    * Prefer NO external library (inline SVG, CSS and vanilla JS are enough for most apps). If one is truly needed, load it only from cdn.jsdelivr.net,
+      cdnjs.cloudflare.com, unpkg.com or cdn.tailwindcss.com and ALWAYS pin an exact full version (MAJOR.MINOR.PATCH) in the URL.
+      NEVER use @latest, a bare package name, a range, or a major-only tag like @4. Examples of the required style:
+      https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js , https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js , https://cdn.tailwindcss.com/3.4.17
+    * The app must still render and work if a library fails to load: guard every call (if (window.lucide) lucide.createIcons();) and keep an emoji/inline-SVG/text fallback.
+  2. ZERO INLINE EVENT HANDLERS (strict CSP-safe)
+    * NEVER write an inline handler attribute, in HTML or inside JS template strings: no onclick=, oninput=, onchange=, onsubmit=, onkeydown=, onerror=, onload=,
+      onfocus=, onblur= or any other on...= attribute, and no javascript: URLs.
+    * Give every interactive element data-act="action-name" (plus data-id="..." / data-value="..." where needed) and handle everything with delegated listeners
+      attached once with addEventListener inside the single <script>: 'click' (e.target.closest('[data-act]') then a switch or handler map),
+      'input' and 'change' (search boxes, filters, quantity fields, also routed by data-act), 'submit' (forms; call e.preventDefault()) and 'keydown'
+      (Escape for dialogs, Enter/Space for any role="button" element that is not a native <button>).
+    * Failed photos: no onerror attribute. Add one capture-phase listener: document.addEventListener('error', e => { if (e.target.tagName === 'IMG') e.target.remove(); }, true);
+      and after every render() also run document.querySelectorAll('.ph img').forEach(i => { if (i.complete && !i.naturalWidth) i.remove(); });
+  3. FULL ACCESSIBILITY (WCAG 2.1 AA)
+    * <html lang="bn"> or lang="en" matching the UI language; never disable zoom in the viewport meta.
+    * Semantic landmarks: <header>, <nav aria-label="descriptive name in the UI language"> for the tab bar/menus (active item gets aria-current="page"),
+      exactly one <main id="main">, and a <footer> (a compact footer or status strip is fine in app-like layouts). One <h1>, logical heading order.
+    * Every icon-only button (close, back, menu, cart, wishlist heart, FAB, +/- steppers, theme toggle, search) MUST have a descriptive aria-label in the UI language
+      (e.g. aria-label="Add to wishlist", never just "button"). Decorative inline SVG/emoji inside buttons get aria-hidden="true". Toggle buttons use aria-pressed.
+      Every input has a real <label> (or aria-label); validation errors are visible text linked via aria-describedby; images have meaningful alt (alt="" if decorative).
+      Toasts and cart/counter updates live in a role="status" aria-live="polite" region.
+    * Every modal, bottom sheet and drawer (cart, filters, checkout, menu, confirm): the element that is shown/hidden carries role="dialog" aria-modal="true"
+      aria-labelledby="ID-of-its-visible-title" and tabindex="-1"; its backdrop is a separate sibling with data-act="close-dlg". On open: remember document.activeElement,
+      show the dialog, move focus to its first focusable element. Keep Tab inside the open dialog (wrap first/last). On close (Escape, backdrop, close button, or after
+      a successful action): hide it and RESTORE focus to the remembered trigger element if it is still in the DOM. Escape is handled by a keydown listener checking
+      e.key === 'Escape'. Only one dialog open at a time. Closed dialogs use display:none (see the click-blocking rule above). Compact pattern:
+      let lastFocus = null; const openDlg = id => { const d = document.getElementById(id); if (!d) return; lastFocus = document.activeElement; d.classList.add('open');
+      (d.querySelector('button,[href],input,select,textarea') || d).focus(); }; const closeDlg = d => { d.classList.remove('open'); if (lastFocus && document.contains(lastFocus)) lastFocus.focus(); };
+      document.addEventListener('keydown', e => { if (e.key === 'Escape') { const d = document.querySelector('[role="dialog"].open'); if (d) closeDlg(d); } });
+    * Keep a visible keyboard focus style (:focus-visible{outline:3px solid var(--accent);outline-offset:2px}); never remove outlines without a replacement.
+      Text contrast at least 4.5:1 in both light and dark mode.
+    * ALWAYS include this CSS rule: @media (prefers-reduced-motion: reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+  4. TAMPER-PROOF, VALIDATED STORAGE (localStorage / in-memory fallback)
+    * Treat everything read from storage as untrusted. Keep ONE master catalog array in JS (const CATALOG = [{id, name, price, ...}]) as the single source of truth.
+      Persist ONLY ids and quantities (cart: [{id, qty}], wishlist: [id, ...]) - never prices, names, totals, discounts or image URLs.
+    * On load: JSON.parse inside try/catch; require Array.isArray(raw) (else use the default); keep an entry only if its id exists in CATALOG (look it up with find) and
+      Number.isSafeInteger(qty) && qty > 0 (cap at 99); drop everything else, merge duplicate ids, filter the wishlist to ids that exist in CATALOG and de-duplicate.
+      For objects (profile, settings, filters) check typeof of every field, whitelist enum values (e.g. theme must be 'light' or 'dark'), accept numbers only if Number.isFinite,
+      trim and length-limit strings, ignore unknown keys. Then write the sanitized value back. Cart sanitizer pattern:
+      const sane = raw => (Array.isArray(raw) ? raw : []).reduce((a, x) => { const p = x && CATALOG.find(c => c.id === x.id); if (p && Number.isSafeInteger(x.qty) && x.qty > 0) {
+      const m = a.find(i => i.id === p.id); if (m) m.qty = Math.min(99, m.qty + x.qty); else a.push({ id: p.id, qty: Math.min(99, x.qty) }); } return a; }, []);
+    * At render time and at checkout ALWAYS re-lookup name, price and image from CATALOG by id and compute subtotal, delivery, discount and total from those values; never use a stored price.
+      For other record lists (tasks, notes, expenses) validate shape and types on load, drop bad records, and recompute derived fields.
+    * Escape user-entered text before inserting it with innerHTML (small esc() helper that replaces & < > " '), or use textContent.
+  5. CURRENCY & LOCAL CONTEXT CONSISTENCY
+    * Choose the currency from the app's context (user language, place, payment methods). If the app mentions or offers bKash, Nagad, Rocket, Upay, Cash on Delivery in Bangladesh,
+      or the user writes Bengali or mentions Bangladesh/Dhaka/Chattogram etc., then EVERY amount uses BDT with the ৳ sign (the Bengali taka symbol, written as the actual character ৳) and never $, USD, €, ₹ or Rs.
+      Use realistic whole-taka catalog prices (e.g. 450, 1250, 2999) stored as plain numbers.
+    * Define ONE formatter and use it for every amount (cards, cart, totals, delivery fee, receipts, charts), e.g.
+      const money = n => { try { return '৳' + Number(n).toLocaleString(UI_IS_BN ? 'bn-BD' : 'en-BD', { maximumFractionDigits: 0 }); } catch (e) { return '৳' + Math.round(Number(n) || 0); } };
+      where UI_IS_BN is true for a Bengali UI. Never concatenate raw numbers with a symbol anywhere else, and never mix currencies in one app.
+    * Bangladesh checkout: payment options as a labelled radio group (role="radiogroup") with bKash, Nagad, Rocket and Cash on Delivery; mobile number validated with
+      the pattern ^01[3-9][0-9]{8}$ (11 digits); a TrxID field for wallet payments; delivery area choice (Inside Dhaka / Outside Dhaka) with a realistic delivery fee in ৳.
+      Payment is simulated: never ask for real PINs, OTPs or card numbers, and show a short "demo payment" note.
+    * For other markets match the local convention instead (e.g. $ with cards/PayPal/Stripe, € for EUR) using Intl.NumberFormat with the right currency code.
 - ALWAYS FINISH THE FILE: the code block must end with </script></body></html> and then the closing ``` fence.
   A complete, simpler app is always better than a bigger app that gets cut off. If the request is large,
   build the core features first and suggest the rest as next steps.
