@@ -744,16 +744,15 @@ if not api_key:
 
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY")  # console.anthropic.com থেকে
-CLAUDE_MODEL = get_secret("CLAUDE_MODEL") or "claude-fable-5-2"  # সবচেয়ে শক্তিশালী মডেল ডিফল্ট
-# সাইডবারে বেছে নেওয়ার মতো Claude মডেল (শক্তিশালী → দ্রুত)
+CLAUDE_MODEL = get_secret("CLAUDE_MODEL") or "claude-sonnet-4-6"  # ডিফল্ট: দ্রুত + খুব শক্তিশালী
+# সাইডবারে বেছে নেওয়ার মতো Claude মডেল (আসল, চালু API model ID)
 CLAUDE_MODELS = {
-    "Fable 5.2 (সবচেয়ে শক্তিশালী)": "claude-fable-5-2",
-    "Opus 5.5 (গভীর চিন্তা)": "claude-opus-5-5",
-    "Sonnet 5.5 (ব্যালান্সড)": "claude-sonnet-5-5",
-    "Haiku 5.5 (সবচেয়ে দ্রুত)": "claude-haiku-5-5",
+    "Sonnet 4.6 (ব্যালান্সড • ডিফল্ট)": "claude-sonnet-4-6",
+    "Opus 4.6 (গভীর চিন্তা)": "claude-opus-4-6",
+    "Haiku 4.5 (সবচেয়ে দ্রুত)": "claude-haiku-4-5-20251001",
 }
 # প্রথম মডেল না চললে (অ্যাক্সেস/ওভারলোড) এই ক্রমে পরেরগুলো চেষ্টা হবে
-CLAUDE_FALLBACKS = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
+CLAUDE_FALLBACKS = ("claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001")
 
 
 def active_claude_model():
@@ -763,14 +762,25 @@ def active_claude_model():
 
 CLAUDE_FILE_LIMIT = 300_000  # Claude-কে পাঠানো ফাইল-টেক্সটের সর্বোচ্চ অক্ষর
 CLAUDE_OUT = {"সংক্ষিপ্ত": 1500, "সাধারণ": 6000, "বিস্তারিত": 16000}
-GEMINI_MODEL = get_secret("GEMINI_MODEL") or "gemini-3.8-flash"
-GEMINI_IMAGE_MODEL = get_secret("GEMINI_IMAGE_MODEL") or "gemini-nano-banana-2.1"
-GEMINI_IMAGE_FALLBACKS = ("gemini-3.1-flash-image", "gemini-2.5-flash-image")  # প্রথমটি না চললে এগুলো
+GEMINI_MODEL = get_secret("GEMINI_MODEL") or "gemini-2.5-flash"
+GEMINI_MODELS = {
+    "2.5 Flash (দ্রুত • ডিফল্ট)": "gemini-2.5-flash",
+    "2.5 Pro (গভীর বিশ্লেষণ)": "gemini-2.5-pro",
+}
+
+
+def active_gemini_model():
+    """সাইডবারের পছন্দ, না থাকলে GEMINI_MODEL"""
+    return st.session_state.get("gemini_model_value") or GEMINI_MODEL
+
+
+GEMINI_IMAGE_MODEL = get_secret("GEMINI_IMAGE_MODEL") or "gemini-2.5-flash-image"
+GEMINI_IMAGE_FALLBACKS = ("gemini-2.5-flash-image-preview", "gemini-3-pro-image-preview")  # প্রথমটি না চললে এগুলো
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 HF_TOKEN = get_secret("HF_TOKEN")
 POLLINATIONS_API_KEY = get_secret("POLLINATIONS_API_KEY")  # ফ্রি কী: enter.pollinations.ai
 TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
-OPENAI_IMAGE_MODEL = get_secret("OPENAI_IMAGE_MODEL") or "gpt-image-2.6-sunburst"
+OPENAI_IMAGE_MODEL = get_secret("OPENAI_IMAGE_MODEL") or "gpt-image-1"
 HAS_EDIT = bool(OPENAI_API_KEY or GEMINI_API_KEY or HF_TOKEN or POLLINATIONS_API_KEY)
 client = Groq(api_key=api_key)
 
@@ -802,7 +812,7 @@ CODE_MAX_BYTES = 5_000_000
 MAX_MEMORIES = 30        # সর্বোচ্চ কতগুলো মেমোরি রাখা যাবে
 MEMORY_FACT_MAX = 300    # একটি তথ্যের সর্বোচ্চ অক্ষর
 MEMORY_MAX_CHARS = 1500  # AI-কে মোট যত অক্ষরের মেমোরি পাঠানো হবে
-VISION_MODEL = get_secret("VISION_MODEL") or "qwen/qwen3.8-27b"  # Groq-এর ছবি দেখার (Vision) মডেল
+VISION_MODEL = get_secret("VISION_MODEL") or "meta-llama/llama-4-scout-17b-16e-instruct"  # Groq-এর ছবি দেখার (Vision) মডেল
 HF_IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
 HF_EDIT_MODEL = "black-forest-labs/FLUX.1-Kontext-dev"
 try:
@@ -850,7 +860,40 @@ Every id must be unique. Use only real Elementor widgetType values (heading, tex
 If the user attaches a screenshot, rebuild that design as closely as possible in this JSON format.
 No text outside the code block."""
 
-CHAT_PROMPT = "You are a helpful AI assistant. Answer clearly in the language the user uses."
+CHAT_PROMPT = """You are Codexio, a senior-level AI expert and personal assistant: part staff software engineer, part researcher, part clear-thinking teacher.
+Your answers must feel like they come from a seasoned professional who respects the user's time.
+
+HOW TO ANSWER
+1. Lead with the direct answer or the verdict in the first 1-2 sentences. Put background, reasoning and caveats AFTER it, never before.
+2. Think before you write: work out the real question behind the message, check facts, numbers and edge cases, then answer. Never guess silently; if something is uncertain, say so plainly and say what would settle it.
+3. Be specific and concrete: exact names, numbers, commands, versions and examples instead of vague generalities. No filler, no flattery, no restating the question, no generic disclaimers.
+4. Match the depth to the question: short factual questions get short answers; complex or technical questions get structured, thorough ones.
+
+FORMAT (clean Markdown)
+- Use short headings (##/###) only for longer answers; bullet points for parallel items; numbered lists for steps.
+- Use a Markdown table whenever you compare options, tools, plans or trade-offs.
+- **Bold** the key terms and the final recommendation. Use `inline code` for names, paths, commands and identifiers.
+- Keep paragraphs short and scannable. Never pad the answer to look longer.
+
+CODE
+- Write complete, correct, production-quality code that runs as given: all imports, no placeholders such as "...rest of code", no pseudo-code unless asked.
+- Put every code block in a fenced block with the language tag. Handle errors and edge cases, use clear names, follow the language's best practices and keep it secure (validate input, never hard-code secrets).
+- When fixing or changing code, show the full corrected code (or the full changed function/file), and explain in 1-3 lines what was wrong and what you changed.
+- Mentally run the code before sending it. If you cannot verify something (a library version, an API detail), say so.
+
+LANGUAGE AND TONE
+- Reply in the user's language and register: Bengali (বাংলা) for Bengali, English for English, and natural Banglish (Bengali written in Latin letters) when the user writes Banglish. Keep technical terms, code and commands in English.
+- Mirror the user's tone: casual and friendly when they are casual, precise and formal when they are formal. Be warm, never robotic.
+
+ACCURACY AND HONESTY
+- Never invent facts, sources, links, quotes, statistics, API names or model names. If you do not know, say so.
+- If WEB SEARCH RESULTS are provided below, treat them as the freshest information: prefer them over memory for anything time-sensitive, cite them inline like [1], [2], and mention if the results conflict or are insufficient.
+- Without search results you cannot browse the web or know events after your training data; for current prices, news, weather or latest versions, say your information may be outdated instead of guessing.
+- For medical, legal and financial topics give useful, accurate general information and note when a professional should be consulted. Do not refuse ordinary questions.
+- If the request is ambiguous, state your assumption in one line and answer; ask a clarifying question only when you truly cannot proceed.
+
+ENDING
+- After complex, technical or multi-part answers, end with 1-2 short, genuinely useful follow-up suggestions (a next step, a risk to check, or a related improvement). Skip them for simple or casual replies."""
 
 APP_MAX_OUT = 6000  # অ্যাপ বিল্ডার মোডে Groq-এর আউটপুট সীমা (পুরো অ্যাপের কোডের জন্য বেশি দরকার)
 
@@ -1209,7 +1252,7 @@ def gemini_contents(history, use_image):
 
 
 _RETRY_CODES = (429, 500, 502, 503, 504)
-_STATIC_FALLBACKS = ("gemini-2.5-flash", "gemini-flash-latest")
+_STATIC_FALLBACKS = ("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest")
 _SKIP_WORDS = r"image|tts|live|audio|embedding|robotics|computer|learnlm|gemma|8b|exp"
 
 
@@ -1239,7 +1282,7 @@ def gemini_candidates():
         extra = []
     if not extra:
         extra = list(_STATIC_FALLBACKS)
-    out = [GEMINI_MODEL]
+    out = [active_gemini_model()]
     for m in extra:
         if m not in out:
             out.append(m)
@@ -1804,9 +1847,31 @@ def edit_ai_image(image_bytes, instruction, mime, quality, extra=None, transpare
 def search_query(user_text):
     return _llm_rewrite(
         "Rewrite the user's message as one concise web search query, in the same language as the message. "
+        f"Today's date is {date.today().isoformat()}; add the current year only if the question is about the latest/current state of something. "
         "Output ONLY the query.",
         user_text,
     )[:200]
+
+
+# বর্তমান/রিয়েল-টাইম তথ্য চাইলে অটো ওয়েব সার্চ (ইংরেজি + বাংলা + Banglish)
+_AUTO_SEARCH_RE = re.compile(
+    r"\b(latest|newest|current(?:ly)?|recent(?:ly)?|today|tonight|tomorrow|yesterday|right now|up[- ]to[- ]date|breaking|"
+    r"news|headlines?|this (?:week|month|year)|price|prices|pricing|how much (?:is|are|does|do)|cost of|exchange rate|"
+    r"stock|share price|market cap|bitcoin|crypto|weather|forecast|temperature|live score|scores?|standings|fixtures?|"
+    r"election|release date|released|release notes|changelog|what'?s new in|who is the (?:current|new)|who won|"
+    r"ceo of|president of|prime minister of|trending|is .{1,40} (?:down|available|out yet)|"
+    r"ajker|ajke|ekhon(?:kar)?|dam koto|daam koto|dollar rate|abohawa|khobor|shorboshesh)\b"
+    r"|আজকের|আজকে|এখনকার|বর্তমান|সর্বশেষ|সাম্প্রতিক|লেটেস্ট|খবর|সংবাদ|দাম|মূল্য|আবহাওয়া|তাপমাত্রা|ডলারের রেট|রেট কত|স্কোর|নির্বাচন|ট্রেন্ডিং|রিলিজ ডেট",
+    re.I,
+)
+
+
+def needs_web_search(text):
+    """মেসেজে কি এমন কিছু চাওয়া হয়েছে যার উত্তর মডেলের পুরনো জ্ঞানে নির্ভুল হবে না? (সহজ heuristic)"""
+    t = (text or "").strip()
+    if not t or len(t) > 600 or "```" in t:  # লম্বা/কোড-ভরা মেসেজ সাধারণত সার্চের বিষয় নয়
+        return False
+    return bool(_AUTO_SEARCH_RE.search(t))
 
 
 def web_search(query, max_results=5):
@@ -3015,9 +3080,9 @@ with st.sidebar:
                    else "💾 চ্যাট সেভ: লোকাল ফাইল (হোস্টিংয়ে রিস্টার্ট দিলে মুছে যেতে পারে)")
         preset_model = st.selectbox(
             "AI মডেল বেছে নিন:",
-            ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"],
+            ["llama-3.3-70b-versatile", "openai/gpt-oss-120b"],
         )
-        custom_model = st.text_input("Custom model (ঐচ্ছিক):", placeholder="যেমন: qwen/qwen3.8-27b")
+        custom_model = st.text_input("Custom model (ঐচ্ছিক):", placeholder="যেমন: openai/gpt-oss-120b")
         selected_model = custom_model.strip() or preset_model
 
         temperature = st.slider(
@@ -3054,7 +3119,7 @@ with st.sidebar:
         if len(_engines) > 1:
             engine_choice = st.selectbox(
                 "🧠 AI ইঞ্জিন (চ্যাট ও JSON):", _engines,
-                index=_engines.index(_claude_label) if ANTHROPIC_API_KEY else 0,
+                index=_engines.index(_claude_label) if ANTHROPIC_API_KEY else (1 if GEMINI_API_KEY else 0),
                 key="engine_choice_sel",
             )
         else:
@@ -3067,6 +3132,11 @@ with st.sidebar:
             _used = st.session_state.get("_claude_used")
             if _used and _used != CLAUDE_MODELS[_pick]:
                 st.caption(f"⚠️ শেষবার ফলব্যাক হয়েছে: {_used}")
+        if GEMINI_API_KEY and engine_choice.startswith("Gemini"):
+            _gnames = list(GEMINI_MODELS)
+            _gdef = next((k for k, v in GEMINI_MODELS.items() if v == GEMINI_MODEL), _gnames[0])
+            _gpick = st.selectbox("🤖 Gemini মডেল:", _gnames, index=_gnames.index(_gdef), key="gemini_model_sel")
+            st.session_state["gemini_model_value"] = GEMINI_MODELS[_gpick]
 
     use_search = False
     if app_mode.startswith("💬"):
@@ -3082,7 +3152,7 @@ with st.sidebar:
             st.warning("WP_URL, WP_USER, WP_APP_PASSWORD সেট করো।")
         if st.session_state.get("mcp_config"):
             st.success("🧩 Elementor MCP কানেক্টেড")
-        st.caption("Tool calling-এর জন্য gpt-oss-120b বা qwen3.8-27b ব্যবহার করো।")
+        st.caption("Tool calling-এর জন্য llama-3.3-70b-versatile বা gpt-oss-120b ব্যবহার করো।")
     if is_image_mode:
         providers = []
         if OPENAI_API_KEY:
@@ -3775,19 +3845,31 @@ def render_message(m, idx):
 
 
 def pick_engine():
+    """ইঞ্জিন বাছাই: Claude → Gemini → Groq (ফলব্যাক)। key থাকলে Claude/Gemini সবসময় আগে;
+    সাইডবারে নিজে বেছে নিলে সেটিই মানা হয়, শুধু ছবি/বড় ফাইল হলে Groq থেকে Gemini-তে তোলা হয়।"""
     if is_agent_mode:
         return "groq"
     if is_app_mode:  # পুরো অ্যাপের কোড লম্বা: Claude (16000) → Gemini (16000) → শেষে Groq
         if ANTHROPIC_API_KEY:
             return "claude"
         return "gemini" if GEMINI_API_KEY else "groq"
-    if ANTHROPIC_API_KEY and engine_choice.startswith("Claude"):
+    choice = engine_choice or ""
+    if ANTHROPIC_API_KEY and choice.startswith("Claude"):
         return "claude"
-    if not GEMINI_API_KEY:
+    if GEMINI_API_KEY and choice.startswith("Gemini"):
+        return "gemini"
+    if choice.startswith("Groq") and (ANTHROPIC_API_KEY or GEMINI_API_KEY):
+        # ব্যবহারকারী নিজে Groq বেছেছেন; তবে ছবি বা বড় ফাইলে Groq যথেষ্ট নয়
+        if GEMINI_API_KEY:
+            msgs = cur().get("messages") or []
+            history_chars = sum(len(m.get("content", "")) for m in msgs[-MAX_HISTORY:])
+            if last_msg_has_image() or (total_file_chars() + history_chars) > 10000:
+                return "gemini"
         return "groq"
-    msgs = cur().get("messages") or []
-    history_chars = sum(len(m.get("content", "")) for m in msgs[-MAX_HISTORY:])
-    if last_msg_has_image() or engine_choice.startswith("Gemini") or (total_file_chars() + history_chars) > 10000:
+    # কোনো স্পষ্ট পছন্দ না থাকলে: সেরা পাওয়া ইঞ্জিন
+    if ANTHROPIC_API_KEY:
+        return "claude"
+    if GEMINI_API_KEY:
         return "gemini"
     return "groq"
 
@@ -6678,8 +6760,15 @@ if st.session_state.pending:
                     search_block = ""
                     sources_md = ""
 
-                    if use_search and TAVILY_API_KEY and intent == "chat" and app_mode.startswith("💬"):
+                    _has_attached = bool(cur().get("file_text") or (file_context and uploaded_file is not None))
+                    auto_search = bool(
+                        not use_search and TAVILY_API_KEY and intent == "chat" and app_mode.startswith("💬")
+                        and not _has_attached and needs_web_search(last_user["content"])
+                    )
+                    if (use_search or auto_search) and TAVILY_API_KEY and intent == "chat" and app_mode.startswith("💬"):
                         try:
+                            if auto_search:
+                                st.caption("🌐 সাম্প্রতিক তথ্য দরকার মনে হয়েছে — স্বয়ংক্রিয়ভাবে ওয়েবে খোঁজা হচ্ছে")
                             with st.spinner("🌐 ওয়েবে খোঁজা হচ্ছে..."):
                                 results = web_search(search_query(last_user["content"]))
                             if results:
@@ -6690,8 +6779,8 @@ if st.session_state.pending:
                                     blocks.append(f"[{i}] {title}\n{url}\n{(item.get('content') or '')[:700]}")
                                     links.append(f"{i}. [{title}]({url})")
                                 search_block = (
-                                    "\n\nWEB SEARCH RESULTS (use them when relevant, cite inline like [1], [2]; "
-                                    "if they are not enough, say so):\n" + "\n\n".join(blocks)
+                                    "\n\nWEB SEARCH RESULTS (fresh data from the web right now; prefer them over your memory for time-sensitive facts, "
+                                    "cite inline like [1], [2]; if they conflict or are not enough, say so):\n" + "\n\n".join(blocks)
                                 )
                                 sources_md = "\n\n**🌐 সূত্র:**\n" + "\n".join(links)
                         except Exception as e:
@@ -6726,7 +6815,7 @@ if st.session_state.pending:
                                 build_system_instruction(MAX_FILE_CHARS) + search_block,
                                 history, temp_eff, use_vision,
                             ))
-                            used_model = st.session_state.get("_gemini_used") or GEMINI_MODEL
+                            used_model = st.session_state.get("_gemini_used") or active_gemini_model()
                         except Exception as e:
                             st.warning(f"⚠️ Gemini ব্যর্থ ({_short(e)}), Groq দিয়ে উত্তর দেওয়া হচ্ছে।")
 
