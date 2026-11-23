@@ -782,7 +782,7 @@ POLLINATIONS_API_KEY = get_secret("POLLINATIONS_API_KEY")  # ফ্রি কী
 TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
 OPENAI_IMAGE_MODEL = get_secret("OPENAI_IMAGE_MODEL") or "gpt-image-1"
 HAS_EDIT = bool(OPENAI_API_KEY or GEMINI_API_KEY or HF_TOKEN or POLLINATIONS_API_KEY)
-client = Groq(api_key=api_key)
+client = Groq(api_key=api_key, timeout=20.0, max_retries=1)  # দ্রুত ব্যর্থ হয়ে ফলব্যাকে যাবে
 
 WP_URL = get_secret("WP_URL").rstrip("/")
 WP_AUTH = (get_secret("WP_USER"), get_secret("WP_APP_PASSWORD"))
@@ -1319,7 +1319,7 @@ _SKIP_WORDS = r"image|tts|live|audio|embedding|robotics|computer|learnlm|gemma|8
 @st.cache_data(ttl=3600, show_spinner=False)
 def _discover_gemini_models(api_key):
     """Google থেকে এখন যে flash মডেলগুলো সত্যিই চালু আছে তার তালিকা (নতুন → পুরনো)।"""
-    r = requests.get(f"{GEMINI_BASE}?pageSize=200", headers=_gemini_headers(), timeout=15)
+    r = requests.get(f"{GEMINI_BASE}?pageSize=200", headers=_gemini_headers(), timeout=5)
     r.raise_for_status()  # ব্যর্থ হলে cache হয় না, পরের বার আবার চেষ্টা হবে
     found = []
     for m in r.json().get("models", []):
@@ -1336,10 +1336,13 @@ def _discover_gemini_models(api_key):
 
 def gemini_candidates():
     """চেষ্টার ক্রম: তোমার GEMINI_MODEL, তারপর এখন চালু থাকা সেরা flash মডেলগুলো।"""
-    try:
-        extra = _discover_gemini_models(GEMINI_API_KEY)[:4]
-    except Exception:
-        extra = []
+    extra = []
+    if time.time() >= st.session_state.get("_gem_discover_fail_until", 0):
+        try:
+            extra = _discover_gemini_models(GEMINI_API_KEY)[:4]
+        except Exception:
+            extra = []
+            st.session_state["_gem_discover_fail_until"] = time.time() + 600  # ১০ মিনিট আর চেষ্টা নয়
     if not extra:
         extra = list(_STATIC_FALLBACKS)
     out = [active_gemini_model()]
@@ -1363,10 +1366,10 @@ def _gemini_body(system_text, history, temp, use_image, thinking):
 def gemini_stream(system_text, history, temp, use_image):
     """Gemini থেকে লেখা একটু একটু করে আসে (SSE)।
     মডেল ভিড়ে থাকলে/বন্ধ থাকলে পরের মডেলে যায়; সবই ব্যস্ত হলে একটু থেমে ৩ রাউন্ড পর্যন্ত আবার চেষ্টা করে।"""
-    candidates = gemini_candidates()
+    candidates = gemini_candidates()[:2]  # আগে ৫টি মডেল ঘুরত; এখন সর্বোচ্চ ২টি
     errors = {}
 
-    for rnd in range(3):
+    for rnd in range(1):
         retryable = False
         for m_name in candidates:
             if errors.get(m_name, "").startswith("404"):
@@ -1377,7 +1380,7 @@ def gemini_stream(system_text, history, temp, use_image):
             for _attempt in range(2):
                 body = _gemini_body(system_text, history, temp, use_image, use_thinking)
                 try:
-                    r = requests.post(url, headers=_gemini_headers(), json=body, stream=True, timeout=120)
+                    r = requests.post(url, headers=_gemini_headers(), json=body, stream=True, timeout=(5, 45))
                 except requests.RequestException as e:
                     errors[m_name] = f"network {str(e)[:60]}"
                     retryable = True
@@ -1435,8 +1438,6 @@ def gemini_stream(system_text, history, temp, use_image):
 
         if not retryable:
             break
-        if rnd < 2:
-            time.sleep(3 * (rnd + 1))  # সবাই ব্যস্ত: ৩s, ৬s থেমে আবার
 
     summary = "; ".join(f"{m}: {e}" for m, e in errors.items()) or "অজানা সমস্যা"
     raise RuntimeError(f"সব Gemini মডেল ব্যস্ত/বন্ধ ({summary})")
@@ -1491,15 +1492,15 @@ def claude_stream(system_text, history, temp, use_image, max_out=None):
     for mi, model_name in enumerate(models):
         body["model"] = model_name
         last_model = mi == len(models) - 1
-        for attempt in range(3):
-            r = requests.post(CLAUDE_URL, headers=headers, json=body, stream=True, timeout=(10, 180))
+        for attempt in range(2):
+            r = requests.post(CLAUDE_URL, headers=headers, json=body, stream=True, timeout=(5, 45))
             if r.status_code == 400 and "temperature" in body and "temperature" in r.text.lower():
                 body.pop("temperature")  # কোনো মডেল temperature না নিলে ছাড়াই চেষ্টা
                 r.close()
                 continue
-            if r.status_code in (429, 500, 502, 503, 529) and attempt < 2:
+            if r.status_code in (429, 500, 502, 503, 529) and attempt < 1:
                 r.close()
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(1.0)
                 continue
             break
         if r.status_code == 200:
@@ -1582,7 +1583,7 @@ def gemini_edit_image(images, prompt, quality="auto"):
 # ---------- Image generation / editing ----------
 def _llm_rewrite(system_text, user_text):
     try:
-        res = client.chat.completions.create(
+        res = client.with_options(timeout=10.0, max_retries=0).chat.completions.create(
             model="openai/gpt-oss-20b",
             messages=[
                 {"role": "system", "content": system_text},
@@ -1905,6 +1906,8 @@ def edit_ai_image(image_bytes, instruction, mime, quality, extra=None, transpare
 
 # ---------- Web search (Tavily) ----------
 def search_query(user_text):
+    if len((user_text or "").strip()) <= 150:  # ছোট প্রশ্ন সরাসরি query: একটা LLM কল বাঁচে
+        return user_text.strip()[:200]
     return _llm_rewrite(
         "Rewrite the user's message as one concise web search query, in the same language as the message. "
         f"Today's date is {date.today().isoformat()}; add the current year only if the question is about the latest/current state of something. "
@@ -1915,13 +1918,13 @@ def search_query(user_text):
 
 # বর্তমান/রিয়েল-টাইম তথ্য চাইলে অটো ওয়েব সার্চ (ইংরেজি + বাংলা + Banglish)
 _AUTO_SEARCH_RE = re.compile(
-    r"\b(latest|newest|current(?:ly)?|recent(?:ly)?|today|tonight|tomorrow|yesterday|right now|up[- ]to[- ]date|breaking|"
-    r"news|headlines?|this (?:week|month|year)|price|prices|pricing|how much (?:is|are|does|do)|cost of|exchange rate|"
-    r"stock|share price|market cap|bitcoin|crypto|weather|forecast|temperature|live score|scores?|standings|fixtures?|"
-    r"election|release date|released|release notes|changelog|what'?s new in|who is the (?:current|new)|who won|"
+    r"\b(latest|newest|right now|up[- ]to[- ]date|breaking|"
+    r"news|headlines?|this (?:week|month|year)|how much (?:is|are|does|do)|cost of|exchange rate|"
+    r"share price|market cap|bitcoin|crypto|weather|forecast|live score|standings|fixtures?|"
+    r"election|release date|release notes|changelog|what'?s new in|who is the (?:current|new)|who won|"
     r"ceo of|president of|prime minister of|trending|is .{1,40} (?:down|available|out yet)|"
     r"ajker|ajke|ekhon(?:kar)?|dam koto|daam koto|dollar rate|abohawa|khobor|shorboshesh)\b"
-    r"|আজকের|আজকে|এখনকার|বর্তমান|সর্বশেষ|সাম্প্রতিক|লেটেস্ট|খবর|সংবাদ|দাম|মূল্য|আবহাওয়া|তাপমাত্রা|ডলারের রেট|রেট কত|স্কোর|নির্বাচন|ট্রেন্ডিং|রিলিজ ডেট",
+    r"|আজকের খবর|এখনকার|সর্বশেষ|সাম্প্রতিক|লেটেস্ট|খবর|সংবাদ|আবহাওয়া|ডলারের রেট|রেট কত|নির্বাচন|ট্রেন্ডিং|রিলিজ ডেট",
     re.I,
 )
 
@@ -1929,7 +1932,7 @@ _AUTO_SEARCH_RE = re.compile(
 def needs_web_search(text):
     """মেসেজে কি এমন কিছু চাওয়া হয়েছে যার উত্তর মডেলের পুরনো জ্ঞানে নির্ভুল হবে না? (সহজ heuristic)"""
     t = (text or "").strip()
-    if not t or len(t) > 600 or "```" in t:  # লম্বা/কোড-ভরা মেসেজ সাধারণত সার্চের বিষয় নয়
+    if not t or len(t) > 300 or "```" in t:  # লম্বা/কোড-ভরা মেসেজ সাধারণত সার্চের বিষয় নয়
         return False
     return bool(_AUTO_SEARCH_RE.search(t))
 
@@ -1939,7 +1942,7 @@ def web_search(query, max_results=5):
         "https://api.tavily.com/search",
         headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
         json={"query": query, "search_depth": "basic", "max_results": max_results},
-        timeout=30,
+        timeout=10,
     )
     r.raise_for_status()
     return r.json().get("results", [])
@@ -2900,7 +2903,7 @@ def auto_extract_memory(user_text):
         room = MAX_MEMORIES - len(existing)
         if room <= 0:
             return []
-        res = client.chat.completions.create(
+        res = client.with_options(timeout=10.0, max_retries=0).chat.completions.create(
             model="openai/gpt-oss-20b",
             messages=[
                 {"role": "system", "content": (
