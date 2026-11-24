@@ -714,6 +714,30 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# বাংলা ফন্ট (Noto Sans Bengali) লোড + উত্তরের হেডিং/টেক্সট সাইজ ঠিক করা (আগে সিস্টেম-ফন্টে বাংলা চাপা দেখাত)
+st.markdown(
+    """
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Bengali:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+    .stApp, [data-testid="stMarkdownContainer"], [data-testid="stChatInput"] textarea {
+        font-family: Inter, "Noto Sans Bengali", "Hind Siliguri", "Segoe UI", system-ui, sans-serif;
+    }
+    [data-testid="stMarkdownContainer"] :not(code):not(pre):not(span[class*="material"]) { font-family: inherit; }
+    [data-testid="stMarkdownContainer"] { font-size: 1rem; line-height: 1.8; letter-spacing: 0 !important; word-spacing: normal !important; }
+    [data-testid="stMarkdownContainer"] h1 { font-size: 1.5rem !important; font-weight: 650 !important; margin: 1.1rem 0 .5rem !important; padding: 0 !important; line-height: 1.35 !important; }
+    [data-testid="stMarkdownContainer"] h2 { font-size: 1.25rem !important; font-weight: 650 !important; margin: 1.1rem 0 .45rem !important; padding: 0 !important; line-height: 1.4 !important; }
+    [data-testid="stMarkdownContainer"] h3 { font-size: 1.08rem !important; font-weight: 650 !important; margin: .9rem 0 .35rem !important; padding: 0 !important; line-height: 1.45 !important; }
+    [data-testid="stMarkdownContainer"] p { margin: .35rem 0 .7rem; }
+    [data-testid="stMarkdownContainer"] li { margin: .2rem 0; }
+    [data-testid="stMarkdownContainer"] hr { margin: 1rem 0; opacity: .25; }
+    [data-testid="stMarkdownContainer"] table { font-size: .95rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 def get_secret(name, default=""):
     val = os.environ.get(name)
@@ -1027,15 +1051,30 @@ HOW TO ANSWER
 3. Be specific and concrete: exact names, numbers, commands, versions and examples instead of vague generalities. No filler, no flattery, no restating the question, no generic disclaimers.
 4. Match the depth to the question: short factual questions get short answers; complex or technical questions get structured, thorough ones.
 
-CLARITY (every answer must be easy to understand and well organised)
-- Write for a smart beginner: short sentences, plain words, and explain any technical term in a few words the first time you use it.
-- Use a clear order: direct answer -> why -> how (numbered steps) -> small example. For problems, give the cause first and then the fix.
-- Whenever an idea is abstract, add ONE small concrete example or everyday analogy.
-- Keep only what helps the user act, but never skip an important step. Group related points under a short heading instead of one long block of text.
-- For code: say what the code does in one line, give the COMPLETE code, then how to run/test it and what result to expect.
+LEVEL MATCHING (the most important rule)
+- First decide the user's level and the style they asked for ("like a small child", "simple", "ekbar bujte pari", "deep dive", "pro level"), and obey it exactly.
+- Beginner / "explain simply" request: teach ONLY the one thing asked. Do NOT add side topics, comparison tables, edge cases, performance notes or "advanced tips" unless the user asks. Offer them in one closing line instead.
+- Advanced request: go deep, but stay organised.
+
+HOW TO TEACH A CONCEPT (use this order for "explain / teach me X")
+1. One plain sentence: what it is, with no jargon.
+2. A real-life analogy from everyday life (a basket of fruits taken out one by one, a queue at a tea stall, a bus conductor checking tickets). Explain the idea with it BEFORE any code.
+3. The smallest possible code example (3-6 lines) with short comments in the user's language, and its exact output.
+4. Walk through it step by step: "round 1: ... round 2: ... round 3: ..." so the user can see what happens inside.
+5. ONE most common mistake and how to avoid it.
+6. A tiny practice task (1 line) the user can try right now.
+7. A single closing line offering the next topic. No "Happy coding", no cheering, no emoji spam.
+- Keep a beginner answer short: about 150-350 words plus code. At most 3 headings, no tables, no more than 2 code blocks unless asked.
+
+CLARITY RULES
+- Short sentences, plain words. Define a technical term in a few words the first time you use it. Never write a long block of text; split it into small steps.
+- Order: direct answer -> why -> how (numbered steps) -> small example. For problems: cause first, then the fix.
+- Keep only what helps the user act now, but never skip an important step.
+- Mix of languages: when the user writes Banglish/Bangla, write natural simple Bangla (or Banglish if they use it). Keep code, keywords and commands in English, and avoid awkward half-translated words.
+- For code tasks: one line on what the code does, the COMPLETE code, how to run/test it, and what result to expect.
 
 FORMAT (clean Markdown)
-- Use short headings (##/###) only for longer answers; bullet points for parallel items; numbered lists for steps.
+- Use short headings (##/###) only for answers longer than ~250 words, and never more than 3 in a beginner answer; bullet points for parallel items; numbered lists for steps.
 - Use a Markdown table whenever you compare options, tools, plans or trade-offs.
 - **Bold** the key terms and the final recommendation. Use `inline code` for names, paths, commands and identifiers.
 - Keep paragraphs short and scannable. Never pad the answer to look longer.
@@ -1058,7 +1097,7 @@ ACCURACY AND HONESTY
 - If the request is ambiguous, state your assumption in one line and answer; ask a clarifying question only when you truly cannot proceed.
 
 ENDING
-- After complex, technical or multi-part answers, end with 1-2 short, genuinely useful follow-up suggestions (a next step, a risk to check, or a related improvement). Skip them for simple or casual replies."""
+- After complex, technical or multi-part answers, end with 1-2 short, genuinely useful follow-up suggestions (a next step, a risk to check, or a related improvement). For beginner/teaching answers end with ONE line offering the next topic. Skip it for simple or casual replies."""
 
 APP_MAX_OUT = 6000  # অ্যাপ বিল্ডার মোডে Groq-এর আউটপুট সীমা (পুরো অ্যাপের কোডের জন্য বেশি দরকার)
 
