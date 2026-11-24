@@ -744,15 +744,19 @@ if not api_key:
 
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY")  # console.anthropic.com থেকে
-CLAUDE_MODEL = get_secret("CLAUDE_MODEL") or "claude-sonnet-4-6"  # ডিফল্ট: দ্রুত + খুব শক্তিশালী
+CLAUDE_MODEL = get_secret("CLAUDE_MODEL") or "claude-sonnet-5-5"  # ডিফল্ট: দ্রুত + খুব শক্তিশালী
 # সাইডবারে বেছে নেওয়ার মতো Claude মডেল (আসল, চালু API model ID)
 CLAUDE_MODELS = {
-    "Sonnet 4.6 (ব্যালান্সড • ডিফল্ট)": "claude-sonnet-4-6",
-    "Opus 4.6 (গভীর চিন্তা)": "claude-opus-4-6",
-    "Haiku 4.5 (সবচেয়ে দ্রুত)": "claude-haiku-4-5-20251001",
+    "Sonnet 5.5 (ব্যালান্সড • ডিফল্ট)": "claude-sonnet-5-5",
+    "Opus 5.5 (গভীর চিন্তা)": "claude-opus-5-5",
+    "Haiku 5.5 (সবচেয়ে দ্রুত)": "claude-haiku-5-5",
+    "Sonnet 4.6": "claude-sonnet-4-6",
+    "Opus 4.6": "claude-opus-4-6",
+    "Haiku 4.5": "claude-haiku-4-5-20251001",
 }
 # প্রথম মডেল না চললে (অ্যাক্সেস/ওভারলোড) এই ক্রমে পরেরগুলো চেষ্টা হবে
-CLAUDE_FALLBACKS = ("claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001")
+CLAUDE_FALLBACKS = ("claude-sonnet-5-5", "claude-sonnet-4-6", "claude-opus-5-5", "claude-opus-4-6",
+                    "claude-haiku-5-5", "claude-haiku-4-5-20251001")
 
 
 def active_claude_model():
@@ -762,10 +766,10 @@ def active_claude_model():
 
 CLAUDE_FILE_LIMIT = 300_000  # Claude-কে পাঠানো ফাইল-টেক্সটের সর্বোচ্চ অক্ষর
 CLAUDE_OUT = {"সংক্ষিপ্ত": 1500, "সাধারণ": 6000, "বিস্তারিত": 16000}
-GEMINI_MODEL = get_secret("GEMINI_MODEL") or "gemini-2.5-flash"
+GEMINI_MODEL = get_secret("GEMINI_MODEL") or "auto-flash"  # auto-flash / auto-pro = Google-এর তালিকা থেকে এখন চালু সেরা মডেল
 GEMINI_MODELS = {
-    "2.5 Flash (দ্রুত • ডিফল্ট)": "gemini-2.5-flash",
-    "2.5 Pro (গভীর বিশ্লেষণ)": "gemini-2.5-pro",
+    "⚡ অটো • দ্রুত (সেরা Flash • ডিফল্ট)": "auto-flash",
+    "🧠 অটো • গভীর (সেরা Pro)": "auto-pro",
 }
 
 
@@ -782,7 +786,161 @@ POLLINATIONS_API_KEY = get_secret("POLLINATIONS_API_KEY")  # ফ্রি কী
 TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
 OPENAI_IMAGE_MODEL = get_secret("OPENAI_IMAGE_MODEL") or "gpt-image-1"
 HAS_EDIT = bool(OPENAI_API_KEY or GEMINI_API_KEY or HF_TOKEN or POLLINATIONS_API_KEY)
-client = Groq(api_key=api_key, timeout=20.0, max_retries=1)  # দ্রুত ব্যর্থ হয়ে ফলব্যাকে যাবে
+client = Groq(api_key=api_key, timeout=25.0, max_retries=0)  # দ্রুত ব্যর্থ হয়ে পরের মডেলে যাবে (নিজস্ব ফলব্যাক চেইন আছে)
+
+
+# ---------- স্বয়ংক্রিয় মডেল বাছাই + ফলব্যাক ----------
+# কোনো মডেল বন্ধ/নাম-বদল/অ্যাক্সেস-হীন হলে (404 model_not_found) অ্যাপ নিজে পরের চালু মডেলে যায়
+# এবং বন্ধ মডেলটি কিছুক্ষণ আর চেষ্টা করে না — তাই একই ভুল বারবার দেখা যায় না, উত্তরও দ্রুত আসে।
+_DEAD_LONG = 6 * 3600   # মডেল নেই / অ্যাক্সেস নেই
+_DEAD_SHORT = 60        # ব্যস্ত / রেট-লিমিট / টাইমআউট
+
+
+def _dead_map():
+    return st.session_state.setdefault("_dead_models", {})
+
+
+def mark_dead(model, secs=_DEAD_LONG):
+    if model:
+        _dead_map()[model] = time.time() + secs
+
+
+def is_dead(model):
+    exp = _dead_map().get(model)
+    if exp and exp < time.time():
+        _dead_map().pop(model, None)
+        return False
+    return bool(exp)
+
+
+def _err_kind(e):
+    """'dead' = মডেল নেই/বন্ধ, 'busy' = সাময়িক (লিমিট/ব্যস্ত), 'skip' = এই মডেলে সাপোর্ট নেই, 'raise' = অন্য সমস্যা"""
+    s = str(e).lower()
+    code = getattr(e, "status_code", None)
+    name = type(e).__name__
+    if code == 404 or any(k in s for k in (
+            "model_not_found", "does not exist", "decommission", "no longer available", "no longer supported",
+            "model_not_active", "do not have access", "don't have access", "unknown model", "invalid model")):
+        return "dead"
+    if code in (413, 429, 500, 502, 503, 504, 529) or "rate_limit" in s or "tokens per" in s \
+            or "overloaded" in s or "timeout" in name.lower() or "connection" in name.lower():
+        return "busy"
+    if code == 400 and any(k in s for k in ("tool", "function", "not support", "unsupported", "vision", "image", "reasoning")):
+        return "skip"
+    return "raise"
+
+
+_GROQ_SKIP = r"whisper|tts|playai|orpheus|guard|safeguard|embed|moderation|transcri|speech"
+# পছন্দের ক্রম (তোমার আগের নামগুলো আগে রাখা হয়েছে; যেটা বন্ধ সেটা অটো বাদ পড়বে)
+_GROQ_PREF = ("openai/gpt-oss-120b", "llama-3.3-70b-versatile", "qwen/qwen3.8-27b", "qwen/qwen3-32b",
+              "openai/gpt-oss-20b", "llama-3.1-8b-instant")
+_GROQ_FAST = ("openai/gpt-oss-20b", "llama-3.1-8b-instant")
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _discover_groq_models(key):
+    """Groq-এ এই কী দিয়ে এখন সত্যিই চালু মডেলের তালিকা"""
+    cl = Groq(api_key=key, timeout=6.0, max_retries=0)
+    out = []
+    for m in cl.models.list().data:
+        if getattr(m, "active", True) is False:
+            continue
+        out.append(m.id)
+    if not out:
+        raise RuntimeError("empty model list")  # খালি হলে cache হয় না
+    return out
+
+
+def _groq_rank(name):
+    if name in _GROQ_PREF:
+        return (0, _GROQ_PREF.index(name), 0.0, name)
+    sizes = [float(x) for x in re.findall(r"(\d+(?:\.\d+)?)b", name.lower())]
+    return (1, 0, -(max(sizes) if sizes else 0.0), name)
+
+
+def groq_text_models():
+    """চ্যাট-যোগ্য চালু মডেল, সেরা আগে (বন্ধ মডেল বাদ)"""
+    try:
+        found = [m for m in _discover_groq_models(api_key) if not re.search(_GROQ_SKIP, m, re.I)]
+    except Exception:
+        found = []
+    if not found:
+        found = list(_GROQ_PREF)
+    found = sorted(dict.fromkeys(found), key=_groq_rank)
+    return [m for m in found if not is_dead(m)] or found
+
+
+def groq_chain(first=None, kind="text", limit=4):
+    """চেষ্টার ক্রম: প্রথমে বেছে নেওয়া মডেল, তারপর বাকি চালু মডেল। kind = text | fast | vision"""
+    try:
+        pool = list(_discover_groq_models(api_key))
+    except Exception:
+        pool = []
+    if kind == "vision":
+        base = [VISION_MODEL] + [m for m in pool if re.search(r"scout|maverick|vision|-vl|llama-4", m, re.I)]
+    elif kind == "fast":
+        base = [m for m in _GROQ_FAST if not pool or m in pool] + groq_text_models()
+    else:
+        base = groq_text_models()
+    chain = ([first] if first else []) + base
+    chain = list(dict.fromkeys(m for m in chain if m))
+    live = [m for m in chain if not is_dead(m)]
+    return (live or chain)[:limit]
+
+
+def groq_create(first=None, kind="text", opts=None, **kw):
+    """client.chat.completions.create + অটো-ফলব্যাক। (response, ব্যবহৃত_মডেল) ফেরত দেয়।
+    stream=True হলে response একটি স্ট্রিম; স্ট্রিম শুরুর আগের ত্রুটিতেই মডেল বদলায় (লেখা দ্বিগুণ হয় না)।"""
+    cl = client.with_options(**opts) if opts else client
+    last = None
+    for m in groq_chain(first, kind):
+        try:
+            res = cl.chat.completions.create(model=m, **kw)
+            st.session_state["_groq_used"] = m
+            if first and m != first:
+                try:
+                    st.toast(f"ℹ️ {first} চলছে না — {m} দিয়ে উত্তর দেওয়া হচ্ছে")
+                except Exception:
+                    pass
+            return res, m
+        except Exception as e:
+            last = e
+            kind_e = _err_kind(e)
+            if kind_e == "dead":
+                mark_dead(m)
+            elif kind_e == "busy":
+                mark_dead(m, _DEAD_SHORT)
+            elif kind_e != "skip":
+                raise
+    raise last if last else RuntimeError("কোনো Groq মডেল পাওয়া যায়নি")
+
+
+def _strip_think(chunks):
+    """Qwen/DeepSeek জাতীয় মডেলের <think>…</think> অংশ উত্তর থেকে বাদ দেয়"""
+    buf, in_think = "", False
+    for c in chunks:
+        buf += c
+        out = ""
+        while buf:
+            if in_think:
+                i = buf.find("</think>")
+                if i == -1:
+                    buf = buf[-7:]
+                    break
+                buf, in_think = buf[i + 8:], False
+            else:
+                i = buf.find("<think>")
+                if i == -1:
+                    keep = max((k for k in range(1, 7) if buf.endswith("<think>"[:k])), default=0)
+                    out += buf[:len(buf) - keep]
+                    buf = buf[len(buf) - keep:]
+                    break
+                out += buf[:i]
+                buf, in_think = buf[i + 7:], True
+        if out:
+            yield out
+    if buf and not in_think:
+        yield buf
 
 WP_URL = get_secret("WP_URL").rstrip("/")
 WP_AUTH = (get_secret("WP_USER"), get_secret("WP_APP_PASSWORD"))
@@ -868,6 +1026,13 @@ HOW TO ANSWER
 2. Think before you write: work out the real question behind the message, check facts, numbers and edge cases, then answer. Never guess silently; if something is uncertain, say so plainly and say what would settle it.
 3. Be specific and concrete: exact names, numbers, commands, versions and examples instead of vague generalities. No filler, no flattery, no restating the question, no generic disclaimers.
 4. Match the depth to the question: short factual questions get short answers; complex or technical questions get structured, thorough ones.
+
+CLARITY (every answer must be easy to understand and well organised)
+- Write for a smart beginner: short sentences, plain words, and explain any technical term in a few words the first time you use it.
+- Use a clear order: direct answer -> why -> how (numbered steps) -> small example. For problems, give the cause first and then the fix.
+- Whenever an idea is abstract, add ONE small concrete example or everyday analogy.
+- Keep only what helps the user act, but never skip an important step. Group related points under a short heading instead of one long block of text.
+- For code: say what the code does in one line, give the COMPLETE code, then how to run/test it and what result to expect.
 
 FORMAT (clean Markdown)
 - Use short headings (##/###) only for longer answers; bullet points for parallel items; numbered lists for steps.
@@ -1251,8 +1416,8 @@ def run_wp_tool(name, args):
 def run_agent(model, system_text, history, temp, max_steps=5):
     msgs = [{"role": "system", "content": system_text}] + history
     for _ in range(max_steps):
-        resp = client.chat.completions.create(
-            model=model,
+        resp, _ = groq_create(
+            model,
             messages=msgs,
             tools=WP_TOOLS,
             tool_choice="auto",
@@ -1312,13 +1477,14 @@ def gemini_contents(history, use_image):
 
 
 _RETRY_CODES = (429, 500, 502, 503, 504)
-_STATIC_FALLBACKS = ("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest")
+_STATIC_FALLBACKS = ("gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash-lite")
+_STATIC_PRO = ("gemini-pro-latest",)
 _SKIP_WORDS = r"image|tts|live|audio|embedding|robotics|computer|learnlm|gemma|8b|exp"
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _discover_gemini_models(api_key):
-    """Google থেকে এখন যে flash মডেলগুলো সত্যিই চালু আছে তার তালিকা (নতুন → পুরনো)।"""
+def _discover_gemini_models(api_key, family="flash"):
+    """Google থেকে এখন যে flash/pro মডেলগুলো সত্যিই চালু আছে তার তালিকা (নতুন → পুরনো)।"""
     r = requests.get(f"{GEMINI_BASE}?pageSize=200", headers=_gemini_headers(), timeout=5)
     r.raise_for_status()  # ব্যর্থ হলে cache হয় না, পরের বার আবার চেষ্টা হবে
     found = []
@@ -1326,7 +1492,7 @@ def _discover_gemini_models(api_key):
         name = m.get("name", "").split("/")[-1]
         if "generateContent" not in m.get("supportedGenerationMethods", []):
             continue
-        if "flash" not in name or re.search(_SKIP_WORDS, name):
+        if family not in name or re.search(_SKIP_WORDS, name):
             continue
         ver = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
         found.append((-(float(ver.group(1)) if ver else 0), "lite" in name, "preview" in name, name))
@@ -1335,21 +1501,26 @@ def _discover_gemini_models(api_key):
 
 
 def gemini_candidates():
-    """চেষ্টার ক্রম: তোমার GEMINI_MODEL, তারপর এখন চালু থাকা সেরা flash মডেলগুলো।"""
-    extra = []
+    """চেষ্টার ক্রম: (নিজে নাম দিলে সেটি), তারপর এখন চালু সেরা মডেল। বন্ধ/ব্যস্ত মডেল কিছুক্ষণ বাদ।"""
+    pref = active_gemini_model() or "auto-flash"
+    want_pro = pref == "auto-pro" or ("pro" in pref and "flash" not in pref and not pref.startswith("auto"))
+    out = [] if pref.startswith("auto-") else [pref]
+    found = []
     if time.time() >= st.session_state.get("_gem_discover_fail_until", 0):
         try:
-            extra = _discover_gemini_models(GEMINI_API_KEY)[:4]
+            if want_pro:
+                found += _discover_gemini_models(GEMINI_API_KEY, "pro")[:2]
+            found += _discover_gemini_models(GEMINI_API_KEY, "flash")[:4]
         except Exception:
-            extra = []
+            found = []
             st.session_state["_gem_discover_fail_until"] = time.time() + 600  # ১০ মিনিট আর চেষ্টা নয়
-    if not extra:
-        extra = list(_STATIC_FALLBACKS)
-    out = [active_gemini_model()]
-    for m in extra:
+    if not found:
+        found = (list(_STATIC_PRO) if want_pro else []) + list(_STATIC_FALLBACKS)
+    for m in found:
         if m not in out:
             out.append(m)
-    return out
+    live = [m for m in out if not is_dead(m)]
+    return live or out
 
 
 def _gemini_body(system_text, history, temp, use_image, thinking):
@@ -1366,7 +1537,7 @@ def _gemini_body(system_text, history, temp, use_image, thinking):
 def gemini_stream(system_text, history, temp, use_image):
     """Gemini থেকে লেখা একটু একটু করে আসে (SSE)।
     মডেল ভিড়ে থাকলে/বন্ধ থাকলে পরের মডেলে যায়; সবই ব্যস্ত হলে একটু থেমে ৩ রাউন্ড পর্যন্ত আবার চেষ্টা করে।"""
-    candidates = gemini_candidates()[:2]  # আগে ৫টি মডেল ঘুরত; এখন সর্বোচ্চ ২টি
+    candidates = gemini_candidates()[:4]  # বন্ধ মডেল আগেই বাদ পড়ে, তাই ৪টির মধ্যেই চালু মডেল পাওয়া যায়
     errors = {}
 
     for rnd in range(1):
@@ -1390,6 +1561,10 @@ def gemini_stream(system_text, history, temp, use_image):
                     if r.status_code != 200:
                         msg = _gemini_error(r)
                         errors[m_name] = msg.replace("Gemini ", "")[:90]
+                        if r.status_code == 404:
+                            mark_dead(m_name)                  # বন্ধ/নতুন-ইউজারের জন্য নয় → ৬ ঘণ্টা বাদ
+                        elif r.status_code in _RETRY_CODES:
+                            mark_dead(m_name, _DEAD_SHORT)     # ব্যস্ত → ১ মিনিট বাদ, পরের মেসেজ দ্রুত যাবে
                         if r.status_code == 400 and use_thinking and "think" in msg.lower():
                             use_thinking = False  # thinking সাপোর্ট নেই, ছাড়া আবার
                             continue
@@ -1488,6 +1663,7 @@ def claude_stream(system_text, history, temp, use_image, max_out=None):
     }
     headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     models = list(dict.fromkeys([body["model"], *CLAUDE_FALLBACKS]))
+    models = [m for m in models if not is_dead(m)] or models
     r = None
     for mi, model_name in enumerate(models):
         body["model"] = model_name
@@ -1505,6 +1681,8 @@ def claude_stream(system_text, history, temp, use_image, max_out=None):
             break
         if r.status_code == 200:
             break
+        if r.status_code == 404:
+            mark_dead(model_name)
         # মডেল পাওয়া যাচ্ছে না / অ্যাক্সেস নেই / ওভারলোড → পরের মডেল
         if not last_model and r.status_code in (400, 403, 404, 429, 500, 502, 503, 529):
             r.close()
@@ -1539,10 +1717,29 @@ def claude_stream(system_text, history, temp, use_image, max_out=None):
         raise RuntimeError("Claude কোনো উত্তর দেয়নি")
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _discover_gemini_image_models(api_key):
+    r = requests.get(f"{GEMINI_BASE}?pageSize=200", headers=_gemini_headers(), timeout=5)
+    r.raise_for_status()
+    found = []
+    for m in r.json().get("models", []):
+        name = m.get("name", "").split("/")[-1]
+        if "generateContent" in m.get("supportedGenerationMethods", []) and "image" in name and not re.search(r"embed|imagen|vision", name):
+            ver = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+            found.append((-(float(ver.group(1)) if ver else 0), "preview" in name, name))
+    found.sort()
+    return [f[-1] for f in found]
+
+
 def _gemini_image_call(parts, image_config=None):
     """image_config: যেমন {"imageSize": "2K"}; মডেল না নিলে (400) config ছাড়া আবার চেষ্টা করে"""
     last_err = None
-    for m_name in dict.fromkeys([GEMINI_IMAGE_MODEL, *GEMINI_IMAGE_FALLBACKS]):
+    try:
+        _disc_img = _discover_gemini_image_models(GEMINI_API_KEY)[:3]
+    except Exception:
+        _disc_img = []
+    _img_models = [m for m in dict.fromkeys([GEMINI_IMAGE_MODEL, *GEMINI_IMAGE_FALLBACKS, *_disc_img]) if not is_dead(m)]
+    for m_name in _img_models:
         r = None
         for cfg in ([image_config, None] if image_config else [None]):
             gen = {"responseModalities": ["TEXT", "IMAGE"]}
@@ -1554,6 +1751,8 @@ def _gemini_image_call(parts, image_config=None):
                 break
         if r.status_code != 200:
             last_err = f"{m_name}: {_gemini_error(r)}"
+            if r.status_code == 404:
+                mark_dead(m_name)
             continue  # এই মডেল বন্ধ/অনুপলব্ধ হলে পরের মডেলে
         for cand in r.json().get("candidates", []):
             for part in (cand.get("content") or {}).get("parts", []):
@@ -1583,8 +1782,8 @@ def gemini_edit_image(images, prompt, quality="auto"):
 # ---------- Image generation / editing ----------
 def _llm_rewrite(system_text, user_text):
     try:
-        res = client.with_options(timeout=10.0, max_retries=0).chat.completions.create(
-            model="openai/gpt-oss-20b",
+        res, _ = groq_create(
+            None, "fast", {"timeout": 10.0, "max_retries": 0},
             messages=[
                 {"role": "system", "content": system_text},
                 {"role": "user", "content": user_text},
@@ -1851,8 +2050,8 @@ def edit_ai_image(image_bytes, instruction, mime, quality, extra=None, transpare
     combined_prompt = eng
     try:
         b64_img = base64.b64encode(image_bytes).decode("utf-8")
-        desc_resp = client.chat.completions.create(
-            model=VISION_MODEL,
+        desc_resp, _ = groq_create(
+            VISION_MODEL, "vision",
             messages=[
                 {
                     "role": "user",
@@ -2903,8 +3102,8 @@ def auto_extract_memory(user_text):
         room = MAX_MEMORIES - len(existing)
         if room <= 0:
             return []
-        res = client.with_options(timeout=10.0, max_retries=0).chat.completions.create(
-            model="openai/gpt-oss-20b",
+        res, _ = groq_create(
+            None, "fast", {"timeout": 10.0, "max_retries": 0},
             messages=[
                 {"role": "system", "content": (
                     "You extract LONG-TERM personal facts about the USER from their latest message, to remember "
@@ -3141,12 +3340,15 @@ with st.sidebar:
     with st.expander("⚙️ সেটিংস", expanded=False):
         st.caption("☁️ চ্যাট সেভ: ক্লাউড ডেটাবেস (Turso)" if USE_TURSO
                    else "💾 চ্যাট সেভ: লোকাল ফাইল (হোস্টিংয়ে রিস্টার্ট দিলে মুছে যেতে পারে)")
+        _AUTO_LABEL = "⚡ অটো (সেরা চালু মডেল)"
+        _gm = groq_text_models()
         preset_model = st.selectbox(
             "AI মডেল বেছে নিন:",
-            ["llama-3.3-70b-versatile", "openai/gpt-oss-120b"],
+            [_AUTO_LABEL, *_gm[:25]],
+            help="অটো বেছে রাখলে কোনো মডেল বন্ধ হয়ে গেলেও অ্যাপ নিজে চালু মডেলে চলে যাবে।",
         )
         custom_model = st.text_input("Custom model (ঐচ্ছিক):", placeholder="যেমন: openai/gpt-oss-120b")
-        selected_model = custom_model.strip() or preset_model
+        selected_model = custom_model.strip() or (_gm[0] if preset_model == _AUTO_LABEL else preset_model)
 
         temperature = st.slider(
             "Creativity (temperature)",
@@ -4076,12 +4278,16 @@ def friendly_error(e):
         return "Gemini এখন ব্যস্ত, কিছুক্ষণ পরে আবার চেষ্টা করো। (ফাইল/ছবি ছোট করলেও সুবিধা হয়)"
     if "503" in s or "overloaded" in low or "high demand" in low:
         return "AI সার্ভার এখন খুব ব্যস্ত। একটু পরে আবার চেষ্টা করো।"
+    if any(k in low for k in ("model_not_found", "does not exist", "no longer available", "decommission")):
+        return ("এই মুহূর্তে কোনো AI মডেল চালু পাওয়া যায়নি। সাইডবার → ⚙️ সেটিংস → AI মডেলে "
+                "'⚡ অটো' বেছে নাও, অথবা Custom model-এ চালু মডেলের নাম দাও। "
+                "(১ মিনিট পর আবার চেষ্টা করলেও অ্যাপ নিজে নতুন মডেল খুঁজে নেবে।)")
     return f"একটি সমস্যা হয়েছে: {s}"
 
 
 def stream_reply(model, messages, temp):
-    stream = client.chat.completions.create(
-        model=model,
+    stream, _used = groq_create(
+        model, "vision" if model == VISION_MODEL else "text",
         messages=messages,
         temperature=temp,
         max_tokens=APP_MAX_OUT if is_app_mode else {"সংক্ষিপ্ত": 1200, "সাধারণ": GROQ_MAX_OUT, "বিস্তারিত": 4000}.get(
@@ -4089,9 +4295,12 @@ def stream_reply(model, messages, temp):
         ),
         stream=True,
     )
-    for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta.content:
-            yield chunk.choices[0].delta.content
+    def _raw():
+        for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+
+    yield from (_strip_think(_raw()) if re.search(r"qwen|deepseek|qwq", _used, re.I) else _raw())
 
 
 def get_history():
@@ -5039,8 +5248,9 @@ def _mcp_groq_loop(cfg, system_text, history, temp, max_steps, stats):
     msgs = [{"role": "system", "content": sys_text}] + [{"role": m["role"], "content": m["content"]} for m in hist]
     stats["model"] = selected_model
     for _ in range(max_steps):
-        resp = client.chat.completions.create(model=selected_model, messages=msgs, tools=otools, tool_choice="auto",
-                                              temperature=temp, max_tokens=GROQ_AGENT_MAX_OUT)
+        resp, _used = groq_create(selected_model, messages=msgs, tools=otools, tool_choice="auto",
+                                  temperature=temp, max_tokens=GROQ_AGENT_MAX_OUT)
+        stats["model"] = _used
         m = resp.choices[0].message
         if not m.tool_calls:
             return m.content or "✅ কাজ শেষ।"
@@ -5200,8 +5410,8 @@ def auto_llm(system_text, user_text, temp=0.6):
             return "".join(gemini_stream(system_text, hist, temp, False))
         except Exception:
             pass
-    res = client.chat.completions.create(
-        model=selected_model,
+    res, _ = groq_create(
+        selected_model,
         messages=[{"role": "system", "content": system_text}, {"role": "user", "content": user_text}],
         temperature=temp,
         max_tokens=4000,
@@ -6882,7 +7092,9 @@ if st.session_state.pending:
                         except Exception as e:
                             st.warning(f"⚠️ Gemini ব্যর্থ ({_short(e)}), Groq দিয়ে উত্তর দেওয়া হচ্ছে।")
 
+                    _on_groq = False
                     if stream is None:
+                        _on_groq = True
                         sys_text = build_system_instruction(GROQ_FILE_LIMIT) + search_block
                         sys_text, g_history, g_trimmed = fit_for_groq(sys_text, history, budget=9000 if is_app_mode else GROQ_INPUT_TOKENS)
                         if g_trimmed:
@@ -6894,6 +7106,8 @@ if st.session_state.pending:
                         used_model = model_to_use
 
                     reply = st.write_stream(stream)
+                    if _on_groq:
+                        used_model = st.session_state.get("_groq_used") or used_model
                     _secs = time.perf_counter() - _t0
                     _toks = est_tokens(reply)
                     if sources_md:
