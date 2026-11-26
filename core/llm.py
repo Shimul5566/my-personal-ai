@@ -9,12 +9,50 @@ Imports only third-party packages (never app.py, studios/ or other core modules)
 import re
 import time
 
+import requests
 import streamlit as st
 from groq import Groq
+from http.cookiejar import DefaultCookiePolicy
+from requests.adapters import HTTPAdapter
 
 client = None          # set by configure()
 api_key = None         # Groq API key (used for cached model discovery)
 VISION_MODEL = ""      # default Groq vision model
+
+
+@st.cache_resource(show_spinner=False)
+def get_groq_client(key, timeout=25.0, max_retries=0):
+    """One shared Groq client per (key, timeout) for the whole server process, not one per Streamlit rerun.
+    Its httpx pool keeps TCP/TLS connections alive between chat requests."""
+    return Groq(api_key=key, timeout=timeout, max_retries=max_retries)
+
+
+@st.cache_resource(show_spinner=False)
+def get_session():
+    """Shared requests.Session (connection pooling: TCP/TLS handshakes are reused).
+    Cookies are disabled so the shared session never leaks cookies between users or sites."""
+    s = requests.Session()
+    s.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
+    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=40, max_retries=0)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+_OPT_CLIENTS = {}  # (id(client), opts) -> client.with_options(...) so it is not rebuilt on every call
+
+
+def _client_with(opts):
+    if not opts:
+        return client
+    try:
+        k = (id(client), tuple(sorted(opts.items())))
+        c = _OPT_CLIENTS.get(k)
+        if c is None:
+            c = _OPT_CLIENTS[k] = client.with_options(**opts)
+        return c
+    except TypeError:  # unhashable option value
+        return client.with_options(**opts)
 
 
 def configure(groq_client, groq_api_key, vision_model):
@@ -73,7 +111,7 @@ _GROQ_FAST = ("openai/gpt-oss-20b", "llama-3.1-8b-instant")
 @st.cache_data(ttl=1800, show_spinner=False)
 def _discover_groq_models(key):
     """Groq-এ এই কী দিয়ে এখন সত্যিই চালু মডেলের তালিকা"""
-    cl = Groq(api_key=key, timeout=6.0, max_retries=0)
+    cl = get_groq_client(key, 6.0, 0)
     out = []
     for m in cl.models.list().data:
         if getattr(m, "active", True) is False:
@@ -124,7 +162,7 @@ def groq_chain(first=None, kind="text", limit=4):
 def groq_create(first=None, kind="text", opts=None, **kw):
     """client.chat.completions.create + অটো-ফলব্যাক। (response, ব্যবহৃত_মডেল) ফেরত দেয়।
     stream=True হলে response একটি স্ট্রিম; স্ট্রিম শুরুর আগের ত্রুটিতেই মডেল বদলায় (লেখা দ্বিগুণ হয় না)।"""
-    cl = client.with_options(**opts) if opts else client
+    cl = _client_with(opts)
     last = None
     for m in groq_chain(first, kind):
         try:
