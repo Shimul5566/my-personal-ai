@@ -31,6 +31,18 @@ from groq import Groq
 from pypdf import PdfReader
 from docx import Document
 
+# ---- Codexio v3 modules (no circular imports: config <- core <- studios <- app) ----
+from config import APP_VERSION, GROQ_APP_BUDGET, GROQ_APP_MAX_OUT, get_secret
+from core import llm as _llm
+from core.llm import _DEAD_SHORT, _strip_think, est_tokens, groq_create, groq_text_models, is_dead, mark_dead
+from core.db import (
+    add_column_if_missing, ensure_saved_sites_table, get_fernet, usage_by_engine,
+)
+from studios.app_builder import render_publish_button, render_starter_chips
+from studios.wordpress import (
+    forget_site, hydrate_saved_sites, persist_site, render_page_actions,
+)
+
 load_dotenv()
 
 # App logo (embedded so the app stays a single file)
@@ -57,7 +69,7 @@ LOGO_SVG = (
 )
 LOGO_SVG_URI = "data:image/svg+xml;base64," + base64.b64encode(LOGO_SVG.encode("utf-8")).decode()
 
-APP_VERSION = "2.9.0"  # Elementor MCP Connector + Auto-Project Builder, মাল্টি-সাইট WP অটোমেশন, মোবাইল UI polish
+# APP_VERSION (3.0.0) আসে config.py থেকে
 
 st.set_page_config(
     page_title="আমার পার্সোনাল AI",
@@ -739,16 +751,6 @@ st.markdown(
 )
 
 
-def get_secret(name, default=""):
-    val = os.environ.get(name)
-    if val:
-        return val
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return default
-
-
 APP_PASSWORD = get_secret("APP_PASSWORD")
 if APP_PASSWORD and not st.session_state.get("auth"):
     st.markdown("<h2 style='text-align:center;'>🔒 আমার পার্সোনাল AI লগইন</h2>", unsafe_allow_html=True)
@@ -813,159 +815,6 @@ HAS_EDIT = bool(OPENAI_API_KEY or GEMINI_API_KEY or HF_TOKEN or POLLINATIONS_API
 client = Groq(api_key=api_key, timeout=25.0, max_retries=0)  # দ্রুত ব্যর্থ হয়ে পরের মডেলে যাবে (নিজস্ব ফলব্যাক চেইন আছে)
 
 
-# ---------- স্বয়ংক্রিয় মডেল বাছাই + ফলব্যাক ----------
-# কোনো মডেল বন্ধ/নাম-বদল/অ্যাক্সেস-হীন হলে (404 model_not_found) অ্যাপ নিজে পরের চালু মডেলে যায়
-# এবং বন্ধ মডেলটি কিছুক্ষণ আর চেষ্টা করে না — তাই একই ভুল বারবার দেখা যায় না, উত্তরও দ্রুত আসে।
-_DEAD_LONG = 6 * 3600   # মডেল নেই / অ্যাক্সেস নেই
-_DEAD_SHORT = 60        # ব্যস্ত / রেট-লিমিট / টাইমআউট
-
-
-def _dead_map():
-    return st.session_state.setdefault("_dead_models", {})
-
-
-def mark_dead(model, secs=_DEAD_LONG):
-    if model:
-        _dead_map()[model] = time.time() + secs
-
-
-def is_dead(model):
-    exp = _dead_map().get(model)
-    if exp and exp < time.time():
-        _dead_map().pop(model, None)
-        return False
-    return bool(exp)
-
-
-def _err_kind(e):
-    """'dead' = মডেল নেই/বন্ধ, 'busy' = সাময়িক (লিমিট/ব্যস্ত), 'skip' = এই মডেলে সাপোর্ট নেই, 'raise' = অন্য সমস্যা"""
-    s = str(e).lower()
-    code = getattr(e, "status_code", None)
-    name = type(e).__name__
-    if code == 404 or any(k in s for k in (
-            "model_not_found", "does not exist", "decommission", "no longer available", "no longer supported",
-            "model_not_active", "do not have access", "don't have access", "unknown model", "invalid model")):
-        return "dead"
-    if code in (413, 429, 500, 502, 503, 504, 529) or "rate_limit" in s or "tokens per" in s \
-            or "overloaded" in s or "timeout" in name.lower() or "connection" in name.lower():
-        return "busy"
-    if code == 400 and any(k in s for k in ("tool", "function", "not support", "unsupported", "vision", "image", "reasoning")):
-        return "skip"
-    return "raise"
-
-
-_GROQ_SKIP = r"whisper|tts|playai|orpheus|guard|safeguard|embed|moderation|transcri|speech"
-# পছন্দের ক্রম (তোমার আগের নামগুলো আগে রাখা হয়েছে; যেটা বন্ধ সেটা অটো বাদ পড়বে)
-_GROQ_PREF = ("openai/gpt-oss-120b", "llama-3.3-70b-versatile", "qwen/qwen3.8-27b", "qwen/qwen3-32b",
-              "openai/gpt-oss-20b", "llama-3.1-8b-instant")
-_GROQ_FAST = ("openai/gpt-oss-20b", "llama-3.1-8b-instant")
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def _discover_groq_models(key):
-    """Groq-এ এই কী দিয়ে এখন সত্যিই চালু মডেলের তালিকা"""
-    cl = Groq(api_key=key, timeout=6.0, max_retries=0)
-    out = []
-    for m in cl.models.list().data:
-        if getattr(m, "active", True) is False:
-            continue
-        out.append(m.id)
-    if not out:
-        raise RuntimeError("empty model list")  # খালি হলে cache হয় না
-    return out
-
-
-def _groq_rank(name):
-    if name in _GROQ_PREF:
-        return (0, _GROQ_PREF.index(name), 0.0, name)
-    sizes = [float(x) for x in re.findall(r"(\d+(?:\.\d+)?)b", name.lower())]
-    return (1, 0, -(max(sizes) if sizes else 0.0), name)
-
-
-def groq_text_models():
-    """চ্যাট-যোগ্য চালু মডেল, সেরা আগে (বন্ধ মডেল বাদ)"""
-    try:
-        found = [m for m in _discover_groq_models(api_key) if not re.search(_GROQ_SKIP, m, re.I)]
-    except Exception:
-        found = []
-    if not found:
-        found = list(_GROQ_PREF)
-    found = sorted(dict.fromkeys(found), key=_groq_rank)
-    return [m for m in found if not is_dead(m)] or found
-
-
-def groq_chain(first=None, kind="text", limit=4):
-    """চেষ্টার ক্রম: প্রথমে বেছে নেওয়া মডেল, তারপর বাকি চালু মডেল। kind = text | fast | vision"""
-    try:
-        pool = list(_discover_groq_models(api_key))
-    except Exception:
-        pool = []
-    if kind == "vision":
-        base = [VISION_MODEL] + [m for m in pool if re.search(r"scout|maverick|vision|-vl|llama-4", m, re.I)]
-    elif kind == "fast":
-        base = [m for m in _GROQ_FAST if not pool or m in pool] + groq_text_models()
-    else:
-        base = groq_text_models()
-    chain = ([first] if first else []) + base
-    chain = list(dict.fromkeys(m for m in chain if m))
-    live = [m for m in chain if not is_dead(m)]
-    return (live or chain)[:limit]
-
-
-def groq_create(first=None, kind="text", opts=None, **kw):
-    """client.chat.completions.create + অটো-ফলব্যাক। (response, ব্যবহৃত_মডেল) ফেরত দেয়।
-    stream=True হলে response একটি স্ট্রিম; স্ট্রিম শুরুর আগের ত্রুটিতেই মডেল বদলায় (লেখা দ্বিগুণ হয় না)।"""
-    cl = client.with_options(**opts) if opts else client
-    last = None
-    for m in groq_chain(first, kind):
-        try:
-            res = cl.chat.completions.create(model=m, **kw)
-            st.session_state["_groq_used"] = m
-            if first and m != first:
-                try:
-                    st.toast(f"ℹ️ {first} চলছে না — {m} দিয়ে উত্তর দেওয়া হচ্ছে")
-                except Exception:
-                    pass
-            return res, m
-        except Exception as e:
-            last = e
-            kind_e = _err_kind(e)
-            if kind_e == "dead":
-                mark_dead(m)
-            elif kind_e == "busy":
-                mark_dead(m, _DEAD_SHORT)
-            elif kind_e != "skip":
-                raise
-    raise last if last else RuntimeError("কোনো Groq মডেল পাওয়া যায়নি")
-
-
-def _strip_think(chunks):
-    """Qwen/DeepSeek জাতীয় মডেলের <think>…</think> অংশ উত্তর থেকে বাদ দেয়"""
-    buf, in_think = "", False
-    for c in chunks:
-        buf += c
-        out = ""
-        while buf:
-            if in_think:
-                i = buf.find("</think>")
-                if i == -1:
-                    buf = buf[-7:]
-                    break
-                buf, in_think = buf[i + 8:], False
-            else:
-                i = buf.find("<think>")
-                if i == -1:
-                    keep = max((k for k in range(1, 7) if buf.endswith("<think>"[:k])), default=0)
-                    out += buf[:len(buf) - keep]
-                    buf = buf[len(buf) - keep:]
-                    break
-                out += buf[:i]
-                buf, in_think = buf[i + 7:], True
-        if out:
-            yield out
-    if buf and not in_think:
-        yield buf
-
 WP_URL = get_secret("WP_URL").rstrip("/")
 WP_AUTH = (get_secret("WP_USER"), get_secret("WP_APP_PASSWORD"))
 
@@ -995,6 +844,7 @@ MAX_MEMORIES = 30        # সর্বোচ্চ কতগুলো মেম
 MEMORY_FACT_MAX = 300    # একটি তথ্যের সর্বোচ্চ অক্ষর
 MEMORY_MAX_CHARS = 1500  # AI-কে মোট যত অক্ষরের মেমোরি পাঠানো হবে
 VISION_MODEL = get_secret("VISION_MODEL") or "meta-llama/llama-4-scout-17b-16e-instruct"  # Groq-এর ছবি দেখার (Vision) মডেল
+_llm.configure(client, api_key, VISION_MODEL)
 HF_IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
 HF_EDIT_MODEL = "black-forest-labs/FLUX.1-Kontext-dev"
 try:
@@ -1099,7 +949,7 @@ ACCURACY AND HONESTY
 ENDING
 - After complex, technical or multi-part answers, end with 1-2 short, genuinely useful follow-up suggestions (a next step, a risk to check, or a related improvement). For beginner/teaching answers end with ONE line offering the next topic. Skip it for simple or casual replies."""
 
-APP_MAX_OUT = 6000  # অ্যাপ বিল্ডার মোডে Groq-এর আউটপুট সীমা (পুরো অ্যাপের কোডের জন্য বেশি দরকার)
+APP_MAX_OUT = GROQ_APP_MAX_OUT  # অ্যাপ বিল্ডারে Groq-এর আউটপুট সীমা (ফ্রি টায়ার TPM-এর জন্য 3500)
 
 APP_BUILDER_PROMPT = """You are an expert mobile app builder (like Rork / Lovable). The user describes an app in plain language
 (Bengali or English). You build a COMPLETE, WORKING, mobile-first app as ONE self-contained HTML file.
@@ -1562,8 +1412,8 @@ def gemini_candidates():
     return live or out
 
 
-def _gemini_body(system_text, history, temp, use_image, thinking):
-    gen_cfg = {"temperature": temp, "maxOutputTokens": 16000 if is_app_mode else 8000}
+def _gemini_body(system_text, history, temp, use_image, thinking, is_app=False):
+    gen_cfg = {"temperature": temp, "maxOutputTokens": 16000 if is_app else 8000}
     if thinking:
         gen_cfg["thinkingConfig"] = {"thinkingBudget": 1024}
     return {
@@ -1573,7 +1423,7 @@ def _gemini_body(system_text, history, temp, use_image, thinking):
     }
 
 
-def gemini_stream(system_text, history, temp, use_image):
+def gemini_stream(system_text, history, temp, use_image, is_app=False):
     """Gemini থেকে লেখা একটু একটু করে আসে (SSE)।
     মডেল ভিড়ে থাকলে/বন্ধ থাকলে পরের মডেলে যায়; সবই ব্যস্ত হলে একটু থেমে ৩ রাউন্ড পর্যন্ত আবার চেষ্টা করে।"""
     candidates = gemini_candidates()[:4]  # বন্ধ মডেল আগেই বাদ পড়ে, তাই ৪টির মধ্যেই চালু মডেল পাওয়া যায়
@@ -1588,7 +1438,7 @@ def gemini_stream(system_text, history, temp, use_image):
             url = f"{GEMINI_BASE}/{m_name}:streamGenerateContent?alt=sse"
 
             for _attempt in range(2):
-                body = _gemini_body(system_text, history, temp, use_image, use_thinking)
+                body = _gemini_body(system_text, history, temp, use_image, use_thinking, is_app)
                 try:
                     r = requests.post(url, headers=_gemini_headers(), json=body, stream=True, timeout=(5, 45))
                 except requests.RequestException as e:
@@ -1688,9 +1538,9 @@ def claude_messages(history, use_image):
     return out
 
 
-def claude_stream(system_text, history, temp, use_image, max_out=None):
+def claude_stream(system_text, history, temp, use_image, max_out=None, is_app=False):
     """Claude থেকে স্ট্রিম করে টেক্সট দেয়। মডেল না চললে নিজে পরের Claude মডেলে যায়; সব ব্যর্থ হলে RuntimeError"""
-    max_out = max_out or (16000 if is_app_mode else CLAUDE_OUT.get(st.session_state.get("response_detail", "সাধারণ"), 6000))
+    max_out = max_out or (16000 if is_app else CLAUDE_OUT.get(st.session_state.get("response_detail", "সাধারণ"), 6000))
     body = {
         "model": active_claude_model(),
         "max_tokens": max_out,
@@ -2658,10 +2508,8 @@ def init_db():
             )
             """
         )
-        # পুরনো ডেটাবেসে pinned কলাম না থাকলে অটোমেটিক যুক্ত করে নেবে
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(chats)").fetchall()]
-        if "pinned" not in cols:
-            conn.execute("ALTER TABLE chats ADD COLUMN pinned INTEGER DEFAULT 0")
+        # পুরনো ডেটাবেসে কলাম না থাকলে যুক্ত হবে। Turso-তে PRAGMA table_info ভরসাযোগ্য নয়, তাই ALTER চেষ্টা করে ব্যর্থ হলে উপেক্ষা।
+        add_column_if_missing(conn, "chats", "pinned INTEGER DEFAULT 0")
 
         conn.execute(
             """
@@ -2688,12 +2536,9 @@ def init_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id)")
-        # একাধিক ছবির জন্য নতুন কলাম (পুরনো ডেটাবেসে না থাকলে অটো যুক্ত হবে)
-        mcols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
-        if "images" not in mcols:
-            conn.execute("ALTER TABLE messages ADD COLUMN images TEXT")
-        if "meta" not in mcols:  # স্পিড/টোকেন ব্যাজের তথ্য (JSON)
-            conn.execute("ALTER TABLE messages ADD COLUMN meta TEXT")
+        add_column_if_missing(conn, "messages", "images TEXT")  # একাধিক ছবি
+        add_column_if_missing(conn, "messages", "meta TEXT")    # স্পিড/টোকেন ব্যাজের তথ্য (JSON)
+        ensure_saved_sites_table(conn)                           # এনক্রিপ্টেড সাইট ম্যানেজার
 
 
 def db_list_chats():
@@ -3442,6 +3287,23 @@ with st.sidebar:
             _gpick = st.selectbox("🤖 Gemini মডেল:", _gnames, index=_gnames.index(_gdef), key="gemini_model_sel")
             st.session_state["gemini_model_value"] = GEMINI_MODELS[_gpick]
 
+    with st.expander("📊 Usage & Tokens", expanded=False):
+        if st.button("🔄 রিফ্রেশ", key="usage_refresh"):
+            st.session_state.pop("_usage_cache", None)
+        _uc = st.session_state.get("_usage_cache")
+        if not _uc or time.time() - _uc[0] > 120:
+            _uc = (time.time(), _db_safe(usage_by_engine, _db, default=None))
+            st.session_state["_usage_cache"] = _uc
+        _us = _uc[1]
+        if _us and any(v["messages"] for v in _us.values()):
+            for _eng, _v in _us.items():
+                if _v["messages"]:
+                    st.markdown(f"**{_eng}** — {_v['messages']:,} মেসেজ · ~{_v['tokens']:,} tokens")
+            st.caption(f"মোট: {sum(v['messages'] for v in _us.values()):,} মেসেজ · "
+                       f"~{sum(v['tokens'] for v in _us.values()):,} tokens (আনুমানিক, সেভ করা চ্যাট থেকে)")
+        else:
+            st.caption("এখনো কোনো ব্যবহারের তথ্য নেই।")
+
     use_search = False
     if app_mode.startswith("💬"):
         if TAVILY_API_KEY:
@@ -4127,6 +3989,7 @@ def render_message(m, idx):
                         mime="text/html",
                         key=f"appdl_{pk}",
                     )
+                    render_publish_button(_rec["code"], f"{pk}_ed", get_secret("NETLIFY_AUTH_TOKEN"), get_secret("GITHUB_TOKEN"))
                 else:
                     render_app_preview(_rec["code"], phone=_dev.startswith("📱"))
                     st.download_button(
@@ -4137,6 +4000,7 @@ def render_message(m, idx):
                         key=f"appdl_{pk}",
                         help="ফাইলটি Netlify Drop / GitHub Pages-এ আপলোড করলেই অ্যাপ লাইভ হবে",
                     )
+                    render_publish_button(_rec["code"], pk, get_secret("NETLIFY_AUTH_TOKEN"), get_secret("GITHUB_TOKEN"))
             elif st.toggle("▶ লাইভ প্রিভিউ দেখুন", key=f"prev_{pk}"):
                 render_preview(preview_page)
                 st.download_button(
@@ -4226,15 +4090,15 @@ def open_app_stream(history):
     temp = min(float(temperature), 0.5)
     if ANTHROPIC_API_KEY:
         try:
-            return _prime(claude_stream(build_system_instruction(CLAUDE_FILE_LIMIT), history, temp, False))
+            return _prime(claude_stream(build_system_instruction(CLAUDE_FILE_LIMIT), history, temp, False, is_app=True))
         except Exception as e:
             st.warning(f"⚠️ Claude ব্যর্থ ({_short(e)}), অন্য ইঞ্জিন দিয়ে চেষ্টা হচ্ছে।")
     if GEMINI_API_KEY:
         try:
-            return _prime(gemini_stream(build_system_instruction(MAX_FILE_CHARS), history, temp, False))
+            return _prime(gemini_stream(build_system_instruction(MAX_FILE_CHARS), history, temp, False, is_app=True))
         except Exception as e:
             st.warning(f"⚠️ Gemini ব্যর্থ ({_short(e)}), Groq দিয়ে চেষ্টা হচ্ছে।")
-    sys_text, g_history, _ = fit_for_groq(build_system_instruction(GROQ_FILE_LIMIT), history, budget=9000)
+    sys_text, g_history, _ = fit_for_groq(build_system_instruction(GROQ_FILE_LIMIT), history, budget=GROQ_APP_BUDGET)
     if len(g_history) < 2:
         raise RuntimeError("Groq-এর সীমায় আগের কোড ধরছে না। Continue-এর জন্য Claude বা Gemini key সেট করো।")
     return stream_reply(selected_model, build_api_messages(g_history, sys_text, False), temp)
@@ -4268,13 +4132,6 @@ def run_app_continue():
     st.session_state.pending = False
     if ok:
         st.rerun()
-
-
-def est_tokens(s):
-    """টোকেনের মোটামুটি হিসাব (বাংলা অক্ষর ~১ টোকেন, ইংরেজি ~৩ অক্ষরে ১)"""
-    s = s or ""
-    non_ascii = sum(1 for ch in s if ord(ch) > 127)
-    return non_ascii + (len(s) - non_ascii) // 3 + 1
 
 
 def fit_for_groq(sys_text, history, budget=GROQ_INPUT_TOKENS):
@@ -5362,8 +5219,17 @@ def _wpa_sites():
                                   "wc_secret": str(it.get("wc_secret", "")).strip()})
     except Exception:
         pass
+    # ডেটাবেসে এনক্রিপ্ট করে রাখা সাইটগুলো (রিফ্রেশ/রিস্টার্টের পরও থাকে)
+    bad = hydrate_saved_sites(_db, _site_fernet(), sites)
+    if bad:
+        st.session_state["_wpa_sites_bad"] = bad
     st.session_state["_wpa_sites"] = sites
     return sites
+
+
+def _site_fernet():
+    """APP_PASSWORD (না থাকলে TURSO_AUTH_TOKEN) থেকে এনক্রিপশন কী। দুটোই না থাকলে সাইট শুধু সেশনে থাকে।"""
+    return get_fernet(APP_PASSWORD or TURSO_TOKEN)
 
 
 def _site():
@@ -5377,6 +5243,18 @@ def _site():
 
 def _wp_url():
     return _site()["url"]
+
+
+def _agent_wp_target():
+    """Agent মোডে প্রিভিউ/পাবলিশের জন্য (সাইট URL, (ইউজার, পাসওয়ার্ড)); না থাকলে None"""
+    try:
+        _wpa_sites()
+        base, auth = _wp_url(), _wp_auth()
+        if not base and WP_URL:
+            base, auth = WP_URL, WP_AUTH
+        return (base, auth) if base and auth[0] and auth[1] else None
+    except Exception:
+        return None
 
 
 def _wp_auth():
@@ -5416,6 +5294,8 @@ def wpa_add_site(name, url, user, pw, wc_key="", wc_secret=""):
             break
     else:
         sites.append(entry)
+    if not persist_site(_db, _site_fernet(), entry):
+        st.session_state["_wpa_not_saved"] = True
     return who
 
 
@@ -5774,8 +5654,15 @@ def render_wp_automation():
     st.caption("এক ক্লিকে: AI ব্লগ লেখা → ফিচার ইমেজ তৈরি ও আপলোড → পোস্ট; WooCommerce প্রোডাক্ট; n8n/Make Webhook।")
     sites = _wpa_sites()
     with st.expander("🌐 ওয়েবসাইট ও API Key ম্যানেজার", expanded=not sites):
-        st.caption("একাধিক সাইটের URL, ইউজারনেম ও Application Password এখানে সরাসরি দাও। এগুলো শুধু এই সেশনে থাকে "
-                   "(ডেটাবেসে সেভ হয় না)। স্থায়ী করতে Secrets-এ WP_SITES (JSON তালিকা) ব্যবহার করো।")
+        if _site_fernet():
+            st.caption("🔐 একাধিক সাইট যোগ করো। Application Password ও WooCommerce কী এনক্রিপ্ট হয়ে ডেটাবেসে সেভ হয় — "
+                       "রিফ্রেশ বা সার্ভার রিস্টার্টের পরও থাকবে।")
+        else:
+            st.caption("একাধিক সাইটের URL, ইউজারনেম ও Application Password এখানে দাও। স্থায়ী করতে Secrets-এ `APP_PASSWORD` "
+                       "(বা `TURSO_AUTH_TOKEN`) সেট করো — তাহলে এনক্রিপ্ট হয়ে ডেটাবেসে সেভ হবে। নইলে শুধু এই সেশনে থাকবে।")
+        if st.session_state.get("_wpa_sites_bad"):
+            st.warning(f"⚠️ {st.session_state['_wpa_sites_bad']}টি সেভ করা সাইট ডিক্রিপ্ট করা যায়নি "
+                       "(APP_PASSWORD / TURSO_AUTH_TOKEN বদলে গেছে?)। সাইটগুলো আবার যোগ করো।")
         with st.form("wpa_site_form", clear_on_submit=True):
             f_name = st.text_input("সাইটের নাম (ঐচ্ছিক):", placeholder="যেমন: আমার শপ")
             f_url = st.text_input("সাইট URL:", placeholder="https://example.com")
@@ -5801,6 +5688,7 @@ def render_wp_automation():
             del_name = d1.selectbox("সাইট মুছতে বাছাই করো:", [x["name"] for x in sites], key="wpa_del_site")
             if d2.button("🗑️ মুছে ফেলো", key="wpa_del_btn"):
                 st.session_state["_wpa_sites"] = [x for x in sites if x["name"] != del_name]
+                forget_site(_db, del_name)  # ডেটাবেস থেকেও মুছে ফেলা
                 st.rerun()
 
     names = [x["name"] for x in sites]
@@ -6915,6 +6803,18 @@ user_input = st.chat_input(
 )
 messages = cur()["messages"]
 
+
+def _pick_starter(prompt):
+    st.session_state["_starter_prompt"] = prompt
+
+
+_starter = st.session_state.pop("_starter_prompt", None)
+if _starter and not voice_prompt and not user_input:
+    voice_prompt = _starter  # স্টার্টার চিপ টাইপ করা মেসেজের মতোই পাঠানো হয়
+
+if is_app_mode and not messages and not st.session_state.pending and not voice_prompt:
+    render_starter_chips(_pick_starter)
+
 if user_input or voice_prompt:
     force, prompt = parse_command(((user_input.text if user_input else "") or voice_prompt or "").strip())
     inline_imgs = []
@@ -7001,6 +6901,10 @@ last_idx = len(messages) - 1
 for idx, m in enumerate(messages):
     with st.chat_message(m["role"]):
         render_message(m, idx)
+        if m["role"] == "assistant" and is_agent_mode:
+            _wp_target = _agent_wp_target()
+            if _wp_target:
+                render_page_actions(m["content"], _wp_target[0], _wp_target[1], f"{st.session_state.current}_{idx}")
         if m["role"] == "assistant" and idx == last_idx and st.session_state.pop("_autoplay_last", False):
             play_tts(m["content"], autoplay=True)  # ভয়েসে প্রশ্ন করলে উত্তর নিজে থেকে বাজবে
         if (
@@ -7115,7 +7019,7 @@ if st.session_state.pending:
                         try:
                             stream = _prime(claude_stream(
                                 build_system_instruction(CLAUDE_FILE_LIMIT) + search_block,
-                                history, temp_eff, use_vision,
+                                history, temp_eff, use_vision, is_app=is_app_mode,
                             ))
                             used_model = st.session_state.get("_claude_used") or active_claude_model()
                         except Exception as e:
@@ -7125,7 +7029,7 @@ if st.session_state.pending:
                         try:
                             stream = _prime(gemini_stream(
                                 build_system_instruction(MAX_FILE_CHARS) + search_block,
-                                history, temp_eff, use_vision,
+                                history, temp_eff, use_vision, is_app=is_app_mode,
                             ))
                             used_model = st.session_state.get("_gemini_used") or active_gemini_model()
                         except Exception as e:
@@ -7135,7 +7039,7 @@ if st.session_state.pending:
                     if stream is None:
                         _on_groq = True
                         sys_text = build_system_instruction(GROQ_FILE_LIMIT) + search_block
-                        sys_text, g_history, g_trimmed = fit_for_groq(sys_text, history, budget=9000 if is_app_mode else GROQ_INPUT_TOKENS)
+                        sys_text, g_history, g_trimmed = fit_for_groq(sys_text, history, budget=GROQ_APP_BUDGET if is_app_mode else GROQ_INPUT_TOKENS)
                         if g_trimmed:
                             st.info("ℹ️ Groq-এর সীমার কারণে ফাইল/আগের চ্যাটের কিছু অংশ বাদ দেওয়া হয়েছে। পুরোটা পড়াতে Gemini ইঞ্জিন বেছে নাও।")
                         has_last_img = bool(g_history and get_msg_images(g_history[-1]))
