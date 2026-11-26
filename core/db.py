@@ -5,6 +5,8 @@ The connection manager itself (`_db`, local SQLite or Turso HTTP/Hrana) stays in
 
 Contents
   * add_column_if_missing  - Turso-safe schema migration (no PRAGMA table_info)
+  * list_chats_light       - chat list WITHOUT the big file_text column (fast startup)
+  * load_chat_file         - lazy fetch of one chat's attachment (file_name, file_text)
   * saved_sites            - encrypted multi-site WordPress manager (Fernet)
   * usage_by_engine        - token / message aggregation from messages.meta
 """
@@ -38,6 +40,27 @@ CREATE TABLE IF NOT EXISTS saved_sites (
 
 def ensure_saved_sites_table(conn):
     conn.execute(SAVED_SITES_DDL)
+
+
+# ---------------------------------------------------------------- chat list (lightweight)
+
+
+def list_chats_light(db):
+    """[(id, title, pinned, has_file)] oldest first. Never reads file_text (up to 300k chars per chat), so the
+    startup query stays tiny even over Turso HTTP."""
+    with db() as conn:
+        return conn.execute(
+            "SELECT id, title, pinned, "
+            "CASE WHEN file_name IS NOT NULL AND file_name != '' THEN 1 ELSE 0 END AS has_file "
+            "FROM chats ORDER BY updated_at ASC, rowid ASC"
+        ).fetchall()
+
+
+def load_chat_file(db, cid):
+    """(file_name, file_text) of ONE chat — called only when that chat is opened."""
+    with db() as conn:
+        row = conn.execute("SELECT file_name, file_text FROM chats WHERE id = ?", (cid,)).fetchone()
+    return (row[0], row[1]) if row else (None, None)
 
 
 # ---------------------------------------------------------------- encryption
