@@ -28,15 +28,15 @@ import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 from dotenv import load_dotenv
 from groq import Groq
-from pypdf import PdfReader
-from docx import Document
+# pypdf / python-docx are imported lazily inside read_file(), _fetch_page(), text_to_docx() (faster reruns)
 
 # ---- Codexio v3 modules (no circular imports: config <- core <- studios <- app) ----
 from config import APP_VERSION, GROQ_APP_BUDGET, GROQ_APP_MAX_OUT, get_secret
 from core import llm as _llm
 from core.llm import _DEAD_SHORT, _strip_think, est_tokens, groq_create, groq_text_models, is_dead, mark_dead
 from core.db import (
-    add_column_if_missing, ensure_saved_sites_table, get_fernet, usage_by_engine,
+    add_column_if_missing, ensure_saved_sites_table, get_fernet, list_chats_light, load_chat_file,
+    usage_by_engine,
 )
 from studios.app_builder import render_publish_button, render_starter_chips
 from studios.wordpress import (
@@ -44,6 +44,19 @@ from studios.wordpress import (
 )
 
 load_dotenv()
+
+# Shared, pooled HTTP session (TCP/TLS reuse) + st.fragment shim for older Streamlit (needs >= 1.37 for real fragments)
+_HTTP = _llm.get_session()
+_fragment = getattr(st, "fragment", None) or (lambda f: f)
+
+
+def _frag_rerun():
+    """Rerun only the current fragment (falls back to a full rerun on old Streamlit)."""
+    try:
+        st.rerun(scope="fragment")
+    except TypeError:
+        st.rerun()
+
 
 # App logo (embedded so the app stays a single file)
 LOGO_B64 = "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"
@@ -69,7 +82,7 @@ LOGO_SVG = (
 )
 LOGO_SVG_URI = "data:image/svg+xml;base64," + base64.b64encode(LOGO_SVG.encode("utf-8")).decode()
 
-# APP_VERSION (3.0.0) আসে config.py থেকে
+# APP_VERSION (3.1.0) আসে config.py থেকে
 
 st.set_page_config(
     page_title="আমার পার্সোনাল AI",
@@ -812,7 +825,7 @@ POLLINATIONS_API_KEY = get_secret("POLLINATIONS_API_KEY")  # ফ্রি কী
 TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
 OPENAI_IMAGE_MODEL = get_secret("OPENAI_IMAGE_MODEL") or "gpt-image-1"
 HAS_EDIT = bool(OPENAI_API_KEY or GEMINI_API_KEY or HF_TOKEN or POLLINATIONS_API_KEY)
-client = Groq(api_key=api_key, timeout=25.0, max_retries=0)  # দ্রুত ব্যর্থ হয়ে পরের মডেলে যাবে (নিজস্ব ফলব্যাক চেইন আছে)
+client = _llm.get_groq_client(api_key, 25.0, 0)  # st.cache_resource: প্রতি রিরানে নতুন ক্লায়েন্ট বানায় না; দ্রুত ব্যর্থ হয়ে পরের মডেলে যাবে (নিজস্ব ফলব্যাক চেইন আছে)
 
 
 WP_URL = get_secret("WP_URL").rstrip("/")
@@ -835,7 +848,7 @@ STT_LANGS = {"🇧🇩 বাংলা": "bn", "🇬🇧 English": "en", "🌐 �
 TTS_MAX_CHARS = 1800       # একবারে এর বেশি অক্ষর পড়ে শোনানো হয় না
 
 # অটো-মেমোরি
-MEMORY_MIN_MSG = 12        # এর চেয়ে ছোট মেসেজে মেমোরি খোঁজা হয় না
+MEMORY_MIN_MSG = 25        # এর চেয়ে ছোট মেসেজে মেমোরি খোঁজা হয় না
 
 # কোড → ZIP এক্সপোর্ট
 CODE_MAX_FILES = 60
@@ -1277,14 +1290,14 @@ def run_wp_tool(name, args):
         if name == "create_elementor_page":
             args["elementor_data"] = fix_elementor(args.get("elementor_data", []))
             args.setdefault("status", "draft")
-            r = requests.post(
+            r = _HTTP.post(
                 f"{WP_URL}/wp-json/ai-builder/v1/page",
                 json=args,
                 auth=WP_AUTH,
                 timeout=60,
             )
         elif name == "list_pages":
-            r = requests.get(
+            r = _HTTP.get(
                 f"{WP_URL}/wp-json/wp/v2/pages?per_page=50&status=any&_fields=id,title,status,link",
                 auth=WP_AUTH,
                 timeout=30,
@@ -1374,7 +1387,7 @@ _SKIP_WORDS = r"image|tts|live|audio|embedding|robotics|computer|learnlm|gemma|8
 @st.cache_data(ttl=3600, show_spinner=False)
 def _discover_gemini_models(api_key, family="flash"):
     """Google থেকে এখন যে flash/pro মডেলগুলো সত্যিই চালু আছে তার তালিকা (নতুন → পুরনো)।"""
-    r = requests.get(f"{GEMINI_BASE}?pageSize=200", headers=_gemini_headers(), timeout=5)
+    r = _HTTP.get(f"{GEMINI_BASE}?pageSize=200", headers=_gemini_headers(), timeout=5)
     r.raise_for_status()  # ব্যর্থ হলে cache হয় না, পরের বার আবার চেষ্টা হবে
     found = []
     for m in r.json().get("models", []):
@@ -1440,7 +1453,7 @@ def gemini_stream(system_text, history, temp, use_image, is_app=False):
             for _attempt in range(2):
                 body = _gemini_body(system_text, history, temp, use_image, use_thinking, is_app)
                 try:
-                    r = requests.post(url, headers=_gemini_headers(), json=body, stream=True, timeout=(5, 45))
+                    r = _HTTP.post(url, headers=_gemini_headers(), json=body, stream=True, timeout=(5, 45))
                 except requests.RequestException as e:
                     errors[m_name] = f"network {str(e)[:60]}"
                     retryable = True
@@ -1558,7 +1571,7 @@ def claude_stream(system_text, history, temp, use_image, max_out=None, is_app=Fa
         body["model"] = model_name
         last_model = mi == len(models) - 1
         for attempt in range(2):
-            r = requests.post(CLAUDE_URL, headers=headers, json=body, stream=True, timeout=(5, 45))
+            r = _HTTP.post(CLAUDE_URL, headers=headers, json=body, stream=True, timeout=(5, 45))
             if r.status_code == 400 and "temperature" in body and "temperature" in r.text.lower():
                 body.pop("temperature")  # কোনো মডেল temperature না নিলে ছাড়াই চেষ্টা
                 r.close()
@@ -1608,7 +1621,7 @@ def claude_stream(system_text, history, temp, use_image, max_out=None, is_app=Fa
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _discover_gemini_image_models(api_key):
-    r = requests.get(f"{GEMINI_BASE}?pageSize=200", headers=_gemini_headers(), timeout=5)
+    r = _HTTP.get(f"{GEMINI_BASE}?pageSize=200", headers=_gemini_headers(), timeout=5)
     r.raise_for_status()
     found = []
     for m in r.json().get("models", []):
@@ -1634,7 +1647,7 @@ def _gemini_image_call(parts, image_config=None):
             gen = {"responseModalities": ["TEXT", "IMAGE"]}
             if cfg:
                 gen["imageConfig"] = cfg
-            r = requests.post(f"{GEMINI_BASE}/{m_name}:generateContent", headers=_gemini_headers(),
+            r = _HTTP.post(f"{GEMINI_BASE}/{m_name}:generateContent", headers=_gemini_headers(),
                               json={"contents": [{"parts": parts}], "generationConfig": gen}, timeout=240)
             if not (r.status_code == 400 and cfg):
                 break
@@ -1725,7 +1738,7 @@ def _openai_check(r):
 
 
 def openai_text_to_image(prompt, size, quality):
-    r = requests.post(
+    r = _HTTP.post(
         "https://api.openai.com/v1/images/generations",
         headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
         json={"model": OPENAI_IMAGE_MODEL, "prompt": prompt, "size": size, "quality": quality, "n": 1},
@@ -1755,7 +1768,7 @@ def openai_edit_image(images, prompt, quality, transparent=False):
 
     r = None
     for data, is_transparent in variants:
-        r = requests.post(
+        r = _HTTP.post(
             "https://api.openai.com/v1/images/edits",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
             files=files, data=data, timeout=240,
@@ -1834,7 +1847,7 @@ def generate_ai_image(prompt, size_key, quality):
             "https://image.pollinations.ai/prompt/"
             f"{urllib.parse.quote(eng)}?width={width}&height={height}&nologo=true&seed={seed}"
         )
-        r = requests.get(url, timeout=120)
+        r = _HTTP.get(url, timeout=120)
         r.raise_for_status()
         ctype = r.headers.get("content-type", "image/jpeg").split(";")[0]
         if not ctype.startswith("image"):
@@ -1854,7 +1867,7 @@ def _pollinations_upload(image_bytes, mime):
     ]
     last = None
     for kw in attempts:
-        r = requests.post("https://media.pollinations.ai/upload", timeout=60, **kw)
+        r = _HTTP.post("https://media.pollinations.ai/upload", timeout=60, **kw)
         if r.status_code == 200:
             try:
                 j = r.json()
@@ -1872,7 +1885,7 @@ def pollinations_edit_image(image_bytes, mime, prompt):
     img_url = _pollinations_upload(image_bytes, mime)
     q = urllib.parse.urlencode({"model": "kontext", "image": img_url, "nologo": "true",
                                 "private": "true", "seed": uuid.uuid4().int % 100000})
-    r = requests.get(
+    r = _HTTP.get(
         f"https://gen.pollinations.ai/image/{urllib.parse.quote(prompt[:1500])}?{q}",
         headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}, timeout=180,
     )
@@ -1974,7 +1987,7 @@ def edit_ai_image(image_bytes, instruction, mime, quality, extra=None, transpare
         f"{urllib.parse.quote(combined_prompt)}?width=1024&height=1024&model=flux&nologo=true&seed={seed}"
     )
     try:
-        r = requests.get(url, timeout=120)
+        r = _HTTP.get(url, timeout=120)
         r.raise_for_status()
         ctype = r.headers.get("content-type", "image/jpeg").split(";")[0]
         if not ctype.startswith("image"):
@@ -2026,7 +2039,7 @@ def needs_web_search(text):
 
 
 def web_search(query, max_results=5):
-    r = requests.post(
+    r = _HTTP.post(
         "https://api.tavily.com/search",
         headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
         json={"query": query, "search_depth": "basic", "max_results": max_results},
@@ -2118,6 +2131,7 @@ def _zip_to_text(data):
 def read_file(name, data: bytes):
     low = name.lower()
     if low.endswith(".pdf"):
+        from pypdf import PdfReader  # lazy import
         reader = PdfReader(io.BytesIO(data))
         return "\n".join(p.extract_text() or "" for p in reader.pages)
     if low.endswith(".zip"):
@@ -2186,7 +2200,7 @@ def _safe_get(url):
             raise RuntimeError("শুধু http/https লিংক পড়া যায়")
         if not _is_public_host(p.hostname):
             raise RuntimeError("লোকাল/প্রাইভেট ঠিকানার লিংক পড়া যাবে না")
-        r = requests.get(url, headers=_UA, timeout=15, stream=True, allow_redirects=False)
+        r = _HTTP.get(url, headers=_UA, timeout=15, stream=True, allow_redirects=False)
         if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
             url = urllib.parse.urljoin(url, r.headers["location"])
             r.close()
@@ -2290,6 +2304,7 @@ def _fetch_page(url):
         if is_pdf:
             if len(buf) > limit:
                 raise RuntimeError("PDF অনেক বড় (১০MB-এর বেশি)")
+            from pypdf import PdfReader  # lazy import
             reader = PdfReader(io.BytesIO(bytes(buf)))
             text = "\n".join((p.extract_text() or "") for p in reader.pages[:40])
             return {"kind": "pdf", "title": "", "text": text.strip()}
@@ -2306,7 +2321,7 @@ def _fetch_page(url):
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=64)
 def _yt_title(vid):
     try:
-        r = requests.get("https://www.youtube.com/oembed", timeout=10,
+        r = _HTTP.get("https://www.youtube.com/oembed", timeout=10,
                          params={"url": f"https://www.youtube.com/watch?v={vid}", "format": "json"})
         if r.status_code == 200:
             j = r.json()
@@ -2447,7 +2462,7 @@ class _TursoConn:
         last = None
         for attempt in range(2):
             try:
-                r = requests.post(url, json=body, timeout=30,
+                r = _HTTP.post(url, json=body, timeout=30,
                                   headers={"Authorization": f"Bearer {TURSO_TOKEN}"})
             except requests.RequestException as e:
                 last = f"নেটওয়ার্ক সমস্যা: {str(e)[:100]}"
@@ -2541,11 +2556,19 @@ def init_db():
         ensure_saved_sites_table(conn)                           # এনক্রিপ্টেড সাইট ম্যানেজার
 
 
-def db_list_chats():
-    with _db() as conn:
-        return conn.execute(
-            "SELECT id, title, file_name, file_text, pinned FROM chats ORDER BY updated_at ASC, rowid ASC"
-        ).fetchall()
+def db_list_chats(force=False):
+    """[(id, title, pinned, has_file)] — বড় file_text আর আনা হয় না; মেটাডেটা সেশনে cache থাকে"""
+    cached = st.session_state.get("_chat_list_cache")
+    if cached is not None and not force:
+        return cached
+    rows = list_chats_light(_db)
+    st.session_state["_chat_list_cache"] = rows
+    return rows
+
+
+def db_load_chat_file(cid):
+    """(file_name, file_text) — শুধু ওই চ্যাট খোলার সময় একবার"""
+    return load_chat_file(_db, cid)
 
 
 def db_load_messages(cid):
@@ -2633,11 +2656,13 @@ def db_add_message(cid, chat, msg):
 
 def _db_add_message_impl(cid, chat, msg, with_meta):
     msg = _persist_msg(msg)
+    st.session_state.pop("_chat_list_cache", None)
     ft = _persist_file_text(chat.get("file_text"))
     sigs = st.session_state.setdefault("_ft_sigs", {}) if USE_TURSO else {}
     sig = hash(ft or "")
+    _ft_pending = bool(chat.get("has_file")) and not chat.get("file_loaded")  # ফাইল লোড হয়নি → DB-র ফাইল মুছব না
     with _db() as conn:
-        if USE_TURSO and sigs.get(cid) == sig:
+        if _ft_pending or (USE_TURSO and sigs.get(cid) == sig):
             # ফাইল-টেক্সট আগেই সেভ হয়েছে: বড় টেক্সট আবার ক্লাউডে না পাঠিয়ে শুধু টাইটেল/সময় আপডেট
             conn.execute(
                 """
@@ -2692,7 +2717,11 @@ def db_pop_last_message(cid):
 
 
 def db_save_meta(cid, chat):
+    st.session_state.pop("_chat_list_cache", None)
     with _db() as conn:
+        if chat.get("has_file") and not chat.get("file_loaded"):  # ফাইল লোড হয়নি: শুধু টাইটেল
+            conn.execute("UPDATE chats SET title = ? WHERE id = ?", (chat["title"], cid))
+            return
         conn.execute(
             "UPDATE chats SET title = ?, file_name = ?, file_text = ? WHERE id = ?",
             (chat["title"], chat.get("file_name"), _persist_file_text(chat.get("file_text")), cid),
@@ -2700,12 +2729,14 @@ def db_save_meta(cid, chat):
 
 
 def db_delete_chat(cid):
+    st.session_state.pop("_chat_list_cache", None)
     with _db() as conn:
         conn.execute("DELETE FROM messages WHERE chat_id = ?", (cid,))
         conn.execute("DELETE FROM chats WHERE id = ?", (cid,))
 
 
 def db_toggle_pin(cid, pinned_val):
+    st.session_state.pop("_chat_list_cache", None)
     with _db() as conn:
         conn.execute("UPDATE chats SET pinned = ? WHERE id = ?", (1 if pinned_val else 0, cid))
 
@@ -2733,11 +2764,28 @@ def db_delete_memory(mid):
 
 
 # ---------- Chat session state ----------
+_FILE_LOAD_FAIL = object()
+
+
 def cur():
     """বর্তমান চ্যাট; মেসেজ প্রথমবার দরকার হলে ডেটাবেস থেকে লোড হয়"""
-    chat = st.session_state.chats[st.session_state.current]
+    cid = st.session_state.current
+    chat = st.session_state.chats[cid]
     if chat["messages"] is None:
-        chat["messages"] = _db_safe(db_load_messages, st.session_state.current, default=[]) or []
+        chat["messages"] = _db_safe(db_load_messages, cid, default=[]) or []
+    if "file_loaded" not in chat:  # ফাইল-অ্যাটাচমেন্ট শুধু এই চ্যাট খোলার সময় একবার লোড হয়
+        if chat.get("has_file"):
+            row = _db_safe(db_load_chat_file, cid, default=_FILE_LOAD_FAIL)
+            if row is _FILE_LOAD_FAIL:
+                return chat  # ব্যর্থ: flag বসাই না, পরের রিরানে আবার চেষ্টা হবে
+            _fname, _ftext = row
+            if _fname:
+                chat["file_name"] = _fname
+            if _ftext:
+                chat["file_text"] = _ftext
+                if USE_TURSO:  # ক্লাউডে এই টেক্সট আগেই আছে — প্রথম মেসেজে আবার আপলোড হবে না
+                    st.session_state.setdefault("_ft_sigs", {})[cid] = hash(_persist_file_text(_ftext) or "")
+        chat["file_loaded"] = True
     return chat
 
 
@@ -2811,13 +2859,10 @@ if "db_ready" not in st.session_state:
     st.session_state.db_ready = True
 if "chats" not in st.session_state:
     st.session_state.chats = {}
-    for _cid, _title, _fname, _ftext, _pinned in (_db_safe(db_list_chats, default=[]) or []):
-        _c = {"title": _title, "messages": None, "pinned": bool(_pinned)}
-        if _fname:
-            _c["file_name"] = _fname
-        if _ftext:
-            _c["file_text"] = _ftext
-        st.session_state.chats[_cid] = _c
+    for _cid, _title, _pinned, _has_file in (_db_safe(db_list_chats, default=[]) or []):
+        st.session_state.chats[_cid] = {
+            "title": _title, "messages": None, "pinned": bool(_pinned), "has_file": bool(_has_file),
+        }
     new_chat()  # প্রতিবার খালি নতুন চ্যাট দিয়ে শুরু, পুরনোগুলো সাইডবারে থাকবে
 if "pending" not in st.session_state:
     st.session_state.pending = False
@@ -2825,6 +2870,31 @@ if "img_counter" not in st.session_state:
     st.session_state.img_counter = 0
 if "voice_counter" not in st.session_state:
     st.session_state.voice_counter = 0
+
+
+@_fragment
+def _memory_manager():
+    """সাইডবারের পার্সোনাল মেমোরি — fragment: যোগ/মোছায় শুধু এই অংশ রিফ্রেশ হয়, পুরো অ্যাপ নয়"""
+    st.toggle(
+        "🤖 অটো-মেমোরি (AI নিজেই জরুরি তথ্য সেভ করবে)", value=True, key="auto_memory",
+        help="আপনার মেসেজে নাম, পেশা, পছন্দ বা প্রজেক্টের মতো স্থায়ী তথ্য থাকলে AI নিজে মেমোরিতে যোগ করবে। পাসওয়ার্ড/কী/নম্বর কখনো সেভ হয় না।",
+    )
+    _mems = _db_safe(db_get_memories, default=[]) or []
+    with st.form("mem_form", clear_on_submit=True):
+        new_mem = st.text_input("নতুন তথ্য লিখুন:", placeholder="যেমন: আমি একজন Web Designer")
+        mem_submitted = st.form_submit_button("➕ মেমোরি সেভ করুন")
+    if mem_submitted and new_mem.strip():
+        if len(_mems) >= MAX_MEMORIES:
+            st.warning(f"সর্বোচ্চ {MAX_MEMORIES}টি মেমোরি রাখা যায়। আগে কিছু মুছুন।")
+        else:
+            _db_safe(db_add_memory, new_mem.strip()[:MEMORY_FACT_MAX])
+            _frag_rerun()
+    for mid, fact in _mems:
+        col1, col2 = st.columns([5, 1])
+        col1.caption(f"• {fact}")
+        if col2.button("❌", key=f"del_mem_{mid}"):
+            _db_safe(db_delete_memory, mid)
+            _frag_rerun()
 
 
 def regen_cb():
@@ -3158,26 +3228,8 @@ with st.sidebar:
         st.caption("কোনো চ্যাট পাওয়া যায়নি।")
 
     with st.expander("🧠 পার্সোনাল মেমোরি (AI মনে রাখবে)", expanded=False):
-        auto_memory = st.toggle(
-            "🤖 অটো-মেমোরি (AI নিজেই জরুরি তথ্য সেভ করবে)", value=True, key="auto_memory",
-            help="আপনার মেসেজে নাম, পেশা, পছন্দ বা প্রজেক্টের মতো স্থায়ী তথ্য থাকলে AI নিজে মেমোরিতে যোগ করবে। পাসওয়ার্ড/কী/নম্বর কখনো সেভ হয় না।",
-        )
-        _mems = _db_safe(db_get_memories, default=[]) or []
-        with st.form("mem_form", clear_on_submit=True):
-            new_mem = st.text_input("নতুন তথ্য লিখুন:", placeholder="যেমন: আমি একজন Web Designer")
-            mem_submitted = st.form_submit_button("➕ মেমোরি সেভ করুন")
-        if mem_submitted and new_mem.strip():
-            if len(_mems) >= MAX_MEMORIES:
-                st.warning(f"সর্বোচ্চ {MAX_MEMORIES}টি মেমোরি রাখা যায়। আগে কিছু মুছুন।")
-            else:
-                _db_safe(db_add_memory, new_mem.strip()[:MEMORY_FACT_MAX])
-                st.rerun()
-        for mid, fact in _mems:
-            col1, col2 = st.columns([5, 1])
-            col1.caption(f"• {fact}")
-            if col2.button("❌", key=f"del_mem_{mid}"):
-                _db_safe(db_delete_memory, mid)
-                st.rerun()
+        _memory_manager()
+        auto_memory = st.session_state.get("auto_memory", True)  # toggle-এর মান (key="auto_memory")
 
     with st.expander("🎙️ ভয়েস সেটিংস", expanded=False):
         voice_lang_label = st.selectbox("আমি যে ভাষায় বলব:", list(STT_LANGS), key="voice_lang")
@@ -3449,6 +3501,7 @@ def _add_md_runs(par, text):
 
 def text_to_docx(md_text):
     """AI-এর উত্তরকে সুন্দর Microsoft Word (.docx) ফাইলে রূপান্তর করে"""
+    from docx import Document  # lazy import
     doc = Document()
     for line in (md_text or "").splitlines():
         clean = line.strip()
@@ -3862,6 +3915,50 @@ def _reset_app_edit(pk, wk, original):
         rec["code"] = original
 
 
+@_fragment
+def _app_builder_block(pk, idx, preview_page):
+    """App Builder: ডিভাইস বদল / লাইভ কোড এডিট + প্রিভিউ — fragment, তাই শুধু এই অংশ রিরান হয়"""
+    _edits = st.session_state.setdefault("_app_edits", {})
+    _sig = hashlib.md5(preview_page.encode("utf-8")).hexdigest()
+    _rec = _edits.get(pk)
+    _wk = f"edcode_{pk}"
+    if not _rec or _rec["src"] != _sig:  # নতুন/পুনরায় তৈরি করা কোড → এডিটর রিসেট
+        _rec = {"src": _sig, "code": preview_page}
+        _edits[pk] = _rec
+        st.session_state.pop(_wk, None)
+    _dev = st.radio("ডিভাইস", ["📱 মোবাইল (390px)", "💻 ডেস্কটপ", "✏️ লাইভ কোড এডিট"], horizontal=True,
+                    key=f"dev_{pk}", label_visibility="collapsed")
+    if _dev.startswith("✏️"):
+        if _wk not in st.session_state:
+            st.session_state[_wk] = _rec["code"]
+        st.caption("কোডে রং/লেখা/CSS বদলাও, তারপর বাইরে ক্লিক করো বা Ctrl+Enter চাপো — প্রিভিউ সাথে সাথে বদলে যাবে (AI-কে আবার ডাকতে হবে না)।")
+        _rec["code"] = st.text_area("HTML কোড", key=_wk, height=380, label_visibility="collapsed")
+        _ec1, _ec2 = st.columns([3, 2])
+        _edev = _ec1.radio("প্রিভিউ সাইজ", ["📱 মোবাইল", "💻 ডেস্কটপ"], horizontal=True,
+                           key=f"edev_{pk}", label_visibility="collapsed")
+        _ec2.button("↩️ মূল কোডে ফিরো", key=f"edreset_{pk}", on_click=_reset_app_edit, args=(pk, _wk, preview_page))
+        render_app_preview(_rec["code"], phone=_edev.startswith("📱"))
+        st.download_button(
+            "⬇️ এডিট করা HTML ডাউনলোড",
+            data=_rec["code"].encode("utf-8"),
+            file_name=f"my-app-{idx}-edited.html",
+            mime="text/html",
+            key=f"appdl_{pk}",
+        )
+        render_publish_button(_rec["code"], f"{pk}_ed", get_secret("NETLIFY_AUTH_TOKEN"), get_secret("GITHUB_TOKEN"))
+    else:
+        render_app_preview(_rec["code"], phone=_dev.startswith("📱"))
+        st.download_button(
+            "⬇️ অ্যাপ ডাউনলোড (.html)",
+            data=_rec["code"].encode("utf-8"),
+            file_name=f"my-app-{idx}.html",
+            mime="text/html",
+            key=f"appdl_{pk}",
+            help="ফাইলটি Netlify Drop / GitHub Pages-এ আপলোড করলেই অ্যাপ লাইভ হবে",
+        )
+        render_publish_button(_rec["code"], pk, get_secret("NETLIFY_AUTH_TOKEN"), get_secret("GITHUB_TOKEN"))
+
+
 def render_message(m, idx):
     if m.get("attachment"):
         st.caption(f"📎 {m['attachment']}")
@@ -3962,45 +4059,7 @@ def render_message(m, idx):
         if preview_page:
             pk = f"{st.session_state.current}_{idx}"
             if is_app_mode:
-                _edits = st.session_state.setdefault("_app_edits", {})
-                _sig = hashlib.md5(preview_page.encode("utf-8")).hexdigest()
-                _rec = _edits.get(pk)
-                _wk = f"edcode_{pk}"
-                if not _rec or _rec["src"] != _sig:  # নতুন/পুনরায় তৈরি করা কোড → এডিটর রিসেট
-                    _rec = {"src": _sig, "code": preview_page}
-                    _edits[pk] = _rec
-                    st.session_state.pop(_wk, None)
-                _dev = st.radio("ডিভাইস", ["📱 মোবাইল (390px)", "💻 ডেস্কটপ", "✏️ লাইভ কোড এডিট"], horizontal=True,
-                                key=f"dev_{pk}", label_visibility="collapsed")
-                if _dev.startswith("✏️"):
-                    if _wk not in st.session_state:
-                        st.session_state[_wk] = _rec["code"]
-                    st.caption("কোডে রং/লেখা/CSS বদলাও, তারপর বাইরে ক্লিক করো বা Ctrl+Enter চাপো — প্রিভিউ সাথে সাথে বদলে যাবে (AI-কে আবার ডাকতে হবে না)।")
-                    _rec["code"] = st.text_area("HTML কোড", key=_wk, height=380, label_visibility="collapsed")
-                    _ec1, _ec2 = st.columns([3, 2])
-                    _edev = _ec1.radio("প্রিভিউ সাইজ", ["📱 মোবাইল", "💻 ডেস্কটপ"], horizontal=True,
-                                       key=f"edev_{pk}", label_visibility="collapsed")
-                    _ec2.button("↩️ মূল কোডে ফিরো", key=f"edreset_{pk}", on_click=_reset_app_edit, args=(pk, _wk, preview_page))
-                    render_app_preview(_rec["code"], phone=_edev.startswith("📱"))
-                    st.download_button(
-                        "⬇️ এডিট করা HTML ডাউনলোড",
-                        data=_rec["code"].encode("utf-8"),
-                        file_name=f"my-app-{idx}-edited.html",
-                        mime="text/html",
-                        key=f"appdl_{pk}",
-                    )
-                    render_publish_button(_rec["code"], f"{pk}_ed", get_secret("NETLIFY_AUTH_TOKEN"), get_secret("GITHUB_TOKEN"))
-                else:
-                    render_app_preview(_rec["code"], phone=_dev.startswith("📱"))
-                    st.download_button(
-                        "⬇️ অ্যাপ ডাউনলোড (.html)",
-                        data=_rec["code"].encode("utf-8"),
-                        file_name=f"my-app-{idx}.html",
-                        mime="text/html",
-                        key=f"appdl_{pk}",
-                        help="ফাইলটি Netlify Drop / GitHub Pages-এ আপলোড করলেই অ্যাপ লাইভ হবে",
-                    )
-                    render_publish_button(_rec["code"], pk, get_secret("NETLIFY_AUTH_TOKEN"), get_secret("GITHUB_TOKEN"))
+                _app_builder_block(pk, idx, preview_page)
             elif st.toggle("▶ লাইভ প্রিভিউ দেখুন", key=f"prev_{pk}"):
                 render_preview(preview_page)
                 st.download_button(
@@ -4815,7 +4874,7 @@ def _mcp_http(cfg, payload, timeout=60):
                 h["Mcp-Session-Id"] = cfg["session_id"]
             if cfg.get("protocol"):
                 h["MCP-Protocol-Version"] = cfg["protocol"]
-        r = requests.post(url, data=json.dumps(payload).encode("utf-8"), headers=h,
+        r = _HTTP.post(url, data=json.dumps(payload).encode("utf-8"), headers=h,
                           timeout=(10, timeout), stream=True, allow_redirects=False)
         if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
             url = urllib.parse.urljoin(url, r.headers["location"])
@@ -5090,7 +5149,7 @@ def _claude_call(body, stats):
     for mi, mname in enumerate(models):
         body["model"] = mname
         for attempt in range(3):
-            r = requests.post(CLAUDE_URL, headers=headers, json=body, timeout=(10, 240))
+            r = _HTTP.post(CLAUDE_URL, headers=headers, json=body, timeout=(10, 240))
             if r.status_code == 400 and "temperature" in body and "temperature" in r.text.lower():
                 body.pop("temperature")
                 continue
@@ -5279,7 +5338,7 @@ def wpa_add_site(name, url, user, pw, wc_key="", wc_secret=""):
         raise RuntimeError("URL, ইউজারনেম ও Application Password — তিনটিই দিতে হবে")
     if not _is_public_host(p.hostname):
         raise RuntimeError("লোকাল/প্রাইভেট ঠিকানার সাইট যোগ করা যাবে না")
-    r = requests.get(f"{url}/wp-json/wp/v2/users/me", params={"_fields": "name"}, auth=(user, pw),
+    r = _HTTP.get(f"{url}/wp-json/wp/v2/users/me", params={"_fields": "name"}, auth=(user, pw),
                      timeout=20, allow_redirects=False)
     if r.status_code != 200:
         raise RuntimeError("সংযোগ ব্যর্থ — " + _wp_err(r))
@@ -5407,7 +5466,7 @@ def wp_upload_media(data, mime, base_name, alt=""):
     ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}.get(mime, "png")
     safe = re.sub(r"[^a-z0-9]+", "-", (base_name or "image").lower()).strip("-")[:50] or "image"
     fname = f"{safe}-{uuid.uuid4().hex[:5]}.{ext}"
-    r = requests.post(
+    r = _HTTP.post(
         f"{_wp_url()}/wp-json/wp/v2/media", data=data, auth=_wp_auth(), timeout=120,
         headers={"Content-Disposition": f'attachment; filename="{fname}"', "Content-Type": mime},
     )
@@ -5416,7 +5475,7 @@ def wp_upload_media(data, mime, base_name, alt=""):
     j = r.json()
     if alt:
         try:
-            requests.post(f"{_wp_url()}/wp-json/wp/v2/media/{j['id']}",
+            _HTTP.post(f"{_wp_url()}/wp-json/wp/v2/media/{j['id']}",
                           json={"alt_text": alt[:200], "title": alt[:100]}, auth=_wp_auth(), timeout=30)
         except Exception:
             pass
@@ -5424,7 +5483,7 @@ def wp_upload_media(data, mime, base_name, alt=""):
 
 
 def wp_list_terms(kind):
-    r = requests.get(f"{_wp_url()}/wp-json/wp/v2/{kind}", params={"per_page": 100, "_fields": "id,name"},
+    r = _HTTP.get(f"{_wp_url()}/wp-json/wp/v2/{kind}", params={"per_page": 100, "_fields": "id,name"},
                      auth=_wp_auth(), timeout=30)
     if r.status_code != 200:
         raise RuntimeError(_wp_err(r))
@@ -5437,7 +5496,7 @@ def wp_tag_ids(names):
         n = n.strip()
         if not n:
             continue
-        r = requests.post(f"{_wp_url()}/wp-json/wp/v2/tags", json={"name": n[:60]}, auth=_wp_auth(), timeout=30)
+        r = _HTTP.post(f"{_wp_url()}/wp-json/wp/v2/tags", json={"name": n[:60]}, auth=_wp_auth(), timeout=30)
         if r.status_code in (200, 201):
             ids.append(r.json()["id"])
         elif r.status_code == 400:
@@ -5460,7 +5519,7 @@ def wp_create_post(title, content, excerpt, status, media_id, cat_ids, tag_ids, 
         body["categories"] = cat_ids
     if tag_ids:
         body["tags"] = tag_ids
-    r = requests.post(f"{_wp_url()}/wp-json/wp/v2/posts", json=body, auth=_wp_auth(), timeout=60)
+    r = _HTTP.post(f"{_wp_url()}/wp-json/wp/v2/posts", json=body, auth=_wp_auth(), timeout=60)
     if r.status_code not in (200, 201):
         raise RuntimeError("পোস্ট তৈরি ব্যর্থ — " + _wp_err(r))
     j = r.json()
@@ -5474,7 +5533,7 @@ def _wc_auth():
 
 
 def wc_list_categories():
-    r = requests.get(f"{_wp_url()}/wp-json/wc/v3/products/categories", params={"per_page": 100, "_fields": "id,name"},
+    r = _HTTP.get(f"{_wp_url()}/wp-json/wc/v3/products/categories", params={"per_page": 100, "_fields": "id,name"},
                      auth=_wc_auth(), timeout=30)
     if r.status_code != 200:
         raise RuntimeError(_wc_err(r))
@@ -5482,7 +5541,7 @@ def wc_list_categories():
 
 
 def wc_create_product(payload):
-    r = requests.post(f"{_wp_url()}/wp-json/wc/v3/products", json=payload, auth=_wc_auth(), timeout=60)
+    r = _HTTP.post(f"{_wp_url()}/wp-json/wc/v3/products", json=payload, auth=_wc_auth(), timeout=60)
     if r.status_code not in (200, 201):
         raise RuntimeError("প্রোডাক্ট তৈরি ব্যর্থ — " + _wc_err(r))
     j = r.json()
@@ -5512,7 +5571,7 @@ def send_webhook(event, data, url=None, secret=None):
                "X-Event": event}
     if secret:
         headers["X-Signature"] = "sha256=" + hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    r = requests.post(url, data=body, headers=headers, timeout=20, allow_redirects=False)
+    r = _HTTP.post(url, data=body, headers=headers, timeout=20, allow_redirects=False)
     if r.status_code >= 300:
         raise RuntimeError(f"Webhook {r.status_code}: {r.text[:120]}")
     return r.status_code
