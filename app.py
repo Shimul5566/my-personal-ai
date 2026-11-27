@@ -28,6 +28,7 @@ import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 from dotenv import load_dotenv
 from groq import Groq
+from anthropic import Anthropic
 # pypdf / python-docx are imported lazily inside read_file(), _fetch_page(), text_to_docx() (faster reruns)
 
 # ---- Codexio v3 modules (no circular imports: config <- core <- studios <- app) ----
