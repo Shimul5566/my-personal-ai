@@ -21,6 +21,26 @@ def get_secret(name, default=""):
         return default
 
 
+# ---- Claude (Anthropic) — used ONLY by the 3 tools in CLAUDE_TOOLS to save API credits ----
+# Sidebar label -> exact model ID. The first entry is the default.
+CLAUDE_MODELS = {
+    "Claude Sonnet 5.5 (Best for WordPress JSON & MCP)": "claude-sonnet-5-5",
+    "Claude Haiku 5.5 (Fast & Low Cost)": "claude-haiku-5-5",
+    "Claude Fable 5.2 (Complex Reasoning)": "claude-fable-5-2",
+}
+CLAUDE_DEFAULT_LABEL = next(iter(CLAUDE_MODELS))
+CLAUDE_DEFAULT_MODEL = CLAUDE_MODELS[CLAUDE_DEFAULT_LABEL]
+
+# The ONLY tools allowed to call Claude. Everything else (general chat, App Builder, Webflow, Agent without MCP ...)
+# stays on Groq / Gemini.
+CLAUDE_TOOLS = frozenset({"wp_json", "ai_automation", "elementor_mcp"})
+
+
+def claude_enabled_for(tool):
+    """True if `tool` is one of the 3 Claude-routed tools (wp_json / ai_automation / elementor_mcp)."""
+    return tool in CLAUDE_TOOLS
+
+
 # ---- Groq free-tier safety for App Builder (TPM limit causes 413/429 with bigger values) ----
 GROQ_APP_BUDGET = 3500   # max input tokens sent to Groq in App Builder fallback
 GROQ_APP_MAX_OUT = 3500  # max output tokens from Groq in App Builder fallback
