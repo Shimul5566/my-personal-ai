@@ -28,11 +28,10 @@ import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 from dotenv import load_dotenv
 from groq import Groq
-from anthropic import Anthropic
 # pypdf / python-docx are imported lazily inside read_file(), _fetch_page(), text_to_docx() (faster reruns)
 
 # ---- Codexio v3 modules (no circular imports: config <- core <- studios <- app) ----
-from config import APP_VERSION, GROQ_APP_BUDGET, GROQ_APP_MAX_OUT, get_secret
+from config import APP_VERSION, CLAUDE_MODELS, GROQ_APP_BUDGET, GROQ_APP_MAX_OUT, get_secret
 from core import llm as _llm
 from core.llm import _DEAD_SHORT, _strip_think, est_tokens, groq_create, groq_text_models, is_dead, mark_dead
 from core.db import (
@@ -784,24 +783,19 @@ if not api_key:
 
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY")  # console.anthropic.com থেকে
-CLAUDE_MODEL = get_secret("CLAUDE_MODEL") or "claude-sonnet-5-5"  # ডিফল্ট: দ্রুত + খুব শক্তিশালী
-# সাইডবারে বেছে নেওয়ার মতো Claude মডেল (আসল, চালু API model ID)
-CLAUDE_MODELS = {
-    "Sonnet 5.5 (ব্যালান্সড • ডিফল্ট)": "claude-sonnet-5-5",
-    "Opus 5.5 (গভীর চিন্তা)": "claude-opus-5-5",
-    "Haiku 5.5 (সবচেয়ে দ্রুত)": "claude-haiku-5-5",
-    "Sonnet 4.6": "claude-sonnet-4-6",
-    "Opus 4.6": "claude-opus-4-6",
-    "Haiku 4.5": "claude-haiku-4-5-20251001",
-}
-# প্রথম মডেল না চললে (অ্যাক্সেস/ওভারলোড) এই ক্রমে পরেরগুলো চেষ্টা হবে
-CLAUDE_FALLBACKS = ("claude-sonnet-5-5", "claude-sonnet-4-6", "claude-opus-5-5", "claude-opus-4-6",
-                    "claude-haiku-5-5", "claude-haiku-4-5-20251001")
+# Claude শুধু ৩টি টুলে চলে: WordPress JSON, WP অটোমেশন (AI Automation), Elementor MCP (config.CLAUDE_TOOLS)।
+# বাকি সব কিছু (সাধারণ চ্যাট, অ্যাপ বিল্ডার, Webflow ...) Groq/Gemini-তেই থাকে — Claude ক্রেডিট বাঁচাতে।
+# মডেল তালিকা config.CLAUDE_MODELS-এ; সাইডবারের selectbox থেকে বাছা হয়।
 
 
 def active_claude_model():
-    """সাইডবারের পছন্দ, না থাকলে CLAUDE_MODEL"""
-    return st.session_state.get("claude_model_value") or CLAUDE_MODEL
+    """সাইডবারে বেছে নেওয়া Claude মডেল ID (না থাকলে ডিফল্ট Sonnet 5.5)"""
+    return _llm.claude_model_id(st.session_state.get("claude_model_value"))
+
+
+def _claude_msg(e):
+    """Claude-এর ত্রুটির পরিষ্কার বার্তা (ClaudeError-এর বার্তা আগে থেকেই বন্ধুত্বপূর্ণ)"""
+    return str(e) if isinstance(e, _llm.ClaudeError) else _short(e)
 
 
 CLAUDE_FILE_LIMIT = 300_000  # Claude-কে পাঠানো ফাইল-টেক্সটের সর্বোচ্চ অক্ষর
@@ -1530,9 +1524,6 @@ def _prime(gen):
     return itertools.chain([first], gen)
 
 
-CLAUDE_URL = "https://api.anthropic.com/v1/messages"
-
-
 def claude_messages(history, use_image):
     """অ্যাপের চ্যাট-হিস্টরিকে Anthropic Messages ফরম্যাটে বদলায় (একই role পরপর এলে জুড়ে দেয়)"""
     out = []
@@ -1553,71 +1544,10 @@ def claude_messages(history, use_image):
 
 
 def claude_stream(system_text, history, temp, use_image, max_out=None, is_app=False):
-    """Claude থেকে স্ট্রিম করে টেক্সট দেয়। মডেল না চললে নিজে পরের Claude মডেলে যায়; সব ব্যর্থ হলে RuntimeError"""
+    """Anthropic SDK (core/llm.py) দিয়ে স্ট্রিম। শুধু Claude-রুটেড ৩টি টুল থেকে ডাকা হয়; ব্যর্থ হলে ClaudeError।"""
     max_out = max_out or (16000 if is_app else CLAUDE_OUT.get(st.session_state.get("response_detail", "সাধারণ"), 6000))
-    body = {
-        "model": active_claude_model(),
-        "max_tokens": max_out,
-        # প্রম্পট ক্যাশ: লম্বা সিস্টেম প্রম্পট/ফাইল বারবার পাঠালে দ্রুত ও সস্তা
-        "system": [{"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}],
-        "messages": claude_messages(history, use_image),
-        "temperature": min(max(float(temp), 0.0), 1.0),
-        "stream": True,
-    }
-    headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    models = list(dict.fromkeys([body["model"], *CLAUDE_FALLBACKS]))
-    models = [m for m in models if not is_dead(m)] or models
-    r = None
-    for mi, model_name in enumerate(models):
-        body["model"] = model_name
-        last_model = mi == len(models) - 1
-        for attempt in range(2):
-            r = _HTTP.post(CLAUDE_URL, headers=headers, json=body, stream=True, timeout=(5, 45))
-            if r.status_code == 400 and "temperature" in body and "temperature" in r.text.lower():
-                body.pop("temperature")  # কোনো মডেল temperature না নিলে ছাড়াই চেষ্টা
-                r.close()
-                continue
-            if r.status_code in (429, 500, 502, 503, 529) and attempt < 1:
-                r.close()
-                time.sleep(1.0)
-                continue
-            break
-        if r.status_code == 200:
-            break
-        if r.status_code == 404:
-            mark_dead(model_name)
-        # মডেল পাওয়া যাচ্ছে না / অ্যাক্সেস নেই / ওভারলোড → পরের মডেল
-        if not last_model and r.status_code in (400, 403, 404, 429, 500, 502, 503, 529):
-            r.close()
-            continue
-        break
-    st.session_state["_claude_used"] = body["model"]
-    if r.status_code != 200:
-        try:
-            msg = (r.json().get("error") or {}).get("message") or r.text[:200]
-        except Exception:
-            msg = r.text[:200]
-        raise RuntimeError(f"Claude API {r.status_code}: {msg}")
-    got = False
-    for line in r.iter_lines(decode_unicode=False):
-        if not line or not line.startswith(b"data:"):
-            continue
-        try:
-            ev = json.loads(line[5:].decode("utf-8").strip())
-        except Exception:
-            continue
-        kind = ev.get("type")
-        if kind == "content_block_delta":
-            d = ev.get("delta") or {}
-            if d.get("type") == "text_delta" and d.get("text"):
-                got = True
-                yield d["text"]
-        elif kind == "error":
-            raise RuntimeError(f"Claude: {(ev.get('error') or {}).get('message', 'unknown error')}")
-        elif kind == "message_stop":
-            break
-    if not got:
-        raise RuntimeError("Claude কোনো উত্তর দেয়নি")
+    return _llm.claude_stream(system_text, claude_messages(history, use_image), model=active_claude_model(),
+                              max_tokens=max_out, temperature=temp)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -3250,6 +3180,24 @@ with st.sidebar:
     is_wpauto_mode = app_mode.startswith("🚀")
     is_webflow_mode = app_mode.startswith("🌊")
 
+    # Claude শুধু এই ৩টিতে: WordPress JSON · WP অটোমেশন (AI Automation) · Elementor MCP (Agent + MCP কানেক্টেড)
+    is_claude_tool = is_json_mode or is_wpauto_mode or (is_agent_mode and bool(st.session_state.get("mcp_config")))
+    _claude_names = list(CLAUDE_MODELS)  # প্রথমটি = ডিফল্ট (Sonnet 5.5)
+    _claude_pick = st.sidebar.selectbox(
+        "🤖 Claude ভার্সন:", _claude_names, index=0, key="claude_model_sel",
+        help="শুধু WordPress JSON, WP অটোমেশন ও Elementor MCP-তে Claude চলে। সাধারণ চ্যাট ও বাকি টুল Groq/Gemini-তেই থাকে।",
+    )
+    st.session_state["claude_model_value"] = CLAUDE_MODELS[_claude_pick]
+    if not ANTHROPIC_API_KEY:
+        st.sidebar.caption("⚠️ ANTHROPIC_API_KEY নেই — Claude-এর টুলগুলো Groq/Gemini দিয়ে চলবে।")
+    elif is_claude_tool:
+        st.sidebar.caption(f"✅ এই মোডে Claude সক্রিয়: `{CLAUDE_MODELS[_claude_pick]}`")
+        _cl_used = st.session_state.get("_claude_used")
+        if _cl_used and _cl_used != CLAUDE_MODELS[_claude_pick]:
+            st.sidebar.caption(f"ℹ️ শেষবার ব্যবহৃত মডেল: {_cl_used}")
+    else:
+        st.sidebar.caption("💤 এই মোডে Claude ব্যবহার হয় না (Groq/Gemini চলছে)।")
+
     if app_mode.startswith("💬"):
         with st.expander("🎭 AI-এর ভূমিকা (Persona)", expanded=False):
             st.radio(
@@ -3312,28 +3260,18 @@ with st.sidebar:
 
         size_key = st.selectbox("ছবির সাইজ:", list(IMAGE_SIZES))
         image_quality = st.selectbox("ছবির কোয়ালিটি (OpenAI):", IMAGE_QUALITIES)
-        _claude_label = "Claude"
         _engines = ["Groq (দ্রুত)"]
         if GEMINI_API_KEY:
             _engines.append("Gemini (বড় ফাইল, ভালো ছবি-বোঝা)")
-        if ANTHROPIC_API_KEY:
-            _engines.append(_claude_label)
         if len(_engines) > 1:
             engine_choice = st.selectbox(
-                "🧠 AI ইঞ্জিন (চ্যাট ও JSON):", _engines,
-                index=_engines.index(_claude_label) if ANTHROPIC_API_KEY else (1 if GEMINI_API_KEY else 0),
+                "🧠 AI ইঞ্জিন (সাধারণ চ্যাট ও অন্যান্য টুল):", _engines,
+                index=1 if GEMINI_API_KEY else 0,
                 key="engine_choice_sel",
+                help="Claude এখানে নেই — সেটা শুধু WordPress JSON, WP অটোমেশন ও Elementor MCP-তে চলে (সাইডবারের Claude ভার্সন)।",
             )
         else:
             engine_choice = _engines[0]
-        if ANTHROPIC_API_KEY and engine_choice.startswith("Claude"):
-            _names = list(CLAUDE_MODELS)
-            _def = next((k for k, v in CLAUDE_MODELS.items() if v == CLAUDE_MODEL), _names[0])
-            _pick = st.selectbox("🤖 Claude মডেল:", _names, index=_names.index(_def), key="claude_model_sel")
-            st.session_state["claude_model_value"] = CLAUDE_MODELS[_pick]
-            _used = st.session_state.get("_claude_used")
-            if _used and _used != CLAUDE_MODELS[_pick]:
-                st.caption(f"⚠️ শেষবার ফলব্যাক হয়েছে: {_used}")
         if GEMINI_API_KEY and engine_choice.startswith("Gemini"):
             _gnames = list(GEMINI_MODELS)
             _gdef = next((k for k, v in GEMINI_MODELS.items() if v == GEMINI_MODEL), _gnames[0])
@@ -4073,33 +4011,26 @@ def render_message(m, idx):
 
 
 def pick_engine():
-    """ইঞ্জিন বাছাই: Claude → Gemini → Groq (ফলব্যাক)। key থাকলে Claude/Gemini সবসময় আগে;
-    সাইডবারে নিজে বেছে নিলে সেটিই মানা হয়, শুধু ছবি/বড় ফাইল হলে Groq থেকে Gemini-তে তোলা হয়।"""
+    """ইঞ্জিন বাছাই। Claude শুধু WordPress JSON মোডে (key থাকলে); বাকি সব Groq/Gemini।
+    (WP অটোমেশন ও Elementor MCP আলাদা ফাংশনে — auto_llm / run_mcp_agent — Claude বাছে।)"""
     if is_agent_mode:
         return "groq"
-    if is_app_mode:  # পুরো অ্যাপের কোড লম্বা: Claude (16000) → Gemini (16000) → শেষে Groq
-        if ANTHROPIC_API_KEY:
-            return "claude"
+    if is_json_mode and _llm.claude_allowed("wp_json"):
+        return "claude"
+    if is_app_mode:  # পুরো অ্যাপের কোড লম্বা: Gemini (16000) → শেষে Groq
         return "gemini" if GEMINI_API_KEY else "groq"
     choice = engine_choice or ""
-    if ANTHROPIC_API_KEY and choice.startswith("Claude"):
-        return "claude"
     if GEMINI_API_KEY and choice.startswith("Gemini"):
         return "gemini"
-    if choice.startswith("Groq") and (ANTHROPIC_API_KEY or GEMINI_API_KEY):
+    if choice.startswith("Groq") and GEMINI_API_KEY:
         # ব্যবহারকারী নিজে Groq বেছেছেন; তবে ছবি বা বড় ফাইলে Groq যথেষ্ট নয়
-        if GEMINI_API_KEY:
-            msgs = cur().get("messages") or []
-            history_chars = sum(len(m.get("content", "")) for m in msgs[-MAX_HISTORY:])
-            if last_msg_has_image() or (total_file_chars() + history_chars) > 10000:
-                return "gemini"
+        msgs = cur().get("messages") or []
+        history_chars = sum(len(m.get("content", "")) for m in msgs[-MAX_HISTORY:])
+        if last_msg_has_image() or (total_file_chars() + history_chars) > 10000:
+            return "gemini"
         return "groq"
-    # কোনো স্পষ্ট পছন্দ না থাকলে: সেরা পাওয়া ইঞ্জিন
-    if ANTHROPIC_API_KEY:
-        return "claude"
-    if GEMINI_API_KEY:
-        return "gemini"
-    return "groq"
+    # কোনো স্পষ্ট পছন্দ না থাকলে
+    return "gemini" if GEMINI_API_KEY else "groq"
 
 
 
@@ -4146,13 +4077,8 @@ def continue_cb():
 
 
 def open_app_stream(history):
-    """Continue-এর জন্য ইঞ্জিন বাছাই: Claude → Gemini → Groq"""
+    """Continue-এর জন্য ইঞ্জিন বাছাই: Gemini → Groq (App Builder-এ Claude ব্যবহার হয় না)"""
     temp = min(float(temperature), 0.5)
-    if ANTHROPIC_API_KEY:
-        try:
-            return _prime(claude_stream(build_system_instruction(CLAUDE_FILE_LIMIT), history, temp, False, is_app=True))
-        except Exception as e:
-            st.warning(f"⚠️ Claude ব্যর্থ ({_short(e)}), অন্য ইঞ্জিন দিয়ে চেষ্টা হচ্ছে।")
     if GEMINI_API_KEY:
         try:
             return _prime(gemini_stream(build_system_instruction(MAX_FILE_CHARS), history, temp, False, is_app=True))
@@ -4160,7 +4086,7 @@ def open_app_stream(history):
             st.warning(f"⚠️ Gemini ব্যর্থ ({_short(e)}), Groq দিয়ে চেষ্টা হচ্ছে।")
     sys_text, g_history, _ = fit_for_groq(build_system_instruction(GROQ_FILE_LIMIT), history, budget=GROQ_APP_BUDGET)
     if len(g_history) < 2:
-        raise RuntimeError("Groq-এর সীমায় আগের কোড ধরছে না। Continue-এর জন্য Claude বা Gemini key সেট করো।")
+        raise RuntimeError("Groq-এর সীমায় আগের কোড ধরছে না। Continue-এর জন্য Gemini key সেট করো।")
     return stream_reply(selected_model, build_api_messages(g_history, sys_text, False), temp)
 
 
@@ -5144,32 +5070,12 @@ def _mcp_run_tool_ui(cfg, s2o, name, args, stats, cap=MCP_TOOL_RESULT_CHARS):
 
 
 def _claude_call(body, stats):
-    headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    models = list(dict.fromkeys([stats.get("model") or active_claude_model(), active_claude_model(), *CLAUDE_FALLBACKS]))
-    r = None
-    for mi, mname in enumerate(models):
-        body["model"] = mname
-        for attempt in range(3):
-            r = _HTTP.post(CLAUDE_URL, headers=headers, json=body, timeout=(10, 240))
-            if r.status_code == 400 and "temperature" in body and "temperature" in r.text.lower():
-                body.pop("temperature")
-                continue
-            if r.status_code in (429, 500, 502, 503, 529) and attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            break
-        if r.status_code == 200:
-            stats["model"] = mname
-            st.session_state["_claude_used"] = mname
-            return r.json()
-        if mi < len(models) - 1 and r.status_code in (400, 403, 404, 429, 500, 502, 503, 529):
-            continue
-        break
-    try:
-        msg = (r.json().get("error") or {}).get("message") or r.text[:200]
-    except Exception:
-        msg = r.text[:200]
-    raise RuntimeError(f"Claude API {r.status_code}: {msg}")
+    """Elementor MCP-এর Claude কল (Anthropic SDK, core/llm.py)। ব্যর্থ হলে ClaudeError।"""
+    data = _llm.claude_create(body.get("system", ""), body["messages"], model=active_claude_model(),
+                              max_tokens=body.get("max_tokens", 8000), temperature=body.get("temperature"),
+                              tools=body.get("tools"))
+    stats["model"] = st.session_state.get("_claude_used") or active_claude_model()
+    return data
 
 
 def _mcp_claude_loop(cfg, system_text, history, temp, max_steps, s2o, ctools, stats):
@@ -5199,7 +5105,7 @@ def _mcp_claude_loop(cfg, system_text, history, temp, max_steps, s2o, ctools, st
 def _mcp_groq_loop(cfg, system_text, history, temp, max_steps, stats):
     s2o, _, otools = mcp_tool_schemas(cfg, limit=20, desc_len=150)
     if len(cfg.get("tools") or []) > 20:
-        st.info("ℹ️ Groq-এর সীমার কারণে প্রথম ২০টি MCP টুল দেওয়া হয়েছে। সবগুলোর জন্য ANTHROPIC_API_KEY সেট করো।")
+        st.info("ℹ️ Groq-এর সীমার কারণে প্রথম ২০টি MCP টুল দেওয়া হয়েছে। সবগুলোর জন্য ANTHROPIC_API_KEY সেট করো (Claude সব টুল নিতে পারে)।")
     sys_text, hist, _ = fit_for_groq(system_text, history, budget=GROQ_INPUT_TOKENS)
     msgs = [{"role": "system", "content": sys_text}] + [{"role": m["role"], "content": m["content"]} for m in hist]
     stats["model"] = selected_model
@@ -5231,13 +5137,15 @@ def run_mcp_agent(system_text, history, temp, max_steps=MCP_MAX_STEPS):
         raise RuntimeError("কানেক্টেড MCP সার্ভারে কোনো টুল নেই। আবার কানেক্ট করো।")
     stats = {"calls": 0, "links": [], "model": ""}
     reply = None
-    if ANTHROPIC_API_KEY:
+    if _llm.claude_allowed("elementor_mcp"):  # Elementor MCP = Claude-রুটেড ৩টি টুলের একটি
         try:
             reply = _mcp_claude_loop(cfg, system_text, history, temp, max_steps, s2o, ctools, stats)
         except Exception as e:
             if stats["calls"] > 0:
                 raise  # কিছু টুল চলে গেছে; অন্য ইঞ্জিনে আবার চালালে ডুপ্লিকেট হবে
-            st.warning(f"⚠️ Claude ব্যর্থ ({_short(e)}), Groq দিয়ে চেষ্টা হচ্ছে।")
+            st.warning(f"⚠️ {_claude_msg(e)}\n\nGroq দিয়ে চেষ্টা হচ্ছে।")
+    else:
+        st.warning("⚠️ ANTHROPIC_API_KEY নেই — Elementor MCP Claude ছাড়া Groq দিয়ে চলছে (সীমিত: প্রথম ২০টি টুল)।")
     if reply is None:
         reply = _mcp_groq_loop(cfg, system_text, history, temp, max_steps, stats)
     new_links = [u for u in stats["links"] if u not in reply]
@@ -5376,14 +5284,19 @@ def _wc_err(r):
     return msg
 
 
-def auto_llm(system_text, user_text, temp=0.6):
-    """Claude → Gemini → Groq ক্রমে লেখা তৈরি (স্ট্রিম ছাড়া, পুরো উত্তর একসাথে)"""
+def auto_llm(system_text, user_text, temp=0.6, tool=None):
+    """লেখা তৈরি (স্ট্রিম ছাড়া, পুরো উত্তর একসাথে)।
+    Claude শুধু তখনই যখন tool="ai_automation" (WP অটোমেশন) — Webflow ইত্যাদি tool ছাড়া ডাকলে Gemini → Groq।"""
     hist = [{"role": "user", "content": user_text}]
-    if ANTHROPIC_API_KEY:
-        try:
-            return "".join(claude_stream(system_text, hist, temp, False, max_out=12000))
-        except Exception:
-            pass
+    if tool and _llm.claude_enabled_for(tool):
+        if _llm.claude_available():
+            try:
+                return "".join(claude_stream(system_text, hist, temp, False, max_out=12000))
+            except Exception as e:
+                st.warning(f"⚠️ {_claude_msg(e)}\n\nGemini/Groq দিয়ে চেষ্টা হচ্ছে।")
+        elif not st.session_state.get("_claude_key_warned"):
+            st.session_state["_claude_key_warned"] = True
+            st.warning("⚠️ ANTHROPIC_API_KEY নেই — AI Automation এখন Gemini/Groq দিয়ে চলছে।")
     if GEMINI_API_KEY:
         try:
             return "".join(gemini_stream(system_text, hist, temp, False))
@@ -5425,7 +5338,7 @@ def _parse_fields(text, keys):
     return out
 
 
-def ai_blog(topic, keywords, tone, lang, words):
+def ai_blog(topic, keywords, tone, lang, words, tool=None):
     sysp = (
         "You are an expert SEO content writer for WordPress blogs. Write ONE complete, original, helpful article.\n"
         f"Language: {lang}. Tone: {tone}. Target length: about {words} words.\n"
@@ -5441,10 +5354,10 @@ def ai_blog(topic, keywords, tone, lang, words):
         "Start with a short intro; end with a conclusion and a call to action. Never invent statistics, quotes or fake sources."
     )
     user = f"Topic: {topic}" + (f"\nKeywords to include naturally: {keywords}" if keywords else "")
-    return _parse_fields(auto_llm(sysp, user, 0.6), ("TITLE", "SLUG", "EXCERPT", "TAGS", "IMAGE_PROMPT"))
+    return _parse_fields(auto_llm(sysp, user, 0.6, tool=tool), ("TITLE", "SLUG", "EXCERPT", "TAGS", "IMAGE_PROMPT"))
 
 
-def ai_product(name, details, lang):
+def ai_product(name, details, lang, tool=None):
     sysp = (
         "You are an e-commerce copywriter for a WooCommerce store. Write a persuasive but honest product listing.\n"
         f"Language: {lang}.\n"
@@ -5458,7 +5371,7 @@ def ai_product(name, details, lang):
         "warranties or prices that the user did not give."
     )
     user = f"Product: {name}" + (f"\nDetails from the seller: {details}" if details else "")
-    return _parse_fields(auto_llm(sysp, user, 0.6), ("SHORT", "TAGS", "IMAGE_PROMPT"))
+    return _parse_fields(auto_llm(sysp, user, 0.6, tool=tool), ("SHORT", "TAGS", "IMAGE_PROMPT"))
 
 
 def wp_upload_media(data, mime, base_name, alt=""):
@@ -5589,7 +5502,7 @@ def _wpa_push(res):
 def wpa_blog_one(topic, o, say):
     r = {"kind": "post", "topic": topic, "warns": []}
     say("✍️ AI ব্লগ লিখছে...")
-    d = ai_blog(topic, o["kw"], o["tone"], o["lang"], o["words"])
+    d = ai_blog(topic, o["kw"], o["tone"], o["lang"], o["words"], tool="ai_automation")
     title = d["title"] or topic[:70]
     media_id = None
     if o["img"]:
@@ -5628,7 +5541,7 @@ def wpa_product_one(o, say):
     desc_html, short, tags, img_prompt = "", "", "", ""
     if o["ai_desc"]:
         say("✍️ AI প্রোডাক্টের বিবরণ লিখছে...")
-        d = ai_product(o["name"], o["info"], o["lang"])
+        d = ai_product(o["name"], o["info"], o["lang"], tool="ai_automation")
         desc_html, short, tags, img_prompt = d["content"], d["short"], d["tags"], d["image_prompt"]
     elif o["info"]:
         import html as _h
@@ -5801,8 +5714,10 @@ def render_wp_automation():
         o1, o2 = st.columns(2)
         want_img = o1.checkbox("🖼️ AI ফিচার ইমেজ তৈরি ও আপলোড", value=True, key="wpa_img")
         want_hook = o2.checkbox("📨 শেষে Webhook পাঠাও", value=False, key="wpa_hook_on")
-        if not ANTHROPIC_API_KEY and not GEMINI_API_KEY:
-            st.caption("ℹ️ শুধু Groq থাকলে লেখা কিছুটা ছোট হতে পারে; লম্বা ব্লগের জন্য Claude/Gemini key ভালো।")
+        if not ANTHROPIC_API_KEY:
+            st.caption("⚠️ ANTHROPIC_API_KEY নেই — ব্লগ/প্রোডাক্ট লেখা Gemini/Groq দিয়ে হবে। সেরা ফলের জন্য Claude key দাও।")
+        else:
+            st.caption(f"✅ AI Automation Claude দিয়ে চলছে: `{active_claude_model()}`")
         if st.button("🚀 এক ক্লিকে ব্লগ লিখে পোস্ট করো", key="wpa_go_blog", type="primary", disabled=not ok):
             topics = [t.strip() for t in topics_txt.splitlines() if t.strip()][:WPA_MAX_TOPICS]
             if not topics:
@@ -6381,8 +6296,8 @@ def _wf_page_updater(sid):
     c1, c2 = st.columns(2)
     lang = c1.selectbox("ভাষা", ["বাংলা", "English"], key="wf_blang")
     tone = c2.selectbox("টোন", ["প্রফেশনাল", "বন্ধুত্বপূর্ণ", "বিক্রয়মুখী", "প্রিমিয়াম"], key="wf_btone")
-    if not ANTHROPIC_API_KEY and not GEMINI_API_KEY:
-        st.caption("ℹ️ শুধু Groq থাকলে ফলাফল ছোট বা কম নিখুঁত হতে পারে; ভালো ফলের জন্য Claude/Gemini key দাও।")
+    if not GEMINI_API_KEY:
+        st.caption("ℹ️ শুধু Groq থাকলে ফলাফল ছোট বা কম নিখুঁত হতে পারে; ভালো ফলের জন্য Gemini key দাও।")
 
     if st.button("✨ AI দিয়ে কপি লিখে পেজে বসানোর প্রিভিউ বানাও", key="wf_bgen", type="primary"):
         if not brief.strip():
@@ -6512,7 +6427,7 @@ def _wf_page_generator():
     if not g:
         return
     if g.get("incomplete"):
-        st.warning("⚠️ AI-এর কোড মাঝপথে কেটে গিয়েছিল; স্বয়ংক্রিয়ভাবে বন্ধ করে দেওয়া হয়েছে। শেষের অংশ অসম্পূর্ণ থাকতে পারে — ছোট বিবরণ দিয়ে বা Claude/Gemini দিয়ে আবার চেষ্টা করো।")
+        st.warning("⚠️ AI-এর কোড মাঝপথে কেটে গিয়েছিল; স্বয়ংক্রিয়ভাবে বন্ধ করে দেওয়া হয়েছে। শেষের অংশ অসম্পূর্ণ থাকতে পারে — ছোট বিবরণ দিয়ে বা Gemini দিয়ে আবার চেষ্টা করো।")
     view = st.radio("প্রিভিউ", ["🖥️ ডেস্কটপ", "📱 ফোন"], horizontal=True, key="wf_gview")
     render_app_preview(g["page"], phone=view.startswith("📱"), height=800)
     fname = "webflow-page.html" if g["kind"] == "page" else "webflow-embed-section.html"
@@ -6644,8 +6559,8 @@ def render_webflow():
             words = c3.select_slider("দৈর্ঘ্য (শব্দ)", options=[500, 800, 1200, 1800], value=800, key="wf_words")
             mode = c4.radio("পাঠানোর পর", ["save", "publish"], key="wf_publish_mode", horizontal=True,
                             format_func=lambda s: "📝 শুধু CMS-এ সেভ" if s == "save" else "🌍 লাইভ পাবলিশ")
-            if not ANTHROPIC_API_KEY and not GEMINI_API_KEY:
-                st.caption("ℹ️ শুধু Groq থাকলে লেখা কিছুটা ছোট হতে পারে; লম্বা আর্টিকেলের জন্য Claude/Gemini key ভালো।")
+            if not GEMINI_API_KEY:
+                st.caption("ℹ️ শুধু Groq থাকলে লেখা কিছুটা ছোট হতে পারে; লম্বা আর্টিকেলের জন্য Gemini key ভালো।")
             if st.button("🚀 AI দিয়ে লিখে Webflow-এ পাঠাও", key="wf_go", type="primary"):
                 topics = [t.strip() for t in topics_txt.splitlines() if t.strip()][:WPA_MAX_TOPICS]
                 if not topics:
@@ -7075,7 +6990,10 @@ if st.session_state.pending:
                     used_model = None
                     st.session_state.pop("_gemini_used", None)
                     _t0 = time.perf_counter()  # উত্তর তৈরির সময় এখান থেকে ধরা হয়
-                    if pick_engine() == "claude":
+                    if is_json_mode and not _llm.claude_available():
+                        st.warning("⚠️ ANTHROPIC_API_KEY নেই — WordPress JSON এখন Gemini/Groq দিয়ে তৈরি হচ্ছে। "
+                                   "সেরা ফলের জন্য Secrets-এ key দাও।")
+                    if pick_engine() == "claude":  # শুধু WordPress JSON মোড
                         try:
                             stream = _prime(claude_stream(
                                 build_system_instruction(CLAUDE_FILE_LIMIT) + search_block,
@@ -7084,7 +7002,7 @@ if st.session_state.pending:
                             used_model = st.session_state.get("_claude_used") or active_claude_model()
                         except Exception as e:
                             claude_failed = True
-                            st.warning(f"⚠️ Claude ব্যর্থ ({_short(e)}), অন্য ইঞ্জিন দিয়ে উত্তর দেওয়া হচ্ছে।")
+                            st.warning(f"⚠️ {_claude_msg(e)}\n\nঅন্য ইঞ্জিন দিয়ে উত্তর দেওয়া হচ্ছে।")
                     if stream is None and (pick_engine() == "gemini" or (GEMINI_API_KEY and (claude_failed or len(links_block) > 6000))):
                         try:
                             stream = _prime(gemini_stream(
