@@ -4,7 +4,10 @@ If a model is shut down / renamed / not accessible (404 model_not_found), the ap
 remembers the dead one for a while, so the same error never repeats and answers stay fast.
 
 Call `configure(...)` once from app.py after the Groq client is created.
-Imports only third-party packages (never app.py, studios/ or other core modules).
+Imports only third-party packages and `config` (never app.py, studios/ or other core modules).
+
+Claude (Anthropic) lives here too, but it is deliberately opt-in: only the 3 tools listed in config.CLAUDE_TOOLS
+(WordPress JSON, AI Automation, Elementor MCP) may call it. See "Claude" section at the bottom.
 """
 import re
 import time
@@ -14,6 +17,8 @@ import streamlit as st
 from groq import Groq
 from http.cookiejar import DefaultCookiePolicy
 from requests.adapters import HTTPAdapter
+
+from config import CLAUDE_DEFAULT_MODEL, CLAUDE_MODELS, claude_enabled_for, get_secret
 
 client = None          # set by configure()
 api_key = None         # Groq API key (used for cached model discovery)
@@ -220,3 +225,146 @@ def est_tokens(s):
     s = s or ""
     non_ascii = sum(1 for ch in s if ord(ch) > 127)
     return non_ascii + (len(s) - non_ascii) // 3 + 1
+
+
+# =====================================================================================================
+# Claude (Anthropic) — ONLY for: WordPress JSON, AI Automation, Elementor MCP  (config.CLAUDE_TOOLS)
+# =====================================================================================================
+class ClaudeError(RuntimeError):
+    """Claude failure with a user-friendly Bengali message. `kind` is one of:
+    no_key | auth | credits | model | rate | busy | bad_request | network | unknown"""
+
+    def __init__(self, kind, message):
+        super().__init__(message)
+        self.kind = kind
+
+
+def claude_key():
+    return get_secret("ANTHROPIC_API_KEY")
+
+
+def claude_available():
+    return bool(claude_key())
+
+
+@st.cache_resource(show_spinner=False)
+def get_claude_client(key):
+    """One shared Anthropic client per API key for the whole server process (connection pooling).
+    max_retries=2 lets the SDK retry 429/5xx itself with back-off."""
+    from anthropic import Anthropic
+    return Anthropic(api_key=key, timeout=120.0, max_retries=2)
+
+
+def claude_client():
+    key = claude_key()
+    if not key:
+        raise ClaudeError("no_key", "❌ ANTHROPIC_API_KEY সেট করা নেই। Secrets বা .env ফাইলে key দাও (console.anthropic.com)। "
+                                    "এই টুলটি Claude ছাড়া চলবে না, তাই এখন Groq/Gemini দিয়ে চেষ্টা হবে।")
+    return get_claude_client(key)
+
+
+def claude_model_id(label_or_id=None):
+    """Sidebar label or raw ID -> a model ID that is in config.CLAUDE_MODELS (falls back to the default)."""
+    v = label_or_id or ""
+    if v in CLAUDE_MODELS:
+        return CLAUDE_MODELS[v]
+    return v if v in CLAUDE_MODELS.values() else CLAUDE_DEFAULT_MODEL
+
+
+def claude_error(e):
+    """Any exception from the anthropic SDK -> ClaudeError with a clear message (already-wrapped errors pass through)."""
+    if isinstance(e, ClaudeError):
+        return e
+    s = str(e)
+    low = s.lower()
+    code = getattr(e, "status_code", None)
+    name = type(e).__name__
+    if "credit balance" in low or "billing" in low or "purchase credits" in low or code == 402:
+        return ClaudeError("credits", "💳 Claude API-তে ক্রেডিট শেষ (Credit balance too low)। console.anthropic.com → "
+                                      "Plans & Billing থেকে ক্রেডিট যোগ করো। এর মধ্যে Groq/Gemini দিয়ে চেষ্টা হবে।")
+    if code == 401 or "authentication" in name.lower() or "invalid x-api-key" in low:
+        return ClaudeError("auth", "🔑 ANTHROPIC_API_KEY ভুল বা মেয়াদ শেষ। console.anthropic.com থেকে নতুন key নিয়ে Secrets-এ বসাও।")
+    if code == 403 or "permission" in name.lower():
+        return ClaudeError("auth", "🚫 এই API key দিয়ে এই Claude মডেলে অ্যাক্সেস নেই। সাইডবার থেকে অন্য Claude মডেল বেছে নাও।")
+    if code == 404 or "notfound" in name.lower() or "model_not_found" in low:
+        return ClaudeError("model", "🤖 বেছে নেওয়া Claude মডেলটি পাওয়া যায়নি বা আপনার key-তে চালু নেই। সাইডবার থেকে অন্য মডেল বেছে নাও।")
+    if code == 429 or "ratelimit" in name.lower():
+        return ClaudeError("rate", "⏳ Claude-এর রেট লিমিট পার হয়েছে। কিছুক্ষণ পর আবার চেষ্টা করো।")
+    if code in (500, 502, 503, 504, 529) or "overloaded" in low or "internalserver" in name.lower():
+        return ClaudeError("busy", "⏳ Claude সার্ভার এখন ব্যস্ত। একটু পরে আবার চেষ্টা করো।")
+    if "connection" in name.lower() or "timeout" in name.lower():
+        return ClaudeError("network", "🌐 Claude-এ সংযোগ করা যায়নি (নেটওয়ার্ক/টাইমআউট)।")
+    if code == 400:
+        return ClaudeError("bad_request", f"Claude অনুরোধ নেয়নি (400): {s[:240]}")
+    return ClaudeError("unknown", f"Claude ত্রুটি: {s[:240]}")
+
+
+def _claude_system(system_text):
+    # prompt caching: long system prompt / file text resent on every turn becomes cheaper and faster
+    return [{"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}] if system_text else []
+
+
+def claude_stream(system_text, messages, model=None, max_tokens=6000, temperature=None):
+    """Streams text from Claude (generator of str). `messages` is already in Anthropic format.
+    Raises ClaudeError (never a raw SDK exception). Errors before the first token are safe to fall back from."""
+    client = claude_client()
+    model = claude_model_id(model)
+    kw = dict(model=model, max_tokens=max_tokens, system=_claude_system(system_text), messages=messages)
+    if temperature is not None:
+        kw["temperature"] = min(max(float(temperature), 0.0), 1.0)
+    st.session_state["_claude_used"] = model  # set before streaming so the UI label is right
+    got = False
+    try:
+        try:
+            ctx = client.messages.stream(**kw)
+            stream = ctx.__enter__()
+        except Exception as e:
+            if "temperature" in kw and "temperature" in str(e).lower():  # some models reject temperature
+                kw.pop("temperature")
+                ctx = client.messages.stream(**kw)
+                stream = ctx.__enter__()
+            else:
+                raise
+        try:
+            for text in stream.text_stream:
+                if text:
+                    got = True
+                    yield text
+        finally:
+            ctx.__exit__(None, None, None)
+    except ClaudeError:
+        raise
+    except Exception as e:
+        raise claude_error(e) from e
+    if not got:
+        raise ClaudeError("unknown", "Claude কোনো উত্তর দেয়নি")
+
+
+def claude_create(system_text, messages, model=None, max_tokens=8000, temperature=None, tools=None):
+    """Non-streaming call (used by the Elementor MCP tool-use loop). Returns the response as a plain dict
+    ({"content": [...], "stop_reason": ...}). Raises ClaudeError."""
+    client = claude_client()
+    model = claude_model_id(model)
+    kw = dict(model=model, max_tokens=max_tokens, system=_claude_system(system_text), messages=messages)
+    if tools:
+        kw["tools"] = tools
+    if temperature is not None:
+        kw["temperature"] = min(max(float(temperature), 0.0), 1.0)
+    try:
+        try:
+            resp = client.messages.create(**kw)
+        except Exception as e:
+            if "temperature" in kw and "temperature" in str(e).lower():
+                kw.pop("temperature")
+                resp = client.messages.create(**kw)
+            else:
+                raise
+    except Exception as e:
+        raise claude_error(e) from e
+    st.session_state["_claude_used"] = model
+    return resp.model_dump(exclude_none=True)  # blocks go back to the API as-is: no None fields
+
+
+def claude_allowed(tool):
+    """Routing gate: True only for wp_json / ai_automation / elementor_mcp AND when an API key exists."""
+    return claude_enabled_for(tool) and claude_available()
